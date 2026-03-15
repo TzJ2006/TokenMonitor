@@ -1,25 +1,67 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 
   let { ready = false, onComplete }: { ready?: boolean; onComplete: () => void } = $props();
   let minTimePassed = $state(false);
   let exiting = $state(false);
+  let started = $state(false);
 
   onMount(() => {
-    const timer = setTimeout(() => { minTimePassed = true; }, 2250);
-    return () => clearTimeout(timer);
+    let timer: ReturnType<typeof setTimeout>;
+    let unlisten: (() => void) | undefined;
+
+    async function init() {
+      try {
+        const win = getCurrentWebviewWindow();
+
+        // Subscribe first so we never miss a focus event
+        unlisten = await win.onFocusChanged(({ payload: focused }) => {
+          if (focused && !started) {
+            begin();
+            unlisten?.();
+            unlisten = undefined;
+          }
+        });
+
+        // Check if already focused (window may already be visible)
+        if (await win.isFocused()) {
+          if (!started) {
+            begin();
+            unlisten?.();
+            unlisten = undefined;
+          }
+        }
+      } catch {
+        // Fallback for browser dev mode
+        begin();
+      }
+    }
+
+    function begin() {
+      started = true;
+      timer = setTimeout(() => { minTimePassed = true; }, 2900);
+    }
+
+    init();
+
+    return () => {
+      clearTimeout(timer);
+      unlisten?.();
+    };
   });
 
   // Dismiss when animation minimum is met AND app data is loaded
   $effect(() => {
     if (ready && minTimePassed && !exiting) {
       exiting = true;
-      setTimeout(() => onComplete(), 450);
+      setTimeout(() => onComplete(), 500);
     }
   });
 </script>
 
 <div class="splash" class:exiting>
+  {#if started}
   <div class="splash-inner">
     <div class="face-wrap">
       <div class="face-alive">
@@ -55,6 +97,7 @@
     </div>
     <span class="name">TokenMonitor</span>
   </div>
+  {/if}
 </div>
 
 <style>
@@ -96,6 +139,11 @@
     90%  { transform: translate(0.5px, -1.8px) rotate(1.2deg); }
     100% { transform: translate(0, 0) rotate(0deg); }
   }
+
+  /* ── Theme-adaptive fills (CSS overrides SVG presentation attributes) ── */
+  .disc { fill: var(--splash-disc); }
+  .eye-left, .eye-right-dot { fill: var(--splash-eye); }
+  .eye-right-wink { stroke: var(--splash-eye); }
 
   .halo {
     opacity: 0;
@@ -166,7 +214,7 @@
     animation-play-state: paused;
   }
   .exiting .splash-inner {
-    animation: exitAnim 0.4s cubic-bezier(0.4, 0, 1, 1) both;
+    animation: exitAnim 0.45s cubic-bezier(0.2, 0, 0.4, 1) both;
   }
   @keyframes exitAnim {
     to { opacity: 0; transform: scale(0.88); }

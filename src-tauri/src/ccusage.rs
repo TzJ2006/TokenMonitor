@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::process::Command;
+use tokio::sync::Mutex as TokioMutex;
 
 /// Manages ccusage installation and execution with caching.
 pub struct CcusageRunner {
@@ -12,6 +13,9 @@ pub struct CcusageRunner {
     /// In-memory cache: cache_key → (json_data, cached_at)
     /// Uses Mutex for interior mutability so run_cached can work with &self.
     mem_cache: Mutex<HashMap<String, (String, Instant)>>,
+    /// Per-key spawn locks: prevents duplicate concurrent subprocesses
+    /// for the same cache key when multiple callers race past expired cache.
+    spawn_locks: Mutex<HashMap<String, Arc<TokioMutex<()>>>>,
 }
 
 impl CcusageRunner {
@@ -25,6 +29,7 @@ impl CcusageRunner {
             install_dir: base.clone(),
             node_path: None,
             mem_cache: Mutex::new(HashMap::new()),
+            spawn_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -143,7 +148,27 @@ impl CcusageRunner {
             }
         }
 
-        // Tier 3: CLI subprocess (slowest path)
+        // Tier 3: CLI subprocess — acquire per-key lock to prevent
+        // duplicate spawns when multiple callers race past expired cache.
+        let key_lock = {
+            let mut locks = self.spawn_locks.lock().unwrap();
+            locks
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let _guard = key_lock.lock().await;
+
+        // Double-check: the winner may have already populated the cache
+        {
+            let cache = self.mem_cache.lock().unwrap();
+            if let Some((data, cached_at)) = cache.get(&cache_key) {
+                if cached_at.elapsed() < max_age {
+                    return Ok((data.clone(), true));
+                }
+            }
+        }
+
         let json = match self.run_fresh(provider, subcommand, extra_args).await {
             Ok(j) => j,
             Err(e) => {
@@ -253,6 +278,7 @@ mod tests {
             cache_dir: base.join("cache"),
             node_path: None,
             mem_cache: Mutex::new(HashMap::new()),
+            spawn_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -366,6 +392,70 @@ mod tests {
             .unwrap()
             .collect();
         assert!(files.is_empty());
+    }
+
+    // ── Spawn deduplication ──
+
+    /// Regression test: concurrent callers that all miss cache must only
+    /// spawn ONE subprocess per cache key, not N.  Before the per-key
+    /// spawn lock was added, this would spawn 5 duplicate processes.
+    #[tokio::test]
+    async fn concurrent_expired_cache_deduplicates_spawns() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        fs::create_dir_all(base.join("cache")).unwrap();
+        fs::create_dir_all(base.join("node_modules/.bin")).unwrap();
+
+        let node = match CcusageRunner::find_binary("node") {
+            Some(n) => n,
+            None => return, // skip if node not installed
+        };
+
+        // Fake ccusage: atomically increments a counter file, then
+        // delays 200ms before printing JSON so the race window is wide.
+        fs::write(
+            base.join("node_modules/.bin/ccusage"),
+            r#"
+const fs = require('fs'), p = require('path');
+const f = p.join(p.resolve(__dirname, '..', '..'), '.spawn_count');
+let n = 0;
+try { n = parseInt(fs.readFileSync(f, 'utf8')); } catch {}
+fs.writeFileSync(f, String(n + 1));
+setTimeout(() => console.log('{"daily":[]}'), 200);
+"#,
+        )
+        .unwrap();
+
+        let runner = CcusageRunner {
+            install_dir: base.clone(),
+            cache_dir: base.join("cache"),
+            node_path: Some(node),
+            mem_cache: Mutex::new(HashMap::new()),
+            spawn_locks: Mutex::new(HashMap::new()),
+        };
+        let ttl = Duration::from_secs(60);
+
+        // 5 concurrent calls for the same cache key
+        let (r1, r2, r3, r4, r5) = tokio::join!(
+            runner.run_cached("claude", "daily", &["--since", "20260315"], ttl),
+            runner.run_cached("claude", "daily", &["--since", "20260315"], ttl),
+            runner.run_cached("claude", "daily", &["--since", "20260315"], ttl),
+            runner.run_cached("claude", "daily", &["--since", "20260315"], ttl),
+            runner.run_cached("claude", "daily", &["--since", "20260315"], ttl),
+        );
+
+        // All must succeed
+        for (i, r) in [&r1, &r2, &r3, &r4, &r5].iter().enumerate() {
+            assert!(r.is_ok(), "call {i} failed: {:?}", r.as_ref().err());
+        }
+
+        // Exactly 1 subprocess, not 5
+        let count: i32 = fs::read_to_string(base.join(".spawn_count"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 1, "expected 1 spawn, got {count}");
     }
 
     // ── Binary paths ──

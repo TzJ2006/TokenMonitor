@@ -33,21 +33,27 @@
   --t2: rgba(255,255,255,0.68);
   --t3: rgba(255,255,255,0.46);
   --t4: rgba(255,255,255,0.34);
+
+  --splash-disc: rgba(255,255,255,0.93);
+  --splash-eye: #111113;
 }
 
 /* ── Light theme ── */
 [data-theme="light"] {
   --bg: #F5F5F7;
   --surface: #FFFFFF;
-  --surface-2: rgba(0,0,0,0.028);
-  --surface-hover: rgba(0,0,0,0.05);
-  --border: rgba(0,0,0,0.08);
-  --border-subtle: rgba(0,0,0,0.05);
+  --surface-2: rgba(0,0,0,0.04);
+  --surface-hover: rgba(0,0,0,0.065);
+  --border: rgba(0,0,0,0.11);
+  --border-subtle: rgba(0,0,0,0.07);
 
-  --t1: rgba(0,0,0,0.88);
+  --t1: rgba(0,0,0,0.90);
   --t2: rgba(0,0,0,0.62);
-  --t3: rgba(0,0,0,0.42);
-  --t4: rgba(0,0,0,0.28);
+  --t3: rgba(0,0,0,0.46);
+  --t4: rgba(0,0,0,0.32);
+
+  --splash-disc: rgba(0,0,0,0.85);
+  --splash-eye: #F5F5F7;
 }
 
 /* ── Accent defaults (neutral — no provider selected) ── */
@@ -67,8 +73,8 @@
   --provider-bg: rgba(196,112,75,0.03);
 }
 [data-theme="light"][data-provider="claude"] {
-  --accent-soft: rgba(196,112,75,0.10);
-  --provider-bg: rgba(196,112,75,0.025);
+  --accent-soft: rgba(196,112,75,0.12);
+  --provider-bg: rgba(196,112,75,0.03);
 }
 
 /* ── Provider: Codex (cool blue) ── */
@@ -78,8 +84,8 @@
   --provider-bg: rgba(74,123,157,0.03);
 }
 [data-theme="light"][data-provider="codex"] {
-  --accent-soft: rgba(74,123,157,0.10);
-  --provider-bg: rgba(74,123,157,0.025);
+  --accent-soft: rgba(74,123,157,0.12);
+  --provider-bg: rgba(74,123,157,0.03);
 }
 
 /* ── System theme: follow OS preference ── */
@@ -87,25 +93,28 @@
   :root:not([data-theme]) {
     --bg: #F5F5F7;
     --surface: #FFFFFF;
-    --surface-2: rgba(0,0,0,0.028);
-    --surface-hover: rgba(0,0,0,0.05);
-    --border: rgba(0,0,0,0.08);
-    --border-subtle: rgba(0,0,0,0.05);
+    --surface-2: rgba(0,0,0,0.04);
+    --surface-hover: rgba(0,0,0,0.065);
+    --border: rgba(0,0,0,0.11);
+    --border-subtle: rgba(0,0,0,0.07);
 
-    --t1: rgba(0,0,0,0.88);
+    --t1: rgba(0,0,0,0.90);
     --t2: rgba(0,0,0,0.62);
-    --t3: rgba(0,0,0,0.42);
-    --t4: rgba(0,0,0,0.28);
+    --t3: rgba(0,0,0,0.46);
+    --t4: rgba(0,0,0,0.32);
 
     --accent-soft: rgba(0,0,0,0.04);
+
+    --splash-disc: rgba(0,0,0,0.85);
+    --splash-eye: #F5F5F7;
   }
   :root:not([data-theme])[data-provider="claude"] {
-    --accent-soft: rgba(196,112,75,0.10);
-    --provider-bg: rgba(196,112,75,0.025);
+    --accent-soft: rgba(196,112,75,0.12);
+    --provider-bg: rgba(196,112,75,0.03);
   }
   :root:not([data-theme])[data-provider="codex"] {
-    --accent-soft: rgba(74,123,157,0.10);
-    --provider-bg: rgba(74,123,157,0.025);
+    --accent-soft: rgba(74,123,157,0.12);
+    --provider-bg: rgba(74,123,157,0.03);
   }
 }
 

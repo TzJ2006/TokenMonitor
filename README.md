@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src-tauri/icons/icon.png" width="128" height="128" alt="TokenMonitor icon" />
+  <img src="docs/avatar.svg" width="128" height="128" alt="TokenMonitor icon" />
 </p>
 
 <h1 align="center">TokenMonitor</h1>

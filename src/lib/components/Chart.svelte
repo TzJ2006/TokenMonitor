@@ -289,7 +289,10 @@
   {/if}
 
   <!-- Detail panel -->
-  <div class="detail" class:visible={displayed != null}>
+  <div class="detail" class:visible={displayed != null}
+    onmouseenter={() => { if (leaveTimer) { clearTimeout(leaveTimer); leaveTimer = null; } }}
+    onmouseleave={onLeave}
+  >
     {#if displayed}
       {#key displayedIdx}
         <div class="detail-inner">
@@ -298,13 +301,16 @@
             <span class="detail-total">{formatCost(displayed.total)}</span>
           </div>
           <div class="detail-models">
-            {#each displayed.segments as seg}
+            {#each displayed.segments.slice(0, 4) as seg}
               <div class="detail-row">
                 <span class="detail-dot" style="background:{modelColor(seg.model_key)}"></span>
                 <span class="detail-name">{seg.model}</span>
                 <span class="detail-cost">{formatCost(seg.cost)}</span>
               </div>
             {/each}
+            {#if displayed.segments.length > 4}
+              <div class="detail-more">+ {displayed.segments.length - 4} more</div>
+            {/if}
           </div>
         </div>
       {/key}
@@ -444,6 +450,7 @@
   .detail-label { font: 600 10px/1 'Inter', sans-serif; color: var(--t1); }
   .detail-total { font: 600 10px/1 'Inter', sans-serif; color: var(--t1); font-variant-numeric: tabular-nums; }
   .detail-models { display: flex; flex-direction: column; gap: 2px; }
+  .detail-more { font: 400 9px/1 'Inter', sans-serif; color: var(--t3); padding: 1px 0 0 10px; }
   .detail-row { display: flex; align-items: center; gap: 5px; }
   .detail-dot { width: 5px; height: 5px; border-radius: 1.5px; flex-shrink: 0; }
   .detail-name { font: 400 10px/1 'Inter', sans-serif; color: var(--t2); flex: 1; }

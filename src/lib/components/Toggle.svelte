@@ -13,13 +13,18 @@
   ];
 
   let activeIdx = $derived(options.findIndex((o) => o.value === active));
-  let showLogo = $derived(brandTheming && active !== "all");
+  let showLogo = $derived(brandTheming);
 </script>
 
 <div class="tog-wrap">
   {#if showLogo}
-    <div class="provider-logo" class:claude={active === "claude"} class:codex={active === "codex"}>
-      {#if active === "claude"}
+    <div class="provider-logo" class:all={active === "all"} class:claude={active === "claude"} class:codex={active === "codex"}>
+      {#if active === "all"}
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd">
+          <path d="M2.4,12 A9.6,9.6 0 1,1 21.6,12 A9.6,9.6 0 1,1 2.4,12 M7.35,9.9 A1.65,1.65 0 1,1 10.65,9.9 A1.65,1.65 0 1,1 7.35,9.9 M13.35,9.9 A1.65,1.65 0 1,1 16.65,9.9 A1.65,1.65 0 1,1 13.35,9.9"/>
+        </svg>
+        <span>TokenMonitor</span>
+      {:else if active === "claude"}
         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd">
           <path clip-rule="evenodd" d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z"/>
         </svg>
@@ -76,6 +81,9 @@
   .provider-logo span {
     font: 600 11px/1 'Inter', sans-serif;
     letter-spacing: .2px;
+  }
+  .provider-logo.all {
+    color: var(--t2);
   }
   .provider-logo.claude {
     color: var(--accent);
