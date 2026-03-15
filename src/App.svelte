@@ -16,7 +16,7 @@
     checkSetup,
   } from "./lib/stores/usage.js";
 
-  import { loadSettings, settings, applyTheme } from "./lib/stores/settings.js";
+  import { loadSettings, settings, applyTheme, applyProvider } from "./lib/stores/settings.js";
 
   import Toggle from "./lib/components/Toggle.svelte";
   import TimeTabs from "./lib/components/TimeTabs.svelte";
@@ -39,13 +39,20 @@
   let loading = $state(false);
   let showRefresh = $state(false);
   let dataKey = $state("initial");
+  let brandTheming = $state(true);
 
   // Subscribe to stores
   $effect(() => {
     const unsub1 = usageData.subscribe((v) => (data = v));
     const unsub2 = setupStatus.subscribe((v) => (status = v));
     const unsub3 = isLoading.subscribe((v) => (loading = v));
-    return () => { unsub1(); unsub2(); unsub3(); };
+    const unsub4 = settings.subscribe((s) => (brandTheming = s.brandTheming));
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
+  });
+
+  // Apply/remove data-provider attribute reactively
+  $effect(() => {
+    applyProvider(provider, brandTheming);
   });
 
   // Only show refresh indicator after 300ms — hides it entirely for
