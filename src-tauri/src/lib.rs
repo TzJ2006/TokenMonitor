@@ -1,6 +1,4 @@
-mod ccusage;
 mod commands;
-mod hourly;
 mod models;
 mod parser;
 mod pricing;
@@ -85,8 +83,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::get_setup_status,
-            commands::initialize_app,
             commands::get_usage_data,
             commands::set_refresh_interval,
             commands::clear_cache,
@@ -96,75 +92,37 @@ pub fn run() {
 }
 
 async fn update_tray_title(app: &tauri::AppHandle, state: &AppState) {
-    let runner = state.runner.read().await;
     let today = chrono::Local::now().format("%Y%m%d").to_string();
-
-    if let Ok((json, _)) = runner
-        .run_cached("claude", "daily", &["--since", &today], Duration::from_secs(60))
-        .await
-    {
-        if let Ok(resp) = serde_json::from_str::<models::ClaudeDailyResponse>(&json) {
-            let total: f64 = resp.daily.iter().map(|d| d.total_cost).sum();
-            if let Some(tray) = app.tray_by_id("main-tray") {
-                let _ = tray.set_title(Some(&format!("${:.2}", total)));
-            }
-        }
+    let payload = state.parser.get_daily("claude", &today);
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_title(Some(&format!("${:.2}", payload.total_cost)));
     }
 }
 
 async fn background_loop(app: tauri::AppHandle) {
-    // Wait for frontend to initialize
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Auto-initialize ccusage
     let state = app.state::<AppState>();
-    {
-        let mut runner = state.runner.write().await;
-        let _ = runner.ensure_installed().await;
-        let mut status = state.setup_status.write().await;
-        status.ready = true;
-    }
 
-    // Notify frontend that setup is complete
-    let _ = app.emit("setup-complete", true);
-
-    // Update tray title immediately on first launch
     update_tray_title(&app, &state).await;
 
-    // Polling loop: refresh data and update tray title
-    // Cache TTL in run_cached handles staleness naturally — no need to
-    // nuke all cache files each cycle.  The tray update will refetch
-    // expired entries, warming the in-memory cache for the frontend.
     let mut update_counter: u64 = 0;
-    let mut hours_elapsed: u64 = 0;
     loop {
-        // Read configurable refresh interval (0 = polling disabled)
         let interval_secs = {
             let interval = state.refresh_interval.read().await;
             *interval
         };
 
         if interval_secs == 0 {
-            // Polling disabled — sleep briefly and re-check
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
 
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         update_counter += 1;
-        hours_elapsed += interval_secs;
 
-        // Update tray (TTL-expired entries refetched automatically)
+        state.parser.clear_cache();
         update_tray_title(&app, &state).await;
-
-        // Notify frontend to refresh its current view
         let _ = app.emit("data-updated", update_counter);
-
-        // Check for ccusage updates every 12 hours
-        if hours_elapsed >= 43200 {
-            hours_elapsed = 0;
-            let runner = state.runner.read().await;
-            let _ = runner.update_packages().await;
-        }
     }
 }

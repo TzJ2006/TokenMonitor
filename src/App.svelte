@@ -8,12 +8,9 @@
     activePeriod,
     usageData,
     isLoading,
-    setupStatus,
     fetchData,
     warmCache,
     warmAllPeriods,
-    initializeApp,
-    checkSetup,
   } from "./lib/stores/usage.js";
 
   import { loadSettings, settings, applyTheme, applyProvider } from "./lib/stores/settings.js";
@@ -35,7 +32,6 @@
   let provider = $state<"all" | "claude" | "codex">("claude");
   let period = $state<"5h" | "day" | "week" | "month" | "year">("day");
   let data = $state($usageData);
-  let status = $state($setupStatus);
   let loading = $state(false);
   let showRefresh = $state(false);
   let dataKey = $state("initial");
@@ -44,10 +40,9 @@
   // Subscribe to stores
   $effect(() => {
     const unsub1 = usageData.subscribe((v) => (data = v));
-    const unsub2 = setupStatus.subscribe((v) => (status = v));
-    const unsub3 = isLoading.subscribe((v) => (loading = v));
-    const unsub4 = settings.subscribe((s) => (brandTheming = s.brandTheming));
-    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
+    const unsub2 = isLoading.subscribe((v) => (loading = v));
+    const unsub3 = settings.subscribe((s) => (brandTheming = s.brandTheming));
+    return () => { unsub1(); unsub2(); unsub3(); };
   });
 
   // Apply/remove data-provider attribute reactively
@@ -70,6 +65,9 @@
     provider = p;
     activeProvider.set(p as any);
     await fetchData(p, period);
+    // Guard: if the user switched again while we were fetching, bail out
+    // so we don't overwrite dataKey / kick off stale warm-ups.
+    if (provider !== p) return;
     dataKey = `${p}-${period}-${Date.now()}`;
     resizeToContent();
     warmAllPeriods(p, period);
@@ -78,10 +76,13 @@
   }
 
   async function handlePeriodChange(p: "5h" | "day" | "week" | "month" | "year") {
+    const prov = provider;
     period = p;
     activePeriod.set(p);
-    await fetchData(provider, p);
-    dataKey = `${provider}-${p}-${Date.now()}`;
+    await fetchData(prov, p);
+    // Guard: if provider or period changed while we were fetching, bail out.
+    if (period !== p || provider !== prov) return;
+    dataKey = `${prov}-${p}-${Date.now()}`;
     resizeToContent();
   }
 
@@ -126,17 +127,11 @@
       // Settings load failed — continue with defaults
     }
 
-    const s = await checkSetup();
-    if (!s?.ready) {
-      await initializeApp();
-    }
     await fetchData(provider, period);
-    // Pre-warm all period tabs for both providers so every tab switch is instant
     warmAllPeriods(provider, period);
     warmAllPeriods(provider === "claude" ? "codex" : "claude");
     appReady = true;
 
-    // Observe content height changes and resize window to fit
     const pop = document.querySelector('.pop') as HTMLElement;
     let observer: ResizeObserver | undefined;
     if (pop) {
@@ -148,12 +143,8 @@
       dataKey = `${provider}-${period}-${Date.now()}`;
       fetchData(provider, period);
     });
-    const unlisten2 = await listen("setup-complete", async () => {
-      setupStatus.set({ ready: true, installing: false, error: null });
-      await fetchData(provider, period);
-    });
     return () => {
-      unlisten(); unlisten2(); observer?.disconnect();
+      unlisten(); observer?.disconnect();
       if (resizeTimer) clearTimeout(resizeTimer);
       cancelAnimationFrame(resizeRaf);
     };
@@ -163,8 +154,8 @@
 <div class="pop">
   {#if showSplash}
     <SplashScreen ready={appReady} onComplete={() => showSplash = false} />
-  {:else if !status.ready}
-    <SetupScreen status={status} />
+  {:else if appReady && !data}
+    <SetupScreen />
   {:else if showSettings}
     <Settings onBack={() => showSettings = false} />
   {:else if data}

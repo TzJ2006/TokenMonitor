@@ -38,9 +38,3 @@ export interface ActiveBlock {
   projected_cost: number;
   is_active: boolean;
 }
-
-export interface SetupStatus {
-  ready: boolean;
-  installing: boolean;
-  error: string | null;
-}

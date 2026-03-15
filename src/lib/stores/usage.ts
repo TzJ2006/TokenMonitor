@@ -1,16 +1,28 @@
 import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
-import type { UsagePayload, SetupStatus } from "../types/index.js";
+import type { UsagePayload } from "../types/index.js";
 
 export const activeProvider = writable<"all" | "claude" | "codex">("claude");
 export const activePeriod = writable<"5h" | "day" | "week" | "month" | "year">("day");
 export const usageData = writable<UsagePayload | null>(null);
 export const isLoading = writable(false);
-export const setupStatus = writable<SetupStatus>({
-  ready: false,
-  installing: false,
-  error: null,
-});
+
+function emptyPayload(): UsagePayload {
+  return {
+    total_cost: 0,
+    total_tokens: 0,
+    session_count: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    chart_buckets: [],
+    model_breakdown: [],
+    active_block: null,
+    five_hour_cost: 0,
+    last_updated: new Date().toISOString(),
+    from_cache: false,
+  };
+}
+export const setupStatus = writable({ ready: false, installing: false, error: null as string | null });
 
 // ── Frontend payload cache ──────────────────────────────────────────
 // Eliminates IPC round-trips on tab switches.  Tab clicks resolve from
@@ -60,6 +72,10 @@ export async function fetchData(provider: string, period: string) {
   if (cached) {
     // Expired but exists — show stale data while we fetch
     usageData.set(cached.data);
+  } else {
+    // No cache at all — clear stale data from a potentially different
+    // provider/period so the UI never shows wrong-provider models.
+    usageData.set(emptyPayload());
   }
   isLoading.set(true);
   try {
@@ -108,25 +124,3 @@ export function warmAllPeriods(provider: string, skipPeriod?: string) {
   }
 }
 
-export async function initializeApp() {
-  setupStatus.set({ ready: false, installing: true, error: null });
-  try {
-    const status = await invoke<SetupStatus>("initialize_app");
-    setupStatus.set(status);
-    return status;
-  } catch (e) {
-    const err = e instanceof Error ? e.message : String(e);
-    setupStatus.set({ ready: false, installing: false, error: err });
-    return null;
-  }
-}
-
-export async function checkSetup() {
-  try {
-    const status = await invoke<SetupStatus>("get_setup_status");
-    setupStatus.set(status);
-    return status;
-  } catch {
-    return null;
-  }
-}
