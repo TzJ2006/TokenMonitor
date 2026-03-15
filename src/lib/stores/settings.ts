@@ -32,7 +32,7 @@ let storeInstance: Awaited<ReturnType<typeof load>> | null = null;
 
 export async function loadSettings(): Promise<Settings> {
   try {
-    const store = await load("settings.json", { autoSave: true });
+    const store = await load("settings.json", { defaults: {}, autoSave: true });
     storeInstance = store;
 
     const saved = await store.get<Partial<Settings>>("settings");
