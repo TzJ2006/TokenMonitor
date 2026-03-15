@@ -38,7 +38,13 @@ pub fn calculate_cost(
 ) -> f64
 ```
 
-Internally uses a lookup table matching model name patterns to per-token rates (all prices in $/MTok).
+Internally uses a lookup table matching model name patterns to per-token rates (all prices in $/MTok). The table is matched in order, most-specific patterns first (e.g., `opus-4-6` before `opus-4`).
+
+**Version constant:** `pub const PRICING_VERSION: &str = "2026-03-15";` — identifies which pricing data is baked into this app version for debugging cost discrepancies.
+
+**OpenAI cache token mapping:** OpenAI uses a single "Cached Input" discount rather than separate write/read rates. For OpenAI models: `cache_creation_tokens` are charged at the standard input rate, `cache_read_tokens` are charged at the "Cached Input" rate.
+
+**Reasoning tokens:** For OpenAI o-series models, `reasoning_output_tokens` are billed at the output token rate. During parsing, reasoning tokens are folded into `output_tokens` in the `ParsedEntry`.
 
 #### Claude Models (source: [Anthropic official pricing](https://platform.claude.com/docs/en/docs/about-claude/pricing))
 
@@ -120,27 +126,27 @@ Cost is calculated per-entry using `pricing::calculate_cost()`.
 
 #### Public API
 
-All functions return `UsagePayload` (the existing struct the frontend expects — no changes):
+All functions return `UsagePayload` (the existing struct the frontend expects — no changes).
+
+The `since` parameter uses `YYYYMMDD` format (e.g., `"20260315"`) to match the existing codebase convention. The parser filters entries with `timestamp >= since`.
+
+`UsageParser` is `Send + Sync` — it is shared across Tauri command threads via `Arc` with internal mutability via `Mutex` for the cache. All public methods take `&self`.
 
 ```rust
 impl UsageParser {
     /// Daily aggregation: group entries by date, sum tokens, apply pricing.
-    /// Replaces `ccusage daily --json --offline --since <date>`.
     pub fn get_daily(&self, provider: &str, since: &str) -> UsagePayload;
 
     /// Monthly aggregation: group entries by YYYY-MM.
-    /// Replaces `ccusage monthly --json --offline --since <date>`.
     pub fn get_monthly(&self, provider: &str, since: &str) -> UsagePayload;
 
     /// 5-hour billing window detection with gap analysis.
-    /// Replaces `ccusage blocks --json --offline --since <date>`.
     /// Scans entries, groups into contiguous activity windows separated by
     /// gaps (>30 min of no activity). Calculates burn_rate = cost / elapsed_hours,
     /// projection = burn_rate * 5.
     pub fn get_blocks(&self, provider: &str, since: &str) -> UsagePayload;
 
     /// Hourly distribution for today. Groups entries by hour.
-    /// Replaces current `hourly.rs` logic.
     pub fn get_hourly(&self, provider: &str, since: &str) -> UsagePayload;
 
     /// Clear the in-memory cache.
@@ -148,9 +154,33 @@ impl UsageParser {
 }
 ```
 
+#### Period → Parser Method Dispatch
+
+`commands.rs` translates the frontend's `period` parameter to the correct parser method and date range:
+
+| Frontend period | Parser method | `since` value |
+|----------------|---------------|---------------|
+| `"5h"` | `get_blocks(provider, today)` | Today's date |
+| `"day"` | `get_hourly(provider, today)` | Today's date |
+| `"week"` | `get_daily(provider, week_start)` | Monday of current week |
+| `"month"` | `get_daily(provider, month_start)` | 1st of current month |
+| `"year"` | `get_monthly(provider, year_start)` | Jan 1st of current year |
+
+#### Provider `"all"` Handling
+
+When `provider = "all"`, `commands.rs` calls the parser twice (once for `"claude"`, once for `"codex"`) and merges the results using the existing `merge_payloads` helper (which deduplicates chart buckets by label, combines model breakdowns, and AND-s `from_cache`). The parser itself only handles single-provider queries.
+
 #### Caching
 
 Simple in-memory cache: `Mutex<HashMap<String, (UsagePayload, Instant)>>` with a 2-minute TTL (matching current `CACHE_MAX_AGE`). No disk cache needed — reading local JSONL files is milliseconds, not seconds like subprocess spawning.
+
+The `from_cache` field in `UsagePayload` now means "served from the in-memory TTL cache" (no longer "from disk/subprocess cache"). The frontend refresh indicator logic is unchanged.
+
+#### Performance: File Scanning
+
+For short periods (day/5h), only files modified today are scanned (using `fs::metadata().modified()` to skip old files without reading contents — porting the `modified_today` optimization from `hourly.rs` into a generalized `modified_since` check).
+
+For longer periods (week/month/year), all files in the provider directory are scanned. The `~/.claude/projects/` directory can contain hundreds of files; each JSONL file is read and lines are filtered by timestamp. This is expected to complete in <100ms for typical usage histories.
 
 #### Claude JSONL Format
 
@@ -193,7 +223,22 @@ Each line is a JSON object. We parse entries where `type == "event_msg"` and `pa
 }
 ```
 
-Model name is extracted from other lines in the same session file containing a `"model"` field.
+**Important: `last_token_usage` contains cumulative totals, not deltas.** The parser must take only the **final** `token_count` event per session file to get accurate totals. Do not sum all `token_count` events — that would massively overcount.
+
+Model name is extracted from lines in the same session file that contain a `"model"` field. These appear in turn-start events:
+
+```json
+{
+  "type": "event_msg",
+  "timestamp": "2026-03-15T10:29:00Z",
+  "payload": {
+    "type": "turn_start",
+    "model": "gpt-5.3-codex"
+  }
+}
+```
+
+The parser tracks the most recent model seen per session file via raw string search for `"model":"` (same approach as the existing `extract_model_from_line` in `hourly.rs`).
 
 ### Changes to `commands.rs`
 
@@ -233,9 +278,9 @@ pub struct AppState {
 
 Minimal — the `UsagePayload` shape is unchanged.
 
-- Remove `SetupScreen` component (or repurpose for "no data found" empty state)
+- Repurpose `SetupScreen` into an **empty state screen**: when `~/.claude/projects/` and `~/.codex/sessions/` do not exist (or contain no JSONL files), show a message like "No usage data found. Use Claude Code or Codex CLI to start tracking." This replaces the current "installing ccusage" state.
 - Remove `checkSetup()` / `initializeApp()` calls from `App.svelte` onMount
-- `setupStatus` store can be removed or simplified
+- `setupStatus` store can be removed or simplified to a `hasData` boolean
 - The `setup-complete` event listener can be removed
 
 ### Files Deleted
@@ -266,7 +311,7 @@ Minimal — the `UsagePayload` shape is unchanged.
 
 **Removed:** None (ccusage was npm-installed at runtime, not a Cargo dep)
 
-**No new Cargo dependencies needed.** Existing `chrono`, `serde`, `serde_json`, `dirs` cover everything.
+**No new Cargo dependencies needed.** Existing `chrono`, `serde`, `serde_json`, `dirs` cover everything. Recursive file discovery uses manual `fs::read_dir` traversal (porting the existing `glob_jsonl_files` helper from `hourly.rs`), not a glob crate.
 
 ## Testing Strategy
 
@@ -278,6 +323,8 @@ Minimal — the `UsagePayload` shape is unchanged.
 ## Migration
 
 This is a clean break — no backward compatibility needed. The ccusage install directory (`~/Library/Application Support/com.tokenmonitor.app/node_modules/`) can be left as-is; it will simply be unused.
+
+**Cost calculation differences:** The new pricing table is locally maintained rather than using ccusage's built-in pricing. Costs may differ slightly from what ccusage previously reported due to rounding differences or pricing version mismatches. This is expected and acceptable.
 
 ## Risks
 
