@@ -172,6 +172,12 @@ pub fn read_claude_entries(projects_dir: &Path, since: Option<NaiveDate>) -> Vec
             Ok(c) => c,
             Err(_) => continue,
         };
+
+        // cache_read_input_tokens is CUMULATIVE per session file (monotonically
+        // increasing). We track the previous value and emit only the delta so
+        // that summing entries gives the correct total.
+        let mut prev_cache_read: u64 = 0;
+
         for line in contents.lines() {
             let entry: ClaudeJsonlEntry = match serde_json::from_str(line) {
                 Ok(e) => e,
@@ -189,8 +195,8 @@ pub fn read_claude_entries(projects_dir: &Path, since: Option<NaiveDate>) -> Vec
                 None => continue,
             };
             let model = match &msg.model {
-                Some(m) => m.clone(),
-                None => continue,
+                Some(m) if !m.starts_with('<') => m.clone(), // skip <synthetic> etc.
+                _ => continue,
             };
             let ts = match chrono::DateTime::parse_from_rfc3339(&entry.timestamp) {
                 Ok(dt) => dt.with_timezone(&Local),
@@ -201,13 +207,18 @@ pub fn read_claude_entries(projects_dir: &Path, since: Option<NaiveDate>) -> Vec
                     continue;
                 }
             }
+
+            let cumulative_cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+            let delta_cache_read = cumulative_cache_read.saturating_sub(prev_cache_read);
+            prev_cache_read = cumulative_cache_read;
+
             entries.push(ParsedEntry {
                 timestamp: ts,
                 model,
                 input_tokens: usage.input_tokens.unwrap_or(0),
                 output_tokens: usage.output_tokens.unwrap_or(0),
                 cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-                cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                cache_read_tokens: delta_cache_read,
             });
         }
     }
@@ -1105,5 +1116,47 @@ mod tests {
             2,
             "entries >30 min apart should produce 2 activity blocks"
         );
+    }
+}
+
+#[cfg(test)]
+mod debug_compare {
+    use super::*;
+
+    #[test]
+    fn compare_token_counts_with_ccusage() {
+        let parser = UsageParser::new();
+        let today = chrono::Local::now().format("%Y%m%d").to_string();
+        
+        // Read raw entries to see per-model token counts
+        let entries = read_claude_entries(&parser.claude_dir, Some(parse_since_date(&today).unwrap()));
+        
+        let mut model_totals: std::collections::HashMap<String, (u64, u64, u64, u64, usize)> = std::collections::HashMap::new();
+        for e in &entries {
+            let (_, key) = normalize_model(&e.model);
+            let m = model_totals.entry(key.to_string()).or_default();
+            m.0 += e.input_tokens;
+            m.1 += e.output_tokens;
+            m.2 += e.cache_creation_tokens;
+            m.3 += e.cache_read_tokens;
+            m.4 += 1;
+        }
+        
+        println!("\n=== Our parser token counts (today) ===");
+        println!("Total entries parsed: {}", entries.len());
+        for (model, (inp, out, cw, cr, count)) in &model_totals {
+            let total = inp + out + cw + cr;
+            let cost = crate::pricing::calculate_cost(
+                &format!("claude-{}-4-6", model), *inp, *out, *cw, *cr
+            );
+            println!("{}: inp={} out={} cw={} cr={} total={} entries={} cost=${:.6}", 
+                model, inp, out, cw, cr, total, count, cost);
+        }
+        
+        println!("\n=== ccusage token counts (for comparison) ===");
+        println!("opus:   inp=19829 out=124000 cw=3149917 cr=65366136 total=68659882 cost=$59.852193");
+        println!("haiku:  inp=3354 out=28909 cw=612190 cr=4675714 total=5320167 cost=$1.380708");
+        println!("sonnet: inp=60 out=4597 cw=124968 cr=2128900 total=2258525 cost=$1.176435");
+        println!("ccusage total tokens: 76238574, total cost: $62.409336");
     }
 }
