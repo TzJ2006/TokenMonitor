@@ -117,6 +117,11 @@
     { key: "opus", name: "Opus", color: "var(--opus)" },
     { key: "sonnet", name: "Sonnet", color: "var(--sonnet)" },
     { key: "haiku", name: "Haiku", color: "var(--haiku)" },
+    { key: "o3", name: "o3", color: "var(--o3)" },
+    { key: "o3mini", name: "o3-mini", color: "var(--o3mini)" },
+    { key: "o4mini", name: "o4-mini", color: "var(--o4mini)" },
+    { key: "o1", name: "o1", color: "var(--o1)" },
+    { key: "o1mini", name: "o1-mini", color: "var(--o1mini)" },
     { key: "gpt54", name: "GPT-5.4", color: "var(--gpt54)" },
     { key: "gpt53", name: "GPT-5.3", color: "var(--gpt53)" },
     { key: "gpt52", name: "GPT-5.2", color: "var(--gpt52)" },
@@ -240,19 +245,19 @@
             />
           </div>
         </div>
-        {#each models as model}
-          <div class="row" class:border={model !== models[models.length - 1]}>
-            <div class="model-label">
+        <div class="model-grid">
+          {#each models as model}
+            <div class="model-cell">
               <div class="dot" style:background={model.color}></div>
-              <span class="label">{model.name}</span>
+              <span class="model-name">{model.name}</span>
+              <ToggleSwitch
+                checked={!current.hiddenModels.includes(model.key)}
+                color={model.color}
+                onChange={() => toggleModel(model.key)}
+              />
             </div>
-            <ToggleSwitch
-              checked={!current.hiddenModels.includes(model.key)}
-              color={model.color}
-              onChange={() => toggleModel(model.key)}
-            />
-          </div>
-        {/each}
+          {/each}
+        </div>
       </div>
     </div>
 
@@ -369,16 +374,30 @@
     color: var(--t1);
   }
 
-  .model-label {
+  .model-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    padding: 2px 0;
+  }
+
+  .model-cell {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
+    padding: 5px 10px;
+  }
+
+  .model-name {
+    flex: 1;
+    font: 400 9px/1 'Inter', sans-serif;
+    color: var(--t1);
   }
 
   .dot {
-    width: 6px;
-    height: 6px;
+    width: 5px;
+    height: 5px;
     border-radius: 50%;
+    flex-shrink: 0;
   }
 
   .cost-row-right {
