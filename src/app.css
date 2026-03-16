@@ -150,11 +150,17 @@
 
 html, body, #app {
   width: 100%;
-  overflow: hidden;
 }
 
-html, body {
-  height: 100%;
+/* No min-height or overflow on body — both inflate scrollHeight
+   measurements, preventing accurate window sizing.  .pop's own
+   overflow:hidden handles content clipping for border-radius. */
+
+/* Prevent scrollbars without capping descendant measurements.
+   overflow:hidden (not clip) — clip causes WebKit/WKWebView to cap
+   offsetHeight on descendants to the viewport height. */
+html {
+  overflow: hidden;
 }
 
 /* #app wraps to content height so the transparent window

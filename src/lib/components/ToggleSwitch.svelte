@@ -5,7 +5,7 @@
     onChange: (checked: boolean) => void;
   }
 
-  let { checked, color = "var(--haiku)", onChange }: Props = $props();
+  let { checked, color = "#34C759", onChange }: Props = $props();
 </script>
 
 <button
@@ -22,10 +22,10 @@
 
 <style>
   .toggle {
-    width: 28px;
-    height: 16px;
-    border-radius: 8px;
-    background: var(--border);
+    width: 32px;
+    height: 20px;
+    border-radius: 10px;
+    background: rgba(120, 120, 128, 0.32);
     border: none;
     cursor: pointer;
     position: relative;
@@ -36,14 +36,15 @@
     background: var(--toggle-color);
   }
   .knob {
-    width: 12px;
-    height: 12px;
+    width: 16px;
+    height: 16px;
     border-radius: 50%;
     background: #fff;
     position: absolute;
     top: 2px;
     left: 2px;
     transition: transform 0.2s ease;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
   }
   .toggle.on .knob {
     transform: translateX(12px);

@@ -22,6 +22,31 @@ impl AppState {
     }
 }
 
+fn format_tray_title(show: bool, total_cost: f64) -> String {
+    if show {
+        format!("${:.2}", total_cost)
+    } else {
+        String::new()
+    }
+}
+
+pub async fn sync_tray_title(app: &tauri::AppHandle, state: &AppState) {
+    let show = *state.show_tray_amount.read().await;
+    let title = if show {
+        let today = Local::now().format("%Y%m%d").to_string();
+        let payload = state.parser.get_daily("claude", &today);
+        format_tray_title(true, payload.total_cost)
+    } else {
+        format_tray_title(false, 0.0)
+    };
+
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        // `tray-icon` on macOS ignores `None` here, so clearing must use an
+        // empty string to collapse the title width immediately.
+        let _ = tray.set_title(Some(title));
+    }
+}
+
 #[tauri::command]
 pub async fn set_refresh_interval(interval: u64, state: State<'_, AppState>) -> Result<(), String> {
     let mut current = state.refresh_interval.write().await;
@@ -30,9 +55,17 @@ pub async fn set_refresh_interval(interval: u64, state: State<'_, AppState>) -> 
 }
 
 #[tauri::command]
-pub async fn set_show_tray_amount(show: bool, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn set_show_tray_amount(
+    show: bool,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let mut current = state.show_tray_amount.write().await;
     *current = show;
+    drop(current);
+
+    sync_tray_title(&app, &state).await;
+
     Ok(())
 }
 
@@ -201,6 +234,16 @@ mod tests {
 
     fn write_file(path: &Path, content: &str) {
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn format_tray_title_returns_empty_string_when_hidden() {
+        assert_eq!(format_tray_title(false, 12.34), "");
+    }
+
+    #[test]
+    fn format_tray_title_formats_cost_when_visible() {
+        assert_eq!(format_tray_title(true, 12.345), "$12.35");
     }
 
     #[test]

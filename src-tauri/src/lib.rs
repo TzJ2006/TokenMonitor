@@ -3,7 +3,7 @@ mod models;
 mod parser;
 mod pricing;
 
-use commands::AppState;
+use commands::{sync_tray_title, AppState};
 use std::time::Duration;
 use tauri::{
     image::Image,
@@ -95,25 +95,12 @@ pub fn run() {
         .expect("error running TokenMonitor");
 }
 
-async fn update_tray_title(app: &tauri::AppHandle, state: &AppState) {
-    let show = *state.show_tray_amount.read().await;
-    if let Some(tray) = app.tray_by_id("main-tray") {
-        if show {
-            let today = chrono::Local::now().format("%Y%m%d").to_string();
-            let payload = state.parser.get_daily("claude", &today);
-            let _ = tray.set_title(Some(&format!("${:.2}", payload.total_cost)));
-        } else {
-            let _ = tray.set_title(None::<&str>);
-        }
-    }
-}
-
 async fn background_loop(app: tauri::AppHandle) {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let state = app.state::<AppState>();
 
-    update_tray_title(&app, &state).await;
+    sync_tray_title(&app, &state).await;
 
     let mut update_counter: u64 = 0;
     loop {
@@ -131,7 +118,7 @@ async fn background_loop(app: tauri::AppHandle) {
         update_counter += 1;
 
         state.parser.clear_cache();
-        update_tray_title(&app, &state).await;
+        sync_tray_title(&app, &state).await;
         let _ = app.emit("data-updated", update_counter);
     }
 }

@@ -308,7 +308,7 @@
 <style>
   .settings {
     animation: slideIn 0.22s cubic-bezier(.25,.8,.25,1) both;
-    height: 100%;
+    height: 460px;
     display: flex;
     flex-direction: column;
   }

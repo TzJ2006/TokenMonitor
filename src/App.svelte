@@ -2,6 +2,7 @@
   import { onMount, tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+  import { currentMonitor } from "@tauri-apps/api/window";
   import { LogicalSize } from "@tauri-apps/api/dpi";
   import {
     activeProvider,
@@ -15,6 +16,16 @@
 
   import { loadSettings, settings, applyProvider } from "./lib/stores/settings.js";
   import { initializeRuntimeFromSettings } from "./lib/bootstrap.js";
+  import {
+    DEFAULT_MAX_WINDOW_HEIGHT,
+    MIN_WINDOW_HEIGHT,
+    RESIZE_SETTLE_DELAY_MS,
+    WINDOW_WIDTH,
+    clampWindowHeight,
+    classifyResize,
+    measureTargetWindowHeight,
+    resolveMonitorMaxWindowHeight,
+  } from "./lib/windowSizing.js";
 
   import Toggle from "./lib/components/Toggle.svelte";
   import TimeTabs from "./lib/components/TimeTabs.svelte";
@@ -37,6 +48,8 @@
   let showRefresh = $state(false);
   let dataKey = $state("initial");
   let brandTheming = $state(true);
+  let popEl: HTMLDivElement | null = null;
+  let maxWindowH = DEFAULT_MAX_WINDOW_HEIGHT;
 
   // Subscribe to stores
   $effect(() => {
@@ -103,9 +116,10 @@
 
   // ── Window resize ──────────────────────────────────────────────
   //
-  //  syncSize()        — measure .pop and call setSize().
-  //                      Used directly after `await tick()` for
-  //                      user-initiated view changes.
+  //  syncSize()        — measure .pop's full content height via
+  //                      scrollHeight (immune to viewport capping) and
+  //                      call setSize() immediately.  Used after
+  //                      await tick() in every user-initiated view swap.
   //
   //  resizeToContent() — called by ResizeObserver.
   //    • GROW  → immediate.  Prevents clipping during CSS
@@ -114,114 +128,178 @@
   //              destroy→create and transition-end settle first.
   let resizeRaf = 0;
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastWindowH = 0;
+  let lastWindowH = typeof window === "undefined" ? 0 : window.innerHeight;
+  const webviewWindow = getCurrentWebviewWindow();
 
-  function syncSize() {
-    const pop = document.querySelector('.pop') as HTMLElement;
-    if (!pop) return;
-    const h = Math.ceil(pop.getBoundingClientRect().height) + 2;
-    if (h === lastWindowH || h < 100) return;
-    lastWindowH = h;
-    getCurrentWebviewWindow().setSize(new LogicalSize(340, h)).catch(() => {});
-  }
-
-  function resizeToContent() {
-    // Grows apply immediately — if we debounce, every ResizeObserver
-    // callback during a CSS transition resets the timer and the window
-    // never catches up, visibly clipping the expanding content.
-    const pop = document.querySelector('.pop') as HTMLElement;
-    if (pop) {
-      const h = Math.ceil(pop.getBoundingClientRect().height) + 2;
-      if (h > lastWindowH && h >= 100) {
-        if (resizeTimer) clearTimeout(resizeTimer);
-        cancelAnimationFrame(resizeRaf);
-        lastWindowH = h;
-        getCurrentWebviewWindow().setSize(new LogicalSize(340, h)).catch(() => {});
-        return;
-      }
+  function clearPendingResize() {
+    if (resizeTimer) {
+      clearTimeout(resizeTimer);
+      resizeTimer = null;
     }
 
-    // Shrink / no-op: debounce so {#key} destroy→create cycles and
-    // ResizeObserver bursts settle before we measure.
-    if (resizeTimer) clearTimeout(resizeTimer);
     cancelAnimationFrame(resizeRaf);
+    resizeRaf = 0;
+  }
+
+  async function refreshWindowMetrics() {
+    try {
+      const monitor = await currentMonitor();
+      if (!monitor) return;
+      maxWindowH = resolveMonitorMaxWindowHeight(
+        monitor.workArea.size.height,
+        monitor.scaleFactor,
+      );
+    } catch {
+      maxWindowH = DEFAULT_MAX_WINDOW_HEIGHT;
+    }
+  }
+
+  function measureContentHeight(): number | null {
+    if (!popEl) return null;
+    // .pop has overflow:hidden → scrollHeight reports the FULL content
+    // height including any overflow below the viewport.  Add 2 for
+    // .pop's 1px top + 1px bottom border (excluded from scrollHeight).
+    return measureTargetWindowHeight(popEl.scrollHeight + 2);
+  }
+
+  function applyWindowHeight(targetHeight: number) {
+    const nextHeight = clampWindowHeight(targetHeight, maxWindowH, MIN_WINDOW_HEIGHT);
+    if (classifyResize(nextHeight, lastWindowH, MIN_WINDOW_HEIGHT) === "skip") return;
+
+    lastWindowH = nextHeight;
+    webviewWindow.setSize(new LogicalSize(WINDOW_WIDTH, nextHeight)).catch(() => {
+      if (typeof window !== "undefined") {
+        lastWindowH = window.innerHeight;
+      }
+    });
+  }
+
+  function syncSize() {
+    const nextHeight = measureContentHeight();
+    if (nextHeight == null) return;
+    applyWindowHeight(nextHeight);
+  }
+
+  function scheduleSettledResize(delay = RESIZE_SETTLE_DELAY_MS) {
+    clearPendingResize();
     resizeTimer = setTimeout(() => {
+      resizeTimer = null;
       resizeRaf = requestAnimationFrame(() => {
         resizeRaf = requestAnimationFrame(() => {
+          resizeRaf = 0;
           syncSize();
         });
       });
-    }, 16);
+    }, delay);
   }
 
-  onMount(async () => {
-    // Load persisted settings and apply theme + defaults (non-blocking)
-    try {
-      const saved = await loadSettings();
-      const runtime = await initializeRuntimeFromSettings(saved);
-      provider = runtime.provider;
-      period = runtime.period;
-    } catch {
-      // Settings load failed — continue with defaults
+  function resizeToContent() {
+    const measuredHeight = measureContentHeight();
+    if (measuredHeight == null) return;
+    const nextHeight = clampWindowHeight(measuredHeight, maxWindowH, MIN_WINDOW_HEIGHT);
+
+    switch (classifyResize(nextHeight, lastWindowH, MIN_WINDOW_HEIGHT)) {
+      case "grow":
+        clearPendingResize();
+        applyWindowHeight(measuredHeight);
+        return;
+      case "shrink":
+        scheduleSettledResize();
+        return;
+      default:
+        return;
     }
+  }
 
-    await fetchData(provider, period);
-    warmAllPeriods(provider, period);
-    warmAllPeriods(provider === "claude" ? "codex" : "claude");
-    appReady = true;
-
-    const pop = document.querySelector('.pop') as HTMLElement;
+  onMount(() => {
+    let cancelled = false;
     let observer: ResizeObserver | undefined;
-    if (pop) {
-      observer = new ResizeObserver(() => resizeToContent());
-      observer.observe(pop);
-    }
+    let unlisten: (() => void) | undefined;
 
-    const unlisten = await listen("data-updated", () => {
-      dataKey = `${provider}-${period}-${Date.now()}`;
-      fetchData(provider, period);
-    });
+    const init = async () => {
+      await refreshWindowMetrics();
+
+      // Load persisted settings and apply theme + defaults (non-blocking)
+      try {
+        const saved = await loadSettings();
+        if (cancelled) return;
+        const runtime = await initializeRuntimeFromSettings(saved);
+        if (cancelled) return;
+        provider = runtime.provider;
+        period = runtime.period;
+      } catch {
+        // Settings load failed — continue with defaults
+      }
+
+      await fetchData(provider, period);
+      if (cancelled) return;
+
+      warmAllPeriods(provider, period);
+      warmAllPeriods(provider === "claude" ? "codex" : "claude");
+      appReady = true;
+
+      if (popEl) {
+        observer = new ResizeObserver(() => resizeToContent());
+        observer.observe(popEl);
+        syncSize();
+      }
+
+      unlisten = await listen("data-updated", () => {
+        dataKey = `${provider}-${period}-${Date.now()}`;
+        fetchData(provider, period);
+      });
+
+      if (cancelled) {
+        unlisten();
+        unlisten = undefined;
+      }
+    };
+
+    init();
+
     return () => {
-      unlisten(); observer?.disconnect();
+      cancelled = true;
+      unlisten?.();
+      observer?.disconnect();
       if (resizeTimer) clearTimeout(resizeTimer);
       cancelAnimationFrame(resizeRaf);
     };
   });
 </script>
 
-<div class="pop">
-  {#if showSplash}
-    <SplashScreen ready={appReady} onComplete={() => { showSplash = false; tick().then(syncSize); }} />
-  {:else if appReady && !data}
-    <SetupScreen />
-  {:else if showSettings}
-    <Settings onBack={handleSettingsClose} />
-  {:else if data}
-    {#if showRefresh}<div class="refresh-bar"></div>{/if}
-    <Toggle active={provider} onChange={handleProviderChange} {brandTheming} />
-    <TimeTabs active={period} onChange={handlePeriodChange} />
-    <MetricsRow {data} />
-    <div class="hr"></div>
+<div class="pop" bind:this={popEl}>
+  <div class="pop-content">
+    {#if showSplash}
+      <SplashScreen ready={appReady} onComplete={() => { showSplash = false; tick().then(syncSize); }} />
+    {:else if appReady && !data}
+      <SetupScreen />
+    {:else if showSettings}
+      <Settings onBack={handleSettingsClose} />
+    {:else if data}
+      {#if showRefresh}<div class="refresh-bar"></div>{/if}
+      <Toggle active={provider} onChange={handleProviderChange} {brandTheming} />
+      <TimeTabs active={period} onChange={handlePeriodChange} />
+      <MetricsRow {data} />
+      <div class="hr"></div>
 
-    {#if period === "5h"}
-      <!-- 5H: horizontal usage bars -->
-      <UsageBars {data} />
-    {:else if data.chart_buckets.length > 0}
-      <!-- Day/Week/Month: stacked vertical bar chart -->
-      <Chart buckets={data.chart_buckets} {dataKey} />
-    {/if}
+      {#if period === "5h"}
+        <UsageBars {data} />
+      {:else if data.chart_buckets.length > 0}
+        <Chart buckets={data.chart_buckets} {dataKey} />
+      {/if}
 
-    <div class="hr"></div>
-    {#if period !== "5h" && data.model_breakdown.length > 0}
-      <ModelList models={data.model_breakdown} />
+      <div class="hr"></div>
+      {#if period !== "5h" && data.model_breakdown.length > 0}
+        <ModelList models={data.model_breakdown} />
+      {/if}
+      <Footer {data} onSettings={handleSettingsOpen} />
+    {:else}
+      <div class="loading">
+        <div class="spinner"></div>
+        <div class="loading-text">Loading data...</div>
+      </div>
     {/if}
-    <Footer {data} onSettings={handleSettingsOpen} />
-  {:else}
-    <div class="loading">
-      <div class="spinner"></div>
-      <div class="loading-text">Loading data...</div>
-    </div>
-  {/if}
+  </div>
 </div>
 
 <style>
@@ -235,12 +313,16 @@
     box-shadow: none;
     animation: popIn .32s cubic-bezier(.25,.8,.25,1) both;
     /* Force GPU compositing layer — prevents macOS transparent window
-       compositor from retaining stale pixels during resize */
+       compositor from retaining stale pixels during resize.
+       NOTE: do NOT use contain:paint here — it implies overflow:clip
+       which caps scrollHeight/getBoundingClientRect, breaking the
+       window-resize measurement. */
     isolation: isolate;
     -webkit-backface-visibility: hidden;
     /* Provider theme tint — transparent when neutral */
     background-image: linear-gradient(var(--provider-bg), var(--provider-bg));
   }
+  .pop-content { min-width: 0; }
   .hr { height: 1px; background: var(--border-subtle); margin: 0 12px; }
   .loading {
     display: flex; flex-direction: column; align-items: center;
