@@ -1,5 +1,5 @@
 use crate::models::{ActiveBlock, ChartBucket, ChartSegment, ModelSummary, UsagePayload};
-use chrono::{Datelike, DateTime, Local, NaiveDate, Timelike};
+use chrono::{DateTime, Local, NaiveDate, Timelike};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;

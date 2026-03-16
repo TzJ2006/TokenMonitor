@@ -79,15 +79,16 @@ pub async fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
 pub async fn get_usage_data(
     provider: String,
     period: String,
+    offset: i32,
     state: State<'_, AppState>,
 ) -> Result<UsagePayload, String> {
     let parser = &state.parser;
 
     match provider.as_str() {
-        "claude" | "codex" => Ok(get_provider_data(parser, &provider, &period)?),
+        "claude" | "codex" => Ok(get_provider_data(parser, &provider, &period, offset)?),
         "all" => {
-            let claude = get_provider_data(parser, "claude", &period)?;
-            let codex = get_provider_data(parser, "codex", &period)?;
+            let claude = get_provider_data(parser, "claude", &period, offset)?;
+            let codex = get_provider_data(parser, "codex", &period, offset)?;
             Ok(merge_payloads(claude, codex))
         }
         _ => Err(format!("Unknown provider: {}", provider)),
@@ -98,36 +99,70 @@ fn get_provider_data(
     parser: &UsageParser,
     provider: &str,
     period: &str,
+    offset: i32,
 ) -> Result<UsagePayload, String> {
     let now = Local::now();
-    let today = now.format("%Y%m%d").to_string();
+    let today = now.date_naive();
 
-    Ok(match period {
-        "5h" => parser.get_blocks(provider, &today),
-        "day" => parser.get_hourly(provider, &today),
+    let mut payload = match period {
+        "5h" => {
+            let today_str = today.format("%Y%m%d").to_string();
+            parser.get_blocks(provider, &today_str)
+        }
+        "day" => {
+            let target = today + chrono::Duration::days(offset as i64);
+            let since_str = target.format("%Y%m%d").to_string();
+            let mut p = parser.get_hourly(provider, &since_str);
+            p.period_label = format_day_label(target);
+            p.has_earlier_data = parser.has_entries_before(provider, target);
+            p
+        }
         "week" => {
-            let week_start = (now
-                - chrono::Duration::days(now.weekday().num_days_from_monday() as i64))
-            .format("%Y%m%d")
-            .to_string();
-            parser.get_daily(provider, &week_start)
+            let current_monday = today - chrono::Duration::days(now.weekday().num_days_from_monday() as i64);
+            let target_monday = current_monday + chrono::Duration::days((offset * 7) as i64);
+            let target_sunday = target_monday + chrono::Duration::days(6);
+            let since_str = target_monday.format("%Y%m%d").to_string();
+            let mut p = parser.get_daily(provider, &since_str);
+            p.period_label = format_week_label(target_monday, target_sunday);
+            p.has_earlier_data = parser.has_entries_before(provider, target_monday);
+            p
         }
         "month" => {
-            let month_start = NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
-                .unwrap()
-                .format("%Y%m%d")
-                .to_string();
-            parser.get_daily(provider, &month_start)
+            let mut target_year = now.year();
+            let mut target_month = now.month() as i32 + offset;
+            while target_month <= 0 {
+                target_year -= 1;
+                target_month += 12;
+            }
+            while target_month > 12 {
+                target_year += 1;
+                target_month -= 12;
+            }
+            let first_of_month = NaiveDate::from_ymd_opt(target_year, target_month as u32, 1).unwrap();
+            let since_str = first_of_month.format("%Y%m%d").to_string();
+            let mut p = parser.get_daily(provider, &since_str);
+            p.period_label = format_month_label(first_of_month);
+            p.has_earlier_data = parser.has_entries_before(provider, first_of_month);
+            p
         }
         "year" => {
-            let year_start = NaiveDate::from_ymd_opt(now.year(), 1, 1)
-                .unwrap()
-                .format("%Y%m%d")
-                .to_string();
-            parser.get_monthly(provider, &year_start)
+            let target_year = now.year() + offset;
+            let first_of_year = NaiveDate::from_ymd_opt(target_year, 1, 1).unwrap();
+            let since_str = first_of_year.format("%Y%m%d").to_string();
+            let mut p = parser.get_monthly(provider, &since_str);
+            p.period_label = format_year_label(target_year);
+            p.has_earlier_data = parser.has_entries_before(provider, first_of_year);
+            p
         }
         _ => return Err(format!("Unknown period: {}", period)),
-    })
+    };
+
+    if period == "5h" {
+        payload.period_label = String::new();
+        payload.has_earlier_data = false;
+    }
+
+    Ok(payload)
 }
 
 fn merge_payloads(mut c: UsagePayload, x: UsagePayload) -> UsagePayload {
@@ -190,6 +225,30 @@ fn merge_active_blocks(
             is_active: true,
         }),
     }
+}
+
+// ── Period label formatting ──
+
+fn format_day_label(date: NaiveDate) -> String {
+    date.format("%B %-d, %Y").to_string()
+}
+
+fn format_week_label(monday: NaiveDate, sunday: NaiveDate) -> String {
+    if monday.year() != sunday.year() {
+        format!("{} \u{2013} {}", monday.format("%b %-d, %Y"), sunday.format("%b %-d, %Y"))
+    } else if monday.month() != sunday.month() {
+        format!("{} \u{2013} {}", monday.format("%b %-d"), sunday.format("%b %-d, %Y"))
+    } else {
+        format!("{} \u{2013} {}", monday.format("%b %-d"), sunday.format("%-d, %Y"))
+    }
+}
+
+fn format_month_label(first_of_month: NaiveDate) -> String {
+    first_of_month.format("%B %Y").to_string()
+}
+
+fn format_year_label(year: i32) -> String {
+    year.to_string()
 }
 
 #[cfg(test)]
@@ -350,7 +409,7 @@ mod tests {
             claude_dir.path().to_path_buf(),
             codex_dir.path().to_path_buf(),
         );
-        let payload = get_provider_data(&parser, "codex", "5h").unwrap();
+        let payload = get_provider_data(&parser, "codex", "5h", 0).unwrap();
 
         assert_eq!(payload.chart_buckets.len(), 1);
         assert!(
@@ -361,5 +420,47 @@ mod tests {
             payload.five_hour_cost > 0.0,
             "block payloads should populate 5h cost"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Period label formatting
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn period_label_day_format() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        assert_eq!(format_day_label(date), "March 15, 2026");
+    }
+
+    #[test]
+    fn period_label_week_same_month() {
+        let monday = NaiveDate::from_ymd_opt(2026, 3, 9).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        assert_eq!(format_week_label(monday, sunday), "Mar 9 \u{2013} 15, 2026");
+    }
+
+    #[test]
+    fn period_label_week_cross_month() {
+        let monday = NaiveDate::from_ymd_opt(2026, 3, 30).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2026, 4, 5).unwrap();
+        assert_eq!(format_week_label(monday, sunday), "Mar 30 \u{2013} Apr 5, 2026");
+    }
+
+    #[test]
+    fn period_label_week_cross_year() {
+        let monday = NaiveDate::from_ymd_opt(2025, 12, 29).unwrap();
+        let sunday = NaiveDate::from_ymd_opt(2026, 1, 4).unwrap();
+        assert_eq!(format_week_label(monday, sunday), "Dec 29, 2025 \u{2013} Jan 4, 2026");
+    }
+
+    #[test]
+    fn period_label_month_format() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        assert_eq!(format_month_label(date), "March 2026");
+    }
+
+    #[test]
+    fn period_label_year_format() {
+        assert_eq!(format_year_label(2026), "2026");
     }
 }
