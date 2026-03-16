@@ -51,6 +51,20 @@ pub struct ActiveBlock {
     pub is_active: bool,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct CalendarDay {
+    pub day: u32,
+    pub cost: f64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct MonthlyUsagePayload {
+    pub year: i32,
+    pub month: u32,
+    pub days: Vec<CalendarDay>,
+    pub total_cost: f64,
+}
+
 // ── Helpers ──
 
 pub fn normalize_claude_model(raw: &str) -> (&str, &str) {
