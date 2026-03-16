@@ -251,6 +251,81 @@ fn format_year_label(year: i32) -> String {
     year.to_string()
 }
 
+fn get_monthly_usage_sync(
+    state: &AppState,
+    provider: &str,
+    year: i32,
+    month: u32,
+) -> MonthlyUsagePayload {
+    let month_start = NaiveDate::from_ymd_opt(year, month, 1)
+        .unwrap()
+        .format("%Y%m%d")
+        .to_string();
+
+    let end_date = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap()
+    };
+
+    let fetch_for_provider = |prov: &str| -> Vec<CalendarDay> {
+        let usage = state.parser.get_daily(prov, &month_start);
+        usage
+            .chart_buckets
+            .iter()
+            .filter_map(|bucket| {
+                let date = NaiveDate::parse_from_str(&bucket.sort_key, "%Y-%m-%d").ok()?;
+                if date >= NaiveDate::from_ymd_opt(year, month, 1).unwrap()
+                    && date < end_date
+                {
+                    Some(CalendarDay {
+                        day: date.day(),
+                        cost: bucket.total,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    let days = match provider {
+        "all" => {
+            let claude_days = fetch_for_provider("claude");
+            let codex_days = fetch_for_provider("codex");
+            let mut day_map: HashMap<u32, f64> = HashMap::new();
+            for d in claude_days.iter().chain(codex_days.iter()) {
+                *day_map.entry(d.day).or_insert(0.0) += d.cost;
+            }
+            let mut merged: Vec<CalendarDay> = day_map
+                .into_iter()
+                .map(|(day, cost)| CalendarDay { day, cost })
+                .collect();
+            merged.sort_by_key(|d| d.day);
+            merged
+        }
+        prov => fetch_for_provider(prov),
+    };
+
+    let total_cost: f64 = days.iter().map(|d| d.cost).sum();
+    MonthlyUsagePayload {
+        year,
+        month,
+        days,
+        total_cost,
+    }
+}
+
+#[tauri::command]
+pub async fn get_monthly_usage(
+    provider: String,
+    year: i32,
+    month: u32,
+    state: State<'_, AppState>,
+) -> Result<MonthlyUsagePayload, String> {
+    Ok(get_monthly_usage_sync(&state, &provider, year, month))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +537,105 @@ mod tests {
     #[test]
     fn period_label_year_format() {
         assert_eq!(format_year_label(2026), "2026");
+    }
+
+    #[test]
+    fn get_monthly_usage_returns_per_day_costs() {
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let project_dir = claude_dir.path().join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let content = r#"{"type":"assistant","timestamp":"2026-03-05T10:00:00-04:00","message":{"model":"claude-sonnet-4-6-20260301","usage":{"input_tokens":1000,"output_tokens":500},"stop_reason":"end_turn"}}"#;
+        write_file(&project_dir.join("session.jsonl"), content);
+
+        let parser = UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        );
+        let state = AppState {
+            parser: Arc::new(parser),
+            refresh_interval: Arc::new(RwLock::new(30)),
+            show_tray_amount: Arc::new(RwLock::new(true)),
+        };
+
+        let payload = get_monthly_usage_sync(&state, "claude", 2026, 3);
+        assert_eq!(payload.year, 2026);
+        assert_eq!(payload.month, 3);
+        assert!(!payload.days.is_empty(), "should have at least one day");
+        let day5 = payload.days.iter().find(|d| d.day == 5);
+        assert!(day5.is_some(), "should have data for day 5");
+        assert!(day5.unwrap().cost > 0.0, "day 5 should have non-zero cost");
+        assert!(payload.total_cost > 0.0);
+    }
+
+    #[test]
+    fn get_monthly_usage_filters_to_requested_month() {
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let project_dir = claude_dir.path().join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let feb_entry = r#"{"type":"assistant","timestamp":"2026-02-15T10:00:00-04:00","message":{"model":"claude-sonnet-4-6-20260301","usage":{"input_tokens":1000,"output_tokens":500},"stop_reason":"end_turn"}}"#;
+        let mar_entry = r#"{"type":"assistant","timestamp":"2026-03-10T10:00:00-04:00","message":{"model":"claude-sonnet-4-6-20260301","usage":{"input_tokens":2000,"output_tokens":1000},"stop_reason":"end_turn"}}"#;
+        write_file(
+            &project_dir.join("session.jsonl"),
+            &format!("{}\n{}", feb_entry, mar_entry),
+        );
+
+        let parser = UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        );
+        let state = AppState {
+            parser: Arc::new(parser),
+            refresh_interval: Arc::new(RwLock::new(30)),
+            show_tray_amount: Arc::new(RwLock::new(true)),
+        };
+
+        let payload = get_monthly_usage_sync(&state, "claude", 2026, 2);
+        assert_eq!(payload.month, 2);
+        for day in &payload.days {
+            assert!(day.day <= 28, "Feb 2026 has no day > 28");
+        }
+        assert!(payload.days.iter().any(|d| d.day == 15));
+    }
+
+    #[test]
+    fn get_monthly_usage_merges_providers_for_all() {
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+
+        let claude_project = claude_dir.path().join("test-project");
+        fs::create_dir_all(&claude_project).unwrap();
+        let claude_entry = r#"{"type":"assistant","timestamp":"2026-03-05T10:00:00-04:00","message":{"model":"claude-sonnet-4-6-20260301","usage":{"input_tokens":1000,"output_tokens":500},"stop_reason":"end_turn"}}"#;
+        write_file(&claude_project.join("session.jsonl"), claude_entry);
+
+        let day_dir = codex_dir.path().join("2026").join("03").join("05");
+        fs::create_dir_all(&day_dir).unwrap();
+        let codex_entry = r#"{"type":"event_msg","timestamp":"2026-03-05T14:00:00-04:00","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500,"output_tokens":250,"reasoning_output_tokens":0,"cached_input_tokens":0}}}}"#;
+        write_file(&day_dir.join("session.jsonl"), codex_entry);
+
+        let parser = UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        );
+        let state = AppState {
+            parser: Arc::new(parser),
+            refresh_interval: Arc::new(RwLock::new(30)),
+            show_tray_amount: Arc::new(RwLock::new(true)),
+        };
+
+        let payload = get_monthly_usage_sync(&state, "all", 2026, 3);
+        let day5 = payload.days.iter().find(|d| d.day == 5);
+        assert!(day5.is_some(), "should have merged day 5");
+        let claude_only = get_monthly_usage_sync(&state, "claude", 2026, 3);
+        let codex_only = get_monthly_usage_sync(&state, "codex", 2026, 3);
+        let claude_day5_cost = claude_only.days.iter().find(|d| d.day == 5).map(|d| d.cost).unwrap_or(0.0);
+        let codex_day5_cost = codex_only.days.iter().find(|d| d.day == 5).map(|d| d.cost).unwrap_or(0.0);
+        assert!(
+            (day5.unwrap().cost - (claude_day5_cost + codex_day5_cost)).abs() < 0.001,
+            "merged cost should equal sum of individual provider costs"
+        );
     }
 }
