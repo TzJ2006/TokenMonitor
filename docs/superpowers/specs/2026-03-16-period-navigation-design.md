@@ -34,6 +34,8 @@ pub struct UsagePayload {
 | month  | "March 2026"       | "February 2026"    |
 | year   | "2026"             | "2025"             |
 
+**Week cross-boundary labels:** When a week spans two months, include both: "Mar 30 – Apr 5, 2026". When it spans two years: "Dec 29, 2025 – Jan 4, 2026".
+
 `has_earlier_data` is `true` when there are log entries in the period *before* the one currently being viewed. Determined cheaply by the parser.
 
 ### commands.rs — get_usage_data
@@ -70,19 +72,16 @@ For "all" provider: pass offset through to both `get_provider_data("claude", ...
 pub fn has_entries_before(&self, provider: &str, before_date: NaiveDate) -> bool
 ```
 
-Loads entries with `since: None` (or a reasonable lower bound like 1 year back) and checks if any entry has `timestamp.date_naive() < before_date`. For Claude, this uses the `modified_since` optimisation to skip recent-only files. For Codex, iterate date directories before the target date and check if any `.jsonl` files exist.
+Checks whether any log entries exist with a timestamp before `before_date`.
 
-Optimisation: bail on the first matching entry — no need to read all files.
+- **Claude:** Call `read_claude_entries` with `since: None` (no date filter — this disables the `modified_since` file-skip optimisation, since we need to read *old* files). Iterate entries and return `true` on the first entry with `timestamp.date_naive() < before_date`. This scans all files but bails early on the first match.
+- **Codex:** Iterate `YYYY/MM/DD` date directories under `~/.codex/sessions/`. For each directory whose date is before `before_date`, check if any `.jsonl` files exist. Return `true` on first match. This is a cheap filesystem check with no file parsing.
+
+Performance note: for users with many years of Claude log files, the Claude path may be slow on the first call because it globs all `.jsonl` files. Future optimisation (out of scope): cache the earliest-known date per provider.
 
 ### Cache key update
 
-Backend cache keys include offset:
-
-```
-"hourly:{provider}:{since}" → "hourly:{provider}:{since}:{offset}"
-```
-
-Since `since` already changes with offset, the key is already unique. No change needed to the cache key format — the existing `since`-based keys naturally differentiate offsets.
+No change needed to the backend cache key format. The existing `since`-based keys (e.g., `"hourly:claude:20260315"`) already differentiate offsets naturally because each offset produces a different `since` date string.
 
 ## Frontend Changes
 
@@ -133,7 +132,7 @@ warmCache(provider, period, offset - 1);
 if (offset < 0) warmCache(provider, period, offset + 1);
 ```
 
-**warmAllPeriods:** Updated to accept and pass offset.
+**warmAllPeriods:** Always warms at offset `0` for all periods, since switching periods resets offset to 0. Signature unchanged — it does not need to accept an offset parameter.
 
 ### New component — DateNav.svelte
 
@@ -216,6 +215,17 @@ async function handleProviderChange(p) {
 }
 ```
 
+**data-updated listener — preserve offset:**
+
+The existing `listen("data-updated", ...)` callback must pass the current offset so background refreshes don't overwrite a past-period view with current data:
+
+```typescript
+unlisten = await listen("data-updated", () => {
+  dataKey = `${provider}-${period}-${offset}-${Date.now()}`;
+  fetchData(provider, period, offset);
+});
+```
+
 **Template — insert DateNav:**
 
 ```svelte
@@ -234,13 +244,15 @@ async function handleProviderChange(p) {
 
 **Empty state — no-data message:**
 
-When `period !== "5h"` and `data.chart_buckets.length === 0`:
+When `period !== "5h"` and `data.total_cost === 0` and `data.total_tokens === 0`:
 
 ```svelte
 <div class="empty-period">No usage data for this period</div>
 ```
 
 Styled as centered, `color: var(--t3)`, `font: 400 10px/1 'Inter'`, `padding: 32px 0`.
+
+Note: We check `total_cost === 0` rather than `chart_buckets.length === 0` because `get_hourly` always produces 24 buckets (one per hour) for past days, even when all are empty. Week/month/year only emit buckets for dates with data, but using `total_cost` is a consistent check across all periods. The empty-period message replaces the Chart component (no empty bars shown).
 
 ## Files Changed
 
