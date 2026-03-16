@@ -35,6 +35,11 @@ export interface ModelSummary {
   tokens: number;
 }
 
+export interface KnownModel {
+  display_name: string;
+  model_key: string;
+}
+
 export interface ActiveBlock {
   cost: number;
   burn_rate_per_hour: number;

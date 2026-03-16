@@ -1,7 +1,11 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { settings, updateSetting, applyTheme, type Settings as SettingsType } from "../stores/settings.js";
-  import { currencySymbol } from "../utils/format.js";
+  import { currencySymbol, modelColor } from "../utils/format.js";
+  import { copyResizeDebugToClipboard, logResizeDebug } from "../resizeDebug.js";
+  import { syncNativeWindowSurface } from "../windowAppearance.js";
+  import type { KnownModel } from "../types/index.js";
   import SegmentedControl from "./SegmentedControl.svelte";
   import ToggleSwitch from "./ToggleSwitch.svelte";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
@@ -29,6 +33,8 @@
 
   let costInput = $state("50.00");
   let costEnabled = $state(true);
+  let copiedDebug = $state(false);
+  let availableModels = $state<KnownModel[]>([]);
 
   $effect(() => {
     const unsub = settings.subscribe((s) => {
@@ -48,10 +54,23 @@
     }).catch(() => {});
   });
 
+  onMount(() => {
+    invoke<KnownModel[]>("get_known_models", { provider: "all" })
+      .then((models) => {
+        availableModels = [...models].sort((a, b) =>
+          a.display_name.localeCompare(b.display_name, undefined, { sensitivity: "base" })
+        );
+      })
+      .catch((error) => {
+        console.error("Failed to load known models:", error);
+      });
+  });
+
   function handleTheme(val: string) {
     const theme = val as SettingsType["theme"];
     updateSetting("theme", theme);
     applyTheme(theme);
+    void syncNativeWindowSurface().catch(() => {});
   }
 
   function handleProvider(val: string) {
@@ -129,19 +148,21 @@
     invoke("clear_cache").catch(() => {});
   }
 
-  const models = [
-    { key: "opus", name: "Opus", color: "var(--opus)" },
-    { key: "sonnet", name: "Sonnet", color: "var(--sonnet)" },
-    { key: "haiku", name: "Haiku", color: "var(--haiku)" },
-    { key: "o3", name: "o3", color: "var(--o3)" },
-    { key: "o3mini", name: "o3-mini", color: "var(--o3mini)" },
-    { key: "o4mini", name: "o4-mini", color: "var(--o4mini)" },
-    { key: "o1", name: "o1", color: "var(--o1)" },
-    { key: "o1mini", name: "o1-mini", color: "var(--o1mini)" },
-    { key: "gpt54", name: "GPT-5.4", color: "var(--gpt54)" },
-    { key: "gpt53", name: "GPT-5.3", color: "var(--gpt53)" },
-    { key: "gpt52", name: "GPT-5.2", color: "var(--gpt52)" },
-  ];
+  async function copyDebugLog() {
+    logResizeDebug("debug:copy-requested", {
+      source: "settings",
+    });
+    try {
+      await copyResizeDebugToClipboard();
+      copiedDebug = true;
+      setTimeout(() => {
+        copiedDebug = false;
+      }, 1500);
+    } catch (error) {
+      copiedDebug = false;
+      console.error("Failed to copy debug log:", error);
+    }
+  }
 
   const currencies = [
     { value: "USD", label: "USD ($)" },
@@ -300,19 +321,23 @@
             />
           </div>
         </div>
-        <div class="model-grid">
-          {#each models as model}
-            <div class="model-cell">
-              <div class="dot" style:background={model.color}></div>
-              <span class="model-name">{model.name}</span>
-              <ToggleSwitch
-                checked={!current.hiddenModels.includes(model.key)}
-                color={model.color}
-                onChange={() => toggleModel(model.key)}
-              />
-            </div>
-          {/each}
-        </div>
+        {#if availableModels.length > 0}
+          <div class="model-grid">
+            {#each availableModels as model}
+              <div class="model-cell">
+                <div class="dot" style:background={modelColor(model.model_key)}></div>
+                <span class="model-name">{model.display_name}</span>
+                <ToggleSwitch
+                  checked={!current.hiddenModels.includes(model.model_key)}
+                  color={modelColor(model.model_key)}
+                  onChange={() => toggleModel(model.model_key)}
+                />
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="model-empty">No models discovered yet</div>
+        {/if}
       </div>
     </div>
 
@@ -340,7 +365,12 @@
           </select>
         </div>
         <div class="row center">
-          <button class="reset-btn" onclick={resetCache}>Reset Cache</button>
+          <div class="actions">
+            <button class="reset-btn" onclick={copyDebugLog}>
+              {copiedDebug ? "Copied Debug Log" : "Copy Debug Log"}
+            </button>
+            <button class="reset-btn" onclick={resetCache}>Reset Cache</button>
+          </div>
         </div>
       </div>
     </div>
@@ -424,6 +454,12 @@
     justify-content: center;
   }
 
+  .actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
   .label {
     font: 400 10px/1 'Inter', sans-serif;
     color: var(--t1);
@@ -433,6 +469,12 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     padding: 2px 0;
+  }
+
+  .model-empty {
+    padding: 10px;
+    font: 400 9px/1.4 'Inter', sans-serif;
+    color: var(--t3);
   }
 
   .model-cell {

@@ -45,7 +45,21 @@ export function formatTimeAgo(isoString: string): string {
   return `${Math.floor(seconds / 3600)}h ago`;
 }
 
+function hashString(value: string): number {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function hashedModelColor(key: string): string {
+  const hue = hashString(key) % 360;
+  return `hsl(${hue} 58% 56%)`;
+}
+
 export function modelColor(key: string): string {
+  const normalized = key.trim().toLowerCase();
   const colors: Record<string, string> = {
     opus: "var(--opus)",
     sonnet: "var(--sonnet)",
@@ -53,6 +67,14 @@ export function modelColor(key: string): string {
     gpt54: "var(--gpt54)",
     gpt53: "var(--gpt53)",
     gpt52: "var(--gpt52)",
+    gpt51max: "var(--gpt53)",
+    gpt51mini: "var(--o3mini)",
+    gpt51: "var(--gpt52)",
+    gpt5codex: "var(--codex)",
+    codexmini: "var(--o4mini)",
+    gpt5mini: "var(--o3mini)",
+    gpt5nano: "var(--o1mini)",
+    gpt5: "var(--codex)",
     o3: "var(--o3)",
     o3mini: "var(--o3mini)",
     o4mini: "var(--o4mini)",
@@ -61,5 +83,27 @@ export function modelColor(key: string): string {
     codex: "var(--codex)",
     unknown: "var(--t3)",
   };
-  return colors[key] ?? colors.unknown;
+  if (colors[normalized]) return colors[normalized];
+  if (normalized.includes("opus")) return colors.opus;
+  if (normalized.includes("sonnet")) return colors.sonnet;
+  if (normalized.includes("haiku")) return colors.haiku;
+  if (normalized.startsWith("gpt-5.4")) return colors.gpt54;
+  if (normalized.startsWith("gpt-5.3")) return colors.gpt53;
+  if (normalized.startsWith("gpt-5.2")) return colors.gpt52;
+  if (normalized.startsWith("gpt-5.1-codex-mini")) return colors.gpt51mini;
+  if (normalized.startsWith("gpt-5.1-codex-max")) return colors.gpt51max;
+  if (normalized.startsWith("gpt-5.1-codex")) return colors.codex;
+  if (normalized.startsWith("gpt-5.1")) return colors.codex;
+  if (normalized.startsWith("gpt-5-mini")) return colors.gpt5mini;
+  if (normalized.startsWith("gpt-5-nano")) return colors.gpt5nano;
+  if (normalized.startsWith("gpt-5-codex")) return colors.gpt5codex;
+  if (normalized.startsWith("gpt-5")) return colors.gpt5;
+  if (normalized.startsWith("codex-mini")) return colors.codexmini;
+  if (normalized.startsWith("o4-mini")) return colors.o4mini;
+  if (normalized.startsWith("o3-mini")) return colors.o3mini;
+  if (normalized.startsWith("o3")) return colors.o3;
+  if (normalized.startsWith("o1-mini")) return colors.o1mini;
+  if (normalized.startsWith("o1")) return colors.o1;
+  if (normalized === "unknown") return colors.unknown;
+  return hashedModelColor(normalized);
 }

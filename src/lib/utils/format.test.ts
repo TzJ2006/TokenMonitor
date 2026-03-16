@@ -144,13 +144,23 @@ describe("modelColor", () => {
     ["gpt54", "var(--gpt54)"],
     ["gpt53", "var(--gpt53)"],
     ["gpt52", "var(--gpt52)"],
+    ["gpt-5.4", "var(--gpt54)"],
+    ["gpt-5.3-codex", "var(--gpt53)"],
+    ["gpt-5.2", "var(--gpt52)"],
     ["codex", "var(--codex)"],
     ["unknown", "var(--t3)"],
   ])("returns correct CSS var for %s", (key, expected) => {
     expect(modelColor(key)).toBe(expected);
   });
 
-  it("falls back to --t3 for unrecognized key", () => {
-    expect(modelColor("nonexistent")).toBe("var(--t3)");
+  it("keeps palette colors deterministic for raw codex model names", () => {
+    expect(modelColor("gpt-5.4")).toBe(modelColor("gpt-5.4"));
+    expect(modelColor("gpt-5.2")).toBe(modelColor("gpt-5.2"));
+    expect(modelColor("gpt-5.4")).toBe("var(--gpt54)");
+    expect(modelColor("gpt-5.2")).toBe("var(--gpt52)");
+  });
+
+  it("returns a hashed fallback for unrecognized keys", () => {
+    expect(modelColor("nonexistent")).toMatch(/^hsl\(/);
   });
 });
