@@ -41,3 +41,15 @@ export interface ActiveBlock {
   projected_cost: number;
   is_active: boolean;
 }
+
+export interface CalendarDay {
+  day: number;
+  cost: number;
+}
+
+export interface MonthlyUsagePayload {
+  year: number;
+  month: number;
+  days: CalendarDay[];
+  total_cost: number;
+}
