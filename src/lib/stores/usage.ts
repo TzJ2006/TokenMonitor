@@ -4,6 +4,7 @@ import type { UsagePayload } from "../types/index.js";
 
 export const activeProvider = writable<"all" | "claude" | "codex">("claude");
 export const activePeriod = writable<"5h" | "day" | "week" | "month" | "year">("day");
+export const activeOffset = writable<number>(0);
 export const usageData = writable<UsagePayload | null>(null);
 export const isLoading = writable(false);
 
@@ -34,8 +35,8 @@ export const setupStatus = writable({ ready: false, installing: false, error: nu
 const payloadCache = new Map<string, { data: UsagePayload; at: number }>();
 const CACHE_TTL = 300_000; // 5 min — generous; background refresh keeps it current
 
-function cacheKey(provider: string, period: string) {
-  return `${provider}:${period}`;
+function cacheKey(provider: string, period: string, offset: number = 0) {
+  return `${provider}:${period}:${offset}`;
 }
 
 // Monotonically increasing request ID prevents stale responses from
@@ -50,16 +51,16 @@ let currentRequestId = 0;
  * - If no cached data exists, a blocking IPC fetch is performed with a
  *   loading indicator.
  */
-export async function fetchData(provider: string, period: string) {
+export async function fetchData(provider: string, period: string, offset: number = 0) {
   const requestId = ++currentRequestId;
-  const key = cacheKey(provider, period);
+  const key = cacheKey(provider, period, offset);
 
   // ── Stale-while-revalidate: instant show + silent refresh ──
   const cached = payloadCache.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL) {
     usageData.set(cached.data);
     // Silent background refresh — no loading indicator
-    invoke<UsagePayload>("get_usage_data", { provider, period })
+    invoke<UsagePayload>("get_usage_data", { provider, period, offset })
       .then((fresh: UsagePayload) => {
         payloadCache.set(key, { data: fresh, at: Date.now() });
         if (requestId === currentRequestId) {
@@ -84,6 +85,7 @@ export async function fetchData(provider: string, period: string) {
     const data = await invoke<UsagePayload>("get_usage_data", {
       provider,
       period,
+      offset,
     });
     if (requestId === currentRequestId) {
       payloadCache.set(key, { data, at: Date.now() });
@@ -105,9 +107,9 @@ export async function fetchData(provider: string, period: string) {
  * Fire-and-forget: the resolved payload is stored in the frontend cache
  * so subsequent tab switches are synchronous.
  */
-export function warmCache(provider: string, period: string) {
-  const key = cacheKey(provider, period);
-  invoke<UsagePayload>("get_usage_data", { provider, period })
+export function warmCache(provider: string, period: string, offset: number = 0) {
+  const key = cacheKey(provider, period, offset);
+  invoke<UsagePayload>("get_usage_data", { provider, period, offset })
     .then((data: UsagePayload) => {
       payloadCache.set(key, { data, at: Date.now() });
     })
