@@ -1841,8 +1841,29 @@ mod tests {
             .iter()
             .map(|m| m.model_key.as_str())
             .collect();
-        assert!(keys.contains(&"sonnet"), "should include sonnet");
-        assert!(keys.contains(&"opus"), "should include opus");
+        assert!(keys.contains(&"sonnet-4-6"), "should include Sonnet 4.6");
+        assert!(keys.contains(&"opus-4-6"), "should include Opus 4.6");
+    }
+
+    #[test]
+    fn daily_aggregation_keeps_distinct_claude_versions_separate() {
+        let content = r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-opus-4-5","stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":500}}}
+{"type":"assistant","timestamp":"2026-03-15T12:30:00+00:00","message":{"model":"claude-opus-4-6","stop_reason":"end_turn","usage":{"input_tokens":500,"output_tokens":200}}}"#;
+        let (_dir, parser) = make_parser_with_claude_data(content);
+        let payload = parser.get_daily("claude", "20260315");
+
+        assert_eq!(
+            payload.model_breakdown.len(),
+            2,
+            "distinct Claude versions should not collapse into one family bucket"
+        );
+        let keys: Vec<&str> = payload
+            .model_breakdown
+            .iter()
+            .map(|m| m.model_key.as_str())
+            .collect();
+        assert!(keys.contains(&"opus-4-5"), "should include Opus 4.5");
+        assert!(keys.contains(&"opus-4-6"), "should include Opus 4.6");
     }
 
     #[test]

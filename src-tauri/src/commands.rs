@@ -308,7 +308,7 @@ pub async fn get_usage_data(
 /// Recalculates total_cost, total_tokens, and model_breakdown from the retained buckets.
 fn filter_buckets_to_range(payload: &mut UsagePayload, start: NaiveDate, end: NaiveDate) {
     payload.chart_buckets.retain(|bucket| {
-        NaiveDate::parse_from_str(&bucket.sort_key, "%Y-%m-%d")
+        parse_bucket_start_date(&bucket.sort_key)
             .map(|d| d >= start && d < end)
             .unwrap_or(false)
     });
@@ -351,6 +351,11 @@ fn filter_buckets_to_range(payload: &mut UsagePayload, start: NaiveDate, end: Na
     // Recalculate input/output tokens
     payload.input_tokens = 0;
     payload.output_tokens = 0;
+}
+
+fn parse_bucket_start_date(sort_key: &str) -> Result<NaiveDate, chrono::ParseError> {
+    NaiveDate::parse_from_str(sort_key, "%Y-%m-%d")
+        .or_else(|_| NaiveDate::parse_from_str(&format!("{sort_key}-01"), "%Y-%m-%d"))
 }
 
 fn get_provider_data(
@@ -416,8 +421,10 @@ fn get_provider_data(
         "year" => {
             let target_year = now.year() + offset;
             let first_of_year = NaiveDate::from_ymd_opt(target_year, 1, 1).unwrap();
+            let end_of_year = NaiveDate::from_ymd_opt(target_year + 1, 1, 1).unwrap();
             let since_str = first_of_year.format("%Y%m%d").to_string();
             let mut p = parser.get_monthly(provider, &since_str);
+            filter_buckets_to_range(&mut p, first_of_year, end_of_year);
             p.period_label = format_year_label(target_year);
             p.has_earlier_data = parser.has_entries_before(provider, first_of_year);
             p
@@ -773,6 +780,58 @@ mod tests {
         assert_eq!(block.projected_cost, 25.0);
         assert_eq!(merged.five_hour_cost, 5.0);
         assert!(!merged.from_cache);
+    }
+
+    #[test]
+    fn filter_buckets_to_range_supports_monthly_sort_keys() {
+        let mut payload = payload_with_buckets(vec![
+            bucket("Dec", "2025-12", 1.0),
+            bucket("Jan", "2026-01", 2.0),
+            bucket("Feb", "2026-02", 3.0),
+        ]);
+
+        filter_buckets_to_range(
+            &mut payload,
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+        );
+
+        assert_eq!(payload.chart_buckets.len(), 1);
+        assert_eq!(payload.chart_buckets[0].label, "Jan");
+        assert_eq!(payload.total_cost, 2.0);
+    }
+
+    #[test]
+    fn year_period_filters_to_target_year_only() {
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let project_dir = claude_dir.path().join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let current_year = Local::now().year();
+        let previous_year = current_year - 1;
+        let prior_entry = format!(
+            r#"{{"type":"assistant","timestamp":"{previous_year}-06-15T10:00:00-04:00","message":{{"model":"claude-opus-4-6","usage":{{"input_tokens":1000,"output_tokens":500}},"stop_reason":"end_turn"}}}}"#
+        );
+        let current_entry = format!(
+            r#"{{"type":"assistant","timestamp":"{current_year}-03-10T10:00:00-04:00","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":1000,"output_tokens":500}},"stop_reason":"end_turn"}}}}"#
+        );
+        write_file(
+            &project_dir.join("session.jsonl"),
+            &format!("{prior_entry}\n{current_entry}"),
+        );
+
+        let parser = UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        );
+        let payload = get_provider_data(&parser, "claude", "year", -1).unwrap();
+
+        assert_eq!(payload.period_label, previous_year.to_string());
+        assert_eq!(payload.chart_buckets.len(), 1);
+        assert_eq!(payload.chart_buckets[0].sort_key, format!("{previous_year}-06"));
+        assert_eq!(payload.model_breakdown.len(), 1);
+        assert_eq!(payload.model_breakdown[0].model_key, "opus-4-6");
     }
 
     #[test]

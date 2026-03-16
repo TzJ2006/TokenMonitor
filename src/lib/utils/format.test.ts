@@ -139,8 +139,11 @@ describe("formatTimeAgo", () => {
 describe("modelColor", () => {
   it.each([
     ["opus", "var(--opus)"],
+    ["opus-4-6", "var(--opus)"],
     ["sonnet", "var(--sonnet)"],
+    ["sonnet-4-6", "var(--sonnet)"],
     ["haiku", "var(--haiku)"],
+    ["haiku-4-5", "var(--haiku)"],
     ["gpt54", "var(--gpt54)"],
     ["gpt53", "var(--gpt53)"],
     ["gpt52", "var(--gpt52)"],

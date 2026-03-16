@@ -76,17 +76,17 @@ pub struct KnownModel {
 pub fn normalize_claude_model(raw: &str) -> (&str, &str) {
     // Returns (display_name, color_key)
     if raw.contains("opus-4-6") {
-        ("Opus 4.6", "opus")
+        ("Opus 4.6", "opus-4-6")
     } else if raw.contains("opus-4-5") {
-        ("Opus 4.5", "opus")
+        ("Opus 4.5", "opus-4-5")
     } else if raw.contains("sonnet-4-6") {
-        ("Sonnet 4.6", "sonnet")
+        ("Sonnet 4.6", "sonnet-4-6")
     } else if raw.contains("sonnet-4-5") {
-        ("Sonnet 4.5", "sonnet")
+        ("Sonnet 4.5", "sonnet-4-5")
     } else if raw.contains("sonnet") {
         ("Sonnet", "sonnet")
     } else if raw.contains("haiku-4-5") {
-        ("Haiku 4.5", "haiku")
+        ("Haiku 4.5", "haiku-4-5")
     } else if raw.contains("haiku") {
         ("Haiku", "haiku")
     } else {
@@ -140,7 +140,7 @@ mod tests {
     fn claude_opus_4_6() {
         assert_eq!(
             normalize_claude_model("claude-opus-4-6-20260301"),
-            ("Opus 4.6", "opus")
+            ("Opus 4.6", "opus-4-6")
         );
     }
 
@@ -148,7 +148,7 @@ mod tests {
     fn claude_opus_4_5() {
         assert_eq!(
             normalize_claude_model("claude-opus-4-5-20250501"),
-            ("Opus 4.5", "opus")
+            ("Opus 4.5", "opus-4-5")
         );
     }
 
@@ -156,7 +156,7 @@ mod tests {
     fn claude_sonnet_4_6() {
         assert_eq!(
             normalize_claude_model("claude-sonnet-4-6-20260301"),
-            ("Sonnet 4.6", "sonnet")
+            ("Sonnet 4.6", "sonnet-4-6")
         );
     }
 
@@ -164,7 +164,7 @@ mod tests {
     fn claude_sonnet_4_5() {
         assert_eq!(
             normalize_claude_model("claude-sonnet-4-5-20250514"),
-            ("Sonnet 4.5", "sonnet")
+            ("Sonnet 4.5", "sonnet-4-5")
         );
     }
 
@@ -180,7 +180,7 @@ mod tests {
     fn claude_haiku() {
         assert_eq!(
             normalize_claude_model("claude-haiku-4-5-20251001"),
-            ("Haiku 4.5", "haiku")
+            ("Haiku 4.5", "haiku-4-5")
         );
     }
 
