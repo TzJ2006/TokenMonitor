@@ -22,7 +22,7 @@ describe("summarizeModelRows", () => {
     expect(rows[1].display_name).toBe("Sonnet");
   });
 
-  it("collapses the tail into a single aggregate row", () => {
+  it("returns all rows even when many models are present", () => {
     const rows = summarizeModelRows([
       model("Opus", "opus", 10, 100),
       model("Sonnet", "sonnet", 9, 90),
@@ -33,13 +33,7 @@ describe("summarizeModelRows", () => {
       model("o3", "o3", 4, 40),
     ]);
 
-    expect(rows).toHaveLength(6);
-    expect(rows.at(-1)).toEqual({
-      display_name: "2 more models",
-      model_key: "other",
-      cost: 9,
-      tokens: 90,
-      isAggregate: true,
-    });
+    expect(rows).toHaveLength(7);
+    expect(rows.at(-1)).toEqual(model("o3", "o3", 4, 40));
   });
 });
