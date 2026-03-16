@@ -169,6 +169,7 @@ fn merge_payloads(mut c: UsagePayload, x: UsagePayload) -> UsagePayload {
     c.active_block = merge_active_blocks(c.active_block, x.active_block);
     c.five_hour_cost += x.five_hour_cost;
     c.from_cache = c.from_cache && x.from_cache;
+    c.has_earlier_data = c.has_earlier_data && x.has_earlier_data;
     c
 }
 
@@ -229,6 +230,8 @@ mod tests {
             five_hour_cost: 0.0,
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
+            period_label: String::new(),
+            has_earlier_data: false,
         }
     }
 
@@ -288,6 +291,8 @@ mod tests {
             five_hour_cost: 3.0,
             last_updated: Local::now().to_rfc3339(),
             from_cache: true,
+            period_label: String::new(),
+            has_earlier_data: false,
         };
         let right = UsagePayload {
             total_cost: 2.0,
@@ -306,6 +311,8 @@ mod tests {
             five_hour_cost: 2.0,
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
+            period_label: String::new(),
+            has_earlier_data: false,
         };
 
         let merged = merge_payloads(left, right);

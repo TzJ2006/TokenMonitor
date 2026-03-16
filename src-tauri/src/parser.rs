@@ -610,6 +610,8 @@ impl UsageParser {
             five_hour_cost: 0.0,
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
+            period_label: String::new(),
+            has_earlier_data: false,
         };
 
         self.store_cache(&cache_key, payload.clone());
@@ -691,6 +693,8 @@ impl UsageParser {
             five_hour_cost: 0.0,
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
+            period_label: String::new(),
+            has_earlier_data: false,
         };
 
         self.store_cache(&cache_key, payload.clone());
@@ -772,6 +776,8 @@ impl UsageParser {
             five_hour_cost: 0.0,
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
+            period_label: String::new(),
+            has_earlier_data: false,
         };
 
         self.store_cache(&cache_key, payload.clone());
@@ -903,6 +909,8 @@ impl UsageParser {
             five_hour_cost,
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
+            period_label: String::new(),
+            has_earlier_data: false,
         };
 
         self.store_cache(&cache_key, payload.clone());

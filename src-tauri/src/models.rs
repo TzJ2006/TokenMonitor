@@ -15,6 +15,8 @@ pub struct UsagePayload {
     pub five_hour_cost: f64,
     pub last_updated: String,
     pub from_cache: bool,
+    pub period_label: String,
+    pub has_earlier_data: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
