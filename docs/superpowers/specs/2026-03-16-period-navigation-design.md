@@ -74,8 +74,8 @@ pub fn has_entries_before(&self, provider: &str, before_date: NaiveDate) -> bool
 
 Checks whether any log entries exist with a timestamp before `before_date`.
 
-- **Claude:** Call `read_claude_entries` with `since: None` (no date filter — this disables the `modified_since` file-skip optimisation, since we need to read *old* files). Iterate entries and return `true` on the first entry with `timestamp.date_naive() < before_date`. This scans all files but bails early on the first match.
-- **Codex:** Iterate `YYYY/MM/DD` date directories under `~/.codex/sessions/`. For each directory whose date is before `before_date`, check if any `.jsonl` files exist. Return `true` on first match. This is a cheap filesystem check with no file parsing.
+- **Claude:** This is a **new iteration loop** that does NOT reuse `read_claude_entries` (which collects all entries into a Vec and cannot bail early). Instead: glob `.jsonl` files under `claude_dir` (no `modified_since` filter — we need old files), open each file, scan lines for assistant entries, and return `true` on the first parsed entry with `timestamp.date_naive() < before_date`. Bail immediately — no need to continue scanning.
+- **Codex:** This is also **new code** (does not reuse `read_codex_entries`). Iterate `YYYY/MM/DD` date directories under `~/.codex/sessions/`. For each directory whose date is before `before_date`, check if any `.jsonl` files exist. Return `true` on first match. This is a cheap filesystem check with no file parsing.
 
 Performance note: for users with many years of Claude log files, the Claude path may be slow on the first call because it globs all `.jsonl` files. Future optimisation (out of scope): cache the earliest-known date per provider.
 
@@ -182,7 +182,7 @@ async function handleOffsetChange(delta: number) {
   // Guard for stale fetch
   dataKey = `${provider}-${period}-${offset}-${Date.now()}`;
   await tick();
-  syncSize();
+  syncSizeAndVerify();
 }
 
 async function handleOffsetReset() {
@@ -192,7 +192,7 @@ async function handleOffsetReset() {
   await fetchData(provider, period, 0);
   dataKey = `${provider}-${period}-0-${Date.now()}`;
   await tick();
-  syncSize();
+  syncSizeAndVerify();
 }
 ```
 
