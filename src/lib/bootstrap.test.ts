@@ -15,6 +15,7 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     currency: "USD",
     hiddenModels: [],
     brandTheming: true,
+    showTrayAmount: true,
     ...overrides,
   };
 }
@@ -42,6 +43,7 @@ describe("initializeRuntimeFromSettings", () => {
 
     expect(applyThemeFn).toHaveBeenCalledWith("system");
     expect(invokeFn).toHaveBeenCalledWith("set_refresh_interval", { interval: 300 });
+    expect(invokeFn).toHaveBeenCalledWith("set_show_tray_amount", { show: true });
     expect(get(activeProvider)).toBe("codex");
     expect(get(activePeriod)).toBe("month");
     expect(runtime).toEqual({ provider: "codex", period: "month" });
