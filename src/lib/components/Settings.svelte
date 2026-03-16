@@ -182,7 +182,7 @@
       </svg>
       <span>Settings</span>
     </button>
-    <span class="ver">v0.1.0</span>
+    <span class="ver">v0.2.0</span>
   </div>
 
   <div class="scroll">
