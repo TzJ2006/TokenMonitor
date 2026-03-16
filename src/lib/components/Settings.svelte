@@ -23,6 +23,8 @@
     hiddenModels: [],
     brandTheming: true,
     showTrayAmount: true,
+    claudePlan: 0,
+    codexPlan: 0,
   });
 
   let costInput = $state("50.00");
@@ -58,6 +60,14 @@
 
   function handleBrandTheming(checked: boolean) {
     updateSetting("brandTheming", checked);
+  }
+
+  function handleClaudePlan(val: string) {
+    updateSetting("claudePlan", parseInt(val));
+  }
+
+  function handleCodexPlan(val: string) {
+    updateSetting("codexPlan", parseInt(val));
   }
 
   function handleShowTrayAmount(checked: boolean) {
@@ -220,6 +230,38 @@
           <ToggleSwitch
             checked={current.showTrayAmount}
             onChange={handleShowTrayAmount}
+          />
+        </div>
+      </div>
+    </div>
+
+    <!-- Plan -->
+    <div class="group">
+      <div class="group-label">Plan</div>
+      <div class="card">
+        <div class="row border">
+          <span class="label">Claude Plan</span>
+          <SegmentedControl
+            options={[
+              { value: "0", label: "None" },
+              { value: "20", label: "$20" },
+              { value: "100", label: "$100" },
+              { value: "200", label: "$200" },
+            ]}
+            value={String(current.claudePlan)}
+            onChange={handleClaudePlan}
+          />
+        </div>
+        <div class="row">
+          <span class="label">Codex Plan</span>
+          <SegmentedControl
+            options={[
+              { value: "0", label: "None" },
+              { value: "20", label: "$20" },
+              { value: "200", label: "$200" },
+            ]}
+            value={String(current.codexPlan)}
+            onChange={handleCodexPlan}
           />
         </div>
       </div>
