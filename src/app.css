@@ -1,5 +1,12 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
 
+/* ── Registered custom properties (enables color interpolation for transitions) ── */
+@property --provider-bg {
+  syntax: '<color>';
+  initial-value: transparent;
+  inherits: true;
+}
+
 /* ── Model colors — Warm & Cool palette ── */
 :root {
   --opus: #C4704B;
@@ -61,6 +68,7 @@
   --accent: var(--t2);
   --accent-soft: rgba(255,255,255,0.06);
   --provider-bg: transparent;
+  transition: --provider-bg 0.5s ease;
 }
 [data-theme="light"] {
   --accent-soft: rgba(0,0,0,0.04);

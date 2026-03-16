@@ -137,8 +137,9 @@ pub async fn sync_tray_title(app: &tauri::AppHandle, state: &AppState) {
     let show = *state.show_tray_amount.read().await;
     let title = if show {
         let today = Local::now().format("%Y%m%d").to_string();
-        let payload = state.parser.get_daily("claude", &today);
-        format_tray_title(true, payload.total_cost)
+        let claude = state.parser.get_daily("claude", &today);
+        let codex = state.parser.get_daily("codex", &today);
+        format_tray_title(true, claude.total_cost + codex.total_cost)
     } else {
         format_tray_title(false, 0.0)
     };

@@ -527,7 +527,7 @@
       {:else if data.total_cost === 0 && data.total_tokens === 0}
         <div class="empty-period">No usage data for this period</div>
       {:else}
-        <Chart buckets={data.chart_buckets} />
+        <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} />
       {/if}
 
       {#if period !== "5h" && data.model_breakdown.length > 0}
@@ -567,7 +567,6 @@
   .pop-content {
     min-width: 0;
     min-height: 100%;
-    background: var(--surface);
   }
   .hr { height: 1px; background: var(--border-subtle); margin: 0 12px; }
   .loading {
