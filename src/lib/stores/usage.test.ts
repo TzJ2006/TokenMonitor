@@ -51,6 +51,7 @@ describe("fetchData", () => {
     expect(mockInvoke).toHaveBeenCalledWith("get_usage_data", {
       provider: "claude",
       period: "day",
+      offset: 0,
     });
     expect(get(usageData)).toEqual(payload);
     expect(get(isLoading)).toBe(false);
@@ -132,6 +133,7 @@ describe("warmCache", () => {
       expect(mockInvoke).toHaveBeenCalledWith("get_usage_data", {
         provider: "claude",
         period: "week",
+        offset: 0,
       });
     });
 

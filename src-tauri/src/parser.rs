@@ -1263,29 +1263,35 @@ mod tests {
 
     #[test]
     fn hourly_aggregation_groups_by_hour() {
-        // Use today's date so entries are not filtered out by "today only" logic
-        let today = Local::now().format("%Y-%m-%dT").to_string();
+        // Use local timestamps at past hours so hour values are guaranteed to be
+        // <= current_hour regardless of the system timezone.
+        let now = Local::now();
+        let ts1 = (now - chrono::Duration::hours(2)).to_rfc3339();
+        let ts2 = (now - chrono::Duration::hours(1)).to_rfc3339();
         let content = format!(
-            r#"{{"type":"assistant","timestamp":"{today}09:00:00+00:00","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":1000,"output_tokens":500}}}}}}
-{{"type":"assistant","timestamp":"{today}14:00:00+00:00","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":2000,"output_tokens":1000}}}}}}"#,
-            today = today
+            r#"{{"type":"assistant","timestamp":"{ts1}","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":1000,"output_tokens":500}}}}}}
+{{"type":"assistant","timestamp":"{ts2}","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":2000,"output_tokens":1000}}}}}}"#,
         );
 
         let dir = TempDir::new().unwrap();
         write_file(&dir.path().join("session.jsonl"), &content);
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
 
-        let today_str = Local::now().format("%Y%m%d").to_string();
+        let today_str = now.format("%Y%m%d").to_string();
         let payload = parser.get_hourly("claude", &today_str);
 
-        // Should have buckets covering from min_hour (9) to current hour
+        // Should have buckets covering from min_hour to current_hour
         assert!(
             !payload.chart_buckets.is_empty(),
             "should produce chart buckets"
         );
-        // At minimum 9AM bucket should exist
-        let has_9am = payload.chart_buckets.iter().any(|b| b.label == "9AM");
-        assert!(has_9am, "should have a 9AM bucket");
+        // The entry 2 hours ago should appear in the buckets
+        let two_hours_ago_label = format_hour((now - chrono::Duration::hours(2)).hour());
+        let has_bucket = payload
+            .chart_buckets
+            .iter()
+            .any(|b| b.label == two_hours_ago_label);
+        assert!(has_bucket, "should have a bucket for 2 hours ago");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
