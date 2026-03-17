@@ -15,6 +15,11 @@ function clampChannel(value: number): number {
   return Math.max(0, Math.min(255, Math.round(value)));
 }
 
+function parseHexChannel(value: string): number | null {
+  const parsed = parseInt(value, 16);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export function parseCssColor(value: string): WindowSurface | null {
   const color = value.trim();
   if (!color) return null;
@@ -23,20 +28,34 @@ export function parseCssColor(value: string): WindowSurface | null {
     const hex = color.slice(1);
     if (hex.length === 3 || hex.length === 4) {
       const [r, g, b, a = "f"] = hex.split("");
+      const red = parseHexChannel(`${r}${r}`);
+      const green = parseHexChannel(`${g}${g}`);
+      const blue = parseHexChannel(`${b}${b}`);
+      const alpha = parseHexChannel(`${a}${a}`);
+      if ([red, green, blue, alpha].some((part) => part == null)) {
+        return null;
+      }
       return {
-        red: parseInt(`${r}${r}`, 16),
-        green: parseInt(`${g}${g}`, 16),
-        blue: parseInt(`${b}${b}`, 16),
-        alpha: parseInt(`${a}${a}`, 16),
+        red,
+        green,
+        blue,
+        alpha,
       };
     }
 
     if (hex.length === 6 || hex.length === 8) {
+      const red = parseHexChannel(hex.slice(0, 2));
+      const green = parseHexChannel(hex.slice(2, 4));
+      const blue = parseHexChannel(hex.slice(4, 6));
+      const alpha = hex.length === 8 ? parseHexChannel(hex.slice(6, 8)) : 255;
+      if ([red, green, blue, alpha].some((part) => part == null)) {
+        return null;
+      }
       return {
-        red: parseInt(hex.slice(0, 2), 16),
-        green: parseInt(hex.slice(2, 4), 16),
-        blue: parseInt(hex.slice(4, 6), 16),
-        alpha: hex.length === 8 ? parseInt(hex.slice(6, 8), 16) : 255,
+        red,
+        green,
+        blue,
+        alpha,
       };
     }
 
