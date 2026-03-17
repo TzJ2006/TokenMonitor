@@ -1,199 +1,102 @@
-import { get, writable } from "svelte/store";
+import { derived, get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
-import { providerHasActiveCooldown } from "../rateLimitsView.js";
+import {
+  createRateLimitsMonitorState,
+  eligibleProviders,
+  hasUsableRateLimitWindows,
+  inferLastSuccessfulAt,
+  mergeProviderRateLimits,
+  providerDeferredUntil,
+  providerPayload,
+  RATE_LIMIT_PROVIDER_ORDER,
+  RATE_LIMIT_PROVIDER_POLICIES,
+  replaceProviderPayload,
+  requestedProviders,
+  scopeRateLimitRequestState,
+  shouldSuppressProviderError,
+  type RateLimitProvider,
+  type RateLimitScope,
+} from "../rateLimitMonitor.js";
 import type {
   ProviderRateLimits,
+  RateLimitsMonitorState,
   RateLimitsPayload,
-  UsageProvider,
 } from "../types/index.js";
 
-type RequestScope = UsageProvider;
-type ProviderScope = Exclude<UsageProvider, "all">;
-
-interface RateLimitsRequestState {
-  loading: boolean;
-  loaded: boolean;
-  error: string | null;
-  deferredUntil: string | null;
-}
-
-const CACHE_FILE = "rate-limits.json";
 const CACHE_KEY = "payload";
-const CLAUDE_MIN_FETCH_INTERVAL_MS = 300_000;
-const PROVIDER_MIN_FETCH_INTERVAL_MS: Record<ProviderScope, number> = {
-  claude: CLAUDE_MIN_FETCH_INTERVAL_MS,
-  codex: 0,
-};
-const DEFAULT_REQUEST_STATE: RateLimitsRequestState = {
-  loading: false,
-  loaded: false,
-  error: null,
-  deferredUntil: null,
-};
+const LEGACY_CACHE_FILE = "rate-limits.json";
+const LAST_SUCCESSFUL_AT_KEY = "lastSuccessfulAt";
+
+interface PersistedProviderRateLimitRecord {
+  payload: ProviderRateLimits | null;
+  lastSuccessfulAt: string | null;
+}
 
 export const rateLimitsData = writable<RateLimitsPayload | null>(null);
-export const rateLimitsRequestState =
-  writable<RateLimitsRequestState>({ ...DEFAULT_REQUEST_STATE });
+export const rateLimitsMonitorState = writable<RateLimitsMonitorState>(createRateLimitsMonitorState());
 
-let storeInstance: Awaited<ReturnType<typeof load>> | null = null;
+const requestedScopeStore = writable<RateLimitScope>("all");
+
+export const rateLimitsRequestState = derived(
+  [rateLimitsMonitorState, requestedScopeStore],
+  ([$monitorState, $scope]) => scopeRateLimitRequestState($monitorState, $scope),
+);
+
+let providerStores: Partial<Record<RateLimitProvider, Awaited<ReturnType<typeof load>>>> = {};
+let legacyStore: Awaited<ReturnType<typeof load>> | null = null;
 let hydratePromise: Promise<void> | null = null;
-let inflightFetch: Promise<void> | null = null;
-let retryTimer: ReturnType<typeof setTimeout> | null = null;
-let lastRequestedScope: RequestScope = "all";
+let inflightFetches: Partial<Record<RateLimitProvider, Promise<void>>> = {};
+let retryTimers: Partial<Record<RateLimitProvider, ReturnType<typeof setTimeout>>> = {};
+let lastRequestedScope: RateLimitScope = "all";
 
-function requestedProviders(scope: RequestScope): ProviderScope[] {
-  return scope === "all" ? ["claude", "codex"] : [scope];
-}
-
-function providerPayload(
-  payload: RateLimitsPayload | null,
-  provider: ProviderScope,
-): ProviderRateLimits | null {
-  if (!payload) return null;
-  return provider === "claude" ? payload.claude : payload.codex;
-}
-
-function mergeProviderRateLimits(
-  fresh: ProviderRateLimits | null | undefined,
-  cached: ProviderRateLimits | null | undefined,
-): ProviderRateLimits | null {
-  if (fresh && cached && fresh.windows.length === 0 && fresh.error && cached.windows.length > 0) {
-    return {
-      ...cached,
-      stale: true,
-      error: fresh.error,
-      retryAfterSeconds: fresh.retryAfterSeconds,
-      cooldownUntil: fresh.cooldownUntil,
-      fetchedAt: fresh.fetchedAt,
-    };
-  }
-
-  return fresh ?? cached ?? null;
-}
-
-function mergeRateLimitsPayloads(
-  fresh: RateLimitsPayload,
-  cached: RateLimitsPayload | null,
-): RateLimitsPayload {
-  return {
-    claude: mergeProviderRateLimits(fresh.claude, cached?.claude),
-    codex: mergeProviderRateLimits(fresh.codex, cached?.codex),
-  };
-}
-
-function providerThrottleUntil(
-  rateLimits: ProviderRateLimits | null,
-  provider: ProviderScope,
-  now = Date.now(),
-): string | null {
-  const minIntervalMs = PROVIDER_MIN_FETCH_INTERVAL_MS[provider];
-  if (!rateLimits || minIntervalMs <= 0) return null;
-
-  const fetchedAtMs = new Date(rateLimits.fetchedAt).getTime();
-  if (!Number.isFinite(fetchedAtMs)) return null;
-
-  const throttleUntilMs = fetchedAtMs + minIntervalMs;
-  if (throttleUntilMs <= now) return null;
-
-  return new Date(throttleUntilMs).toISOString();
-}
-
-function providerDeferredUntil(
-  payload: RateLimitsPayload | null,
-  provider: ProviderScope,
-  now = Date.now(),
-): string | null {
-  const rateLimits = providerPayload(payload, provider);
-  const activeCooldownUntil = providerHasActiveCooldown(rateLimits, now)
-    ? rateLimits?.cooldownUntil ?? null
-    : null;
-  const throttleUntil = providerThrottleUntil(rateLimits, provider, now);
-
-  if (activeCooldownUntil && throttleUntil) {
-    return new Date(activeCooldownUntil).getTime() >= new Date(throttleUntil).getTime()
-      ? activeCooldownUntil
-      : throttleUntil;
-  }
-
-  return activeCooldownUntil ?? throttleUntil;
-}
-
-function earliestDeferredUntil(
-  payload: RateLimitsPayload | null,
-  scope: RequestScope,
-): string | null {
-  const deferredProviders = requestedProviders(scope)
-    .map((provider) => providerDeferredUntil(payload, provider))
-    .filter((value): value is string => Boolean(value));
-
-  if (deferredProviders.length === 0) return null;
-  deferredProviders.sort((left, right) => {
-    return new Date(left).getTime() - new Date(right).getTime();
+async function ensureProviderStore(provider: RateLimitProvider) {
+  if (providerStores[provider]) return providerStores[provider];
+  const store = await load(RATE_LIMIT_PROVIDER_POLICIES[provider].cacheFile, {
+    defaults: {},
+    autoSave: true,
   });
-  return deferredProviders[0];
+  providerStores[provider] = store;
+  return store;
 }
 
-function eligibleProviders(
-  payload: RateLimitsPayload | null,
-  scope: RequestScope,
-): ProviderScope[] {
-  return requestedProviders(scope).filter((provider) => {
-    return providerDeferredUntil(payload, provider) === null;
-  });
+async function ensureLegacyStore() {
+  if (legacyStore) return legacyStore;
+  legacyStore = await load(LEGACY_CACHE_FILE, { defaults: {}, autoSave: true });
+  return legacyStore;
 }
 
-function fetchScopeFor(
-  payload: RateLimitsPayload | null,
-  scope: RequestScope,
-): RequestScope | null {
-  const eligible = eligibleProviders(payload, scope);
-  if (eligible.length === 0) return null;
-  if (scope !== "all") return scope;
-  if (eligible.length === 2) return "all";
-  return eligible[0];
+async function readPersistedProviderRecord(
+  provider: RateLimitProvider,
+): Promise<PersistedProviderRateLimitRecord> {
+  const store = await ensureProviderStore(provider);
+  const payload = (await store.get<ProviderRateLimits | null>(CACHE_KEY)) ?? null;
+  const lastSuccessfulAt =
+    (await store.get<string | null>(LAST_SUCCESSFUL_AT_KEY)) ?? inferLastSuccessfulAt(payload);
+  return { payload, lastSuccessfulAt };
 }
 
-function clearRetryTimer() {
-  if (!retryTimer) return;
-  clearTimeout(retryTimer);
-  retryTimer = null;
-}
-
-function scheduleRetry(payload: RateLimitsPayload | null, scope: RequestScope) {
-  clearRetryTimer();
-
-  const deferredUntil = earliestDeferredUntil(payload, scope);
-  rateLimitsRequestState.update((state) => ({
-    ...state,
-    deferredUntil,
-  }));
-
-  if (!deferredUntil) return;
-
-  const delay = new Date(deferredUntil).getTime() - Date.now();
-  if (delay <= 0) return;
-
-  retryTimer = setTimeout(() => {
-    retryTimer = null;
-    void fetchRateLimits(lastRequestedScope);
-  }, delay + 50);
-}
-
-async function ensureStore() {
-  if (storeInstance) return storeInstance;
-  storeInstance = await load(CACHE_FILE, { defaults: {}, autoSave: true });
-  return storeInstance;
-}
-
-async function persistRateLimits(payload: RateLimitsPayload | null): Promise<void> {
-  if (!storeInstance) return;
-
+async function readLegacyPayload(): Promise<RateLimitsPayload | null> {
   try {
-    await storeInstance.set(CACHE_KEY, payload);
-    await storeInstance.save();
+    const store = await ensureLegacyStore();
+    return (await store.get<RateLimitsPayload | null>(CACHE_KEY)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function persistProviderRecord(
+  provider: RateLimitProvider,
+  payload: ProviderRateLimits | null,
+  lastSuccessfulAt: string | null,
+): Promise<void> {
+  try {
+    const store = await ensureProviderStore(provider);
+    await store.set(CACHE_KEY, payload);
+    await store.set(LAST_SUCCESSFUL_AT_KEY, lastSuccessfulAt);
+    await store.save();
   } catch (error) {
-    console.warn("Failed to persist rate limits:", error);
+    console.warn(`Failed to persist ${provider} rate limits:`, error);
   }
 }
 
@@ -203,80 +106,219 @@ function formatFetchError(error: unknown): string {
   return "Failed to fetch rate limits.";
 }
 
+function updateProviderMonitorState(
+  provider: RateLimitProvider,
+  updater: (current: RateLimitsMonitorState[RateLimitProvider]) => RateLimitsMonitorState[RateLimitProvider],
+) {
+  rateLimitsMonitorState.update((state) => ({
+    ...state,
+    [provider]: updater(state[provider]),
+  }));
+}
+
+function clearRetryTimer(provider: RateLimitProvider) {
+  const timer = retryTimers[provider];
+  if (!timer) return;
+  clearTimeout(timer);
+  delete retryTimers[provider];
+}
+
+function scheduleProviderRetry(
+  payload: RateLimitsPayload | null,
+  provider: RateLimitProvider,
+) {
+  clearRetryTimer(provider);
+
+  const deferredUntil = providerDeferredUntil(providerPayload(payload, provider), provider);
+  updateProviderMonitorState(provider, (state) => ({
+    ...state,
+    deferredUntil,
+  }));
+
+  if (!deferredUntil) return;
+
+  const delay = new Date(deferredUntil).getTime() - Date.now();
+  if (delay <= 0) return;
+
+  retryTimers[provider] = setTimeout(() => {
+    delete retryTimers[provider];
+    void fetchRateLimits(provider);
+  }, delay + 50);
+}
+
+function scheduleScopeRetries(
+  payload: RateLimitsPayload | null,
+  scope: RateLimitScope,
+) {
+  const activeProviders = new Set(requestedProviders(scope));
+  for (const provider of RATE_LIMIT_PROVIDER_ORDER) {
+    if (!activeProviders.has(provider)) {
+      clearRetryTimer(provider);
+      continue;
+    }
+    scheduleProviderRetry(payload, provider);
+  }
+}
+
+function mergedPayloadOrNull(payload: RateLimitsPayload): RateLimitsPayload | null {
+  if (!payload.claude && !payload.codex) return null;
+  return payload;
+}
+
+function hydrateProviderMonitorState(
+  provider: RateLimitProvider,
+  payload: ProviderRateLimits | null,
+  lastSuccessfulAt: string | null,
+) {
+  updateProviderMonitorState(provider, () => ({
+    loading: false,
+    loaded: payload !== null || lastSuccessfulAt !== null,
+    error: hasUsableRateLimitWindows(payload) ? null : payload?.error ?? null,
+    deferredUntil: providerDeferredUntil(payload, provider),
+    failureStreak: 0,
+    lastAttemptAt: payload?.fetchedAt ?? null,
+    lastSuccessAt: lastSuccessfulAt,
+  }));
+}
+
+async function fetchProviderRateLimits(provider: RateLimitProvider): Promise<void> {
+  if (inflightFetches[provider]) return inflightFetches[provider];
+
+  const currentPayload = get(rateLimitsData);
+  const cachedProvider = providerPayload(currentPayload, provider);
+
+  updateProviderMonitorState(provider, (state) => ({
+    ...state,
+    loading: true,
+    error: null,
+    deferredUntil: providerDeferredUntil(cachedProvider, provider),
+  }));
+
+  const startedAt = new Date().toISOString();
+
+  inflightFetches[provider] = (async () => {
+    try {
+      const freshPayload = await invoke<RateLimitsPayload>("get_rate_limits", {
+        provider,
+      });
+
+      const freshProvider = providerPayload(freshPayload, provider);
+      const payloadBeforeMerge = get(rateLimitsData);
+      const cachedBeforeMerge = providerPayload(payloadBeforeMerge, provider);
+      const previousMonitor = get(rateLimitsMonitorState)[provider];
+      const mergedProvider = mergeProviderRateLimits(freshProvider, cachedBeforeMerge);
+      const nextPayload = mergedPayloadOrNull(
+        replaceProviderPayload(payloadBeforeMerge, provider, mergedProvider),
+      );
+
+      const hadPriorUsableData = hasUsableRateLimitWindows(cachedBeforeMerge);
+      const freshError = freshProvider?.error ?? null;
+      const lastAttemptAt = freshProvider?.fetchedAt ?? startedAt;
+      const failureStreak = freshError ? previousMonitor.failureStreak + 1 : 0;
+      const lastSuccessfulAt = freshError
+        ? previousMonitor.lastSuccessAt
+        : freshProvider?.fetchedAt ?? previousMonitor.lastSuccessAt ?? startedAt;
+
+      rateLimitsData.set(nextPayload);
+      updateProviderMonitorState(provider, (state) => ({
+        ...state,
+        loading: false,
+        loaded: true,
+        error: shouldSuppressProviderError(hadPriorUsableData, previousMonitor.failureStreak)
+          ? null
+          : hasUsableRateLimitWindows(mergedProvider)
+            ? null
+            : freshError,
+        deferredUntil: providerDeferredUntil(mergedProvider, provider),
+        failureStreak,
+        lastAttemptAt,
+        lastSuccessAt: lastSuccessfulAt,
+      }));
+
+      await persistProviderRecord(provider, mergedProvider, lastSuccessfulAt);
+      scheduleProviderRetry(nextPayload, provider);
+    } catch (error) {
+      console.error(`Failed to fetch ${provider} rate limits:`, error);
+      const previousMonitor = get(rateLimitsMonitorState)[provider];
+      const currentData = get(rateLimitsData);
+      const currentProvider = providerPayload(currentData, provider);
+      const hadPriorUsableData = hasUsableRateLimitWindows(currentProvider);
+      const formattedError = formatFetchError(error);
+
+      updateProviderMonitorState(provider, (state) => ({
+        ...state,
+        loading: false,
+        loaded: true,
+        error: shouldSuppressProviderError(hadPriorUsableData, previousMonitor.failureStreak)
+          ? null
+          : formattedError,
+        deferredUntil: providerDeferredUntil(currentProvider, provider),
+        failureStreak: previousMonitor.failureStreak + 1,
+        lastAttemptAt: startedAt,
+      }));
+
+      scheduleProviderRetry(currentData, provider);
+    } finally {
+      delete inflightFetches[provider];
+    }
+  })();
+
+  return inflightFetches[provider];
+}
+
 export async function hydrateRateLimits(): Promise<void> {
   if (hydratePromise) return hydratePromise;
 
   hydratePromise = (async () => {
-    try {
-      const store = await ensureStore();
-      const cached = (await store.get<RateLimitsPayload | null>(CACHE_KEY)) ?? null;
-      if (!cached) return;
-      rateLimitsData.set(cached);
-      scheduleRetry(cached, lastRequestedScope);
-    } catch (error) {
-      console.warn("Failed to load persisted rate limits:", error);
+    const [legacyPayload, claudeRecord, codexRecord] = await Promise.all([
+      readLegacyPayload(),
+      readPersistedProviderRecord("claude"),
+      readPersistedProviderRecord("codex"),
+    ]);
+
+    const payload: RateLimitsPayload = {
+      claude: claudeRecord.payload ?? legacyPayload?.claude ?? null,
+      codex: codexRecord.payload ?? legacyPayload?.codex ?? null,
+    };
+
+    const normalizedPayload = mergedPayloadOrNull(payload);
+    if (normalizedPayload) {
+      rateLimitsData.set(normalizedPayload);
     }
+
+    const claudeLastSuccess = claudeRecord.lastSuccessfulAt ?? inferLastSuccessfulAt(payload.claude);
+    const codexLastSuccess = codexRecord.lastSuccessfulAt ?? inferLastSuccessfulAt(payload.codex);
+
+    hydrateProviderMonitorState("claude", payload.claude, claudeLastSuccess);
+    hydrateProviderMonitorState("codex", payload.codex, codexLastSuccess);
+
+    if (legacyPayload) {
+      const migrations: Promise<void>[] = [];
+      if (!claudeRecord.payload && payload.claude) {
+        migrations.push(persistProviderRecord("claude", payload.claude, claudeLastSuccess));
+      }
+      if (!codexRecord.payload && payload.codex) {
+        migrations.push(persistProviderRecord("codex", payload.codex, codexLastSuccess));
+      }
+      await Promise.all(migrations);
+    }
+
+    scheduleScopeRetries(normalizedPayload, lastRequestedScope);
   })();
 
   return hydratePromise;
 }
 
-export async function fetchRateLimits(scope: RequestScope = "all"): Promise<void> {
+export async function fetchRateLimits(scope: RateLimitScope = "all"): Promise<void> {
   lastRequestedScope = scope;
+  requestedScopeStore.set(scope);
   await hydrateRateLimits();
 
   const cached = get(rateLimitsData);
-  const fetchScope = fetchScopeFor(cached, scope);
-  if (!fetchScope) {
-    scheduleRetry(cached, scope);
-    rateLimitsRequestState.set({
-      loading: false,
-      loaded: true,
-      error: null,
-      deferredUntil: earliestDeferredUntil(cached, scope),
-    });
-    return;
-  }
+  scheduleScopeRetries(cached, scope);
 
-  if (inflightFetch) return inflightFetch;
+  const providers = eligibleProviders(cached, scope);
+  if (providers.length === 0) return;
 
-  rateLimitsRequestState.set({
-    ...get(rateLimitsRequestState),
-    loading: true,
-    error: null,
-    deferredUntil: earliestDeferredUntil(cached, scope),
-  });
-
-  inflightFetch = (async () => {
-    try {
-      const payload = await invoke<RateLimitsPayload>("get_rate_limits", {
-        provider: fetchScope === "all" ? null : fetchScope,
-      });
-      const mergedPayload = mergeRateLimitsPayloads(payload, cached);
-
-      rateLimitsData.set(mergedPayload);
-      await persistRateLimits(mergedPayload);
-      scheduleRetry(mergedPayload, scope);
-      rateLimitsRequestState.set({
-        loading: false,
-        loaded: true,
-        error: null,
-        deferredUntil: earliestDeferredUntil(mergedPayload, scope),
-      });
-    } catch (error) {
-      console.error("Failed to fetch rate limits:", error);
-      const deferredUntil = earliestDeferredUntil(get(rateLimitsData), scope);
-      scheduleRetry(get(rateLimitsData), scope);
-      rateLimitsRequestState.set({
-        loading: false,
-        loaded: true,
-        error: formatFetchError(error),
-        deferredUntil,
-      });
-    } finally {
-      inflightFetch = null;
-    }
-  })();
-
-  return inflightFetch;
+  await Promise.all(providers.map((provider) => fetchProviderRateLimits(provider)));
 }
