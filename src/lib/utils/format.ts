@@ -45,6 +45,33 @@ export function formatTimeAgo(isoString: string): string {
   return `${Math.floor(seconds / 3600)}h ago`;
 }
 
+export function formatResetsIn(isoString: string | null): string {
+  if (!isoString) return "";
+  const ms = new Date(isoString).getTime() - Date.now();
+  if (ms <= 0) return "resetting...";
+  const hours = Math.floor(ms / 3_600_000);
+  const minutes = Math.floor((ms % 3_600_000) / 60_000);
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24);
+    return `Resets in ${days}d ${hours % 24}h`;
+  }
+  return hours > 0 ? `Resets in ${hours}h ${minutes}m` : `Resets in ${minutes}m`;
+}
+
+export function formatRetryIn(isoString: string | null): string {
+  if (!isoString) return "";
+  const ms = new Date(isoString).getTime() - Date.now();
+  if (ms <= 0) return "Retrying...";
+
+  const totalSeconds = Math.ceil(ms / 1000);
+  if (totalSeconds < 60) return `Retry in ${totalSeconds}s`;
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.ceil((totalSeconds % 3600) / 60);
+  if (hours > 0) return `Retry in ${hours}h ${minutes}m`;
+  return `Retry in ${minutes}m`;
+}
+
 function hashString(value: string): number {
   let hash = 0;
   for (let i = 0; i < value.length; i += 1) {
