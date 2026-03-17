@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { formatResetsIn, formatRetryIn } from "../utils/format.js";
+  import { formatRetryIn } from "../utils/format.js";
   import {
     providerHasActiveCooldown,
     providerRateLimitViewState,
+    rateLimitWindowResetLabel,
   } from "../rateLimitsView.js";
   import type { ProviderRateLimits, RateLimitWindow } from "../types/index.js";
 
@@ -29,11 +30,34 @@
 
   function resetsIn(isoString: string | null): string {
     void refreshTick;
-    return formatResetsIn(isoString);
+    return rateLimitWindowResetLabel(rateLimits, isoString);
+  }
+
+  function paceDelta(w: RateLimitWindow, windowHours: number): number | null {
+    void refreshTick;
+    if (!w.resetsAt) return null;
+    const resetMs = new Date(w.resetsAt).getTime();
+    const now = Date.now();
+    const remainingMs = resetMs - now;
+    if (remainingMs <= 0) return null;
+    const totalMs = windowHours * 3_600_000;
+    const elapsedMs = totalMs - remainingMs;
+    if (elapsedMs <= 0) return null;
+    return (elapsedMs / totalMs) * 100 - w.utilization;
   }
 
   function paceLabel(w: RateLimitWindow, windowHours: number): string {
+    const delta = paceDelta(w, windowHours);
+    if (delta === null) return "";
+    const abs = Math.abs(Math.round(delta));
+    if (abs < 2) return "on pace";
+    if (delta > 0) return `${abs}% under`;
+    return `${abs}% over`;
+  }
+
+  function etaToLimit(w: RateLimitWindow, windowHours: number): string {
     void refreshTick;
+    if (w.utilization <= 0 || w.utilization >= 95) return "";
     if (!w.resetsAt) return "";
     const resetMs = new Date(w.resetsAt).getTime();
     const now = Date.now();
@@ -41,30 +65,19 @@
     if (remainingMs <= 0) return "";
     const totalMs = windowHours * 3_600_000;
     const elapsedMs = totalMs - remainingMs;
-    if (elapsedMs <= 0) return "";
-    const uniformPct = (elapsedMs / totalMs) * 100;
-    const delta = uniformPct - w.utilization;
-    const absDelta = Math.abs(Math.round(delta));
-    if (absDelta < 2) return "on pace";
-    if (delta > 0) return `${absDelta}% ahead`;
-    return `${absDelta}% behind`;
+    if (elapsedMs < 60_000) return ""; // need at least 1 min of history
+    const etaMs = ((100 - w.utilization) * elapsedMs) / w.utilization;
+    // Only warn if you'll exhaust before the window resets
+    if (etaMs >= remainingMs || etaMs < 300_000) return "";
+    const hours = Math.floor(etaMs / 3_600_000);
+    const mins = Math.floor((etaMs % 3_600_000) / 60_000);
+    return hours > 0 ? `limit in ~${hours}h ${mins}m` : `limit in ~${mins}m`;
   }
 
   function paceColor(w: RateLimitWindow, windowHours: number): string {
-    void refreshTick;
-    if (!w.resetsAt) return "var(--t3)";
-    const resetMs = new Date(w.resetsAt).getTime();
-    const now = Date.now();
-    const remainingMs = resetMs - now;
-    if (remainingMs <= 0) return "var(--t3)";
-    const totalMs = windowHours * 3_600_000;
-    const elapsedMs = totalMs - remainingMs;
-    if (elapsedMs <= 0) return "var(--t3)";
-    const uniformPct = (elapsedMs / totalMs) * 100;
-    const delta = uniformPct - w.utilization;
-    if (Math.abs(delta) < 2) return "var(--t3)";
-    if (delta > 0) return "var(--green, #22c55e)";
-    return "var(--red, #ef4444)";
+    const delta = paceDelta(w, windowHours);
+    if (delta === null || Math.abs(delta) < 2) return "var(--t3)";
+    return delta > 0 ? "var(--green, #22c55e)" : "var(--yellow, #f59e0b)";
   }
 
   function windowHours(windowId: string): number {
@@ -99,20 +112,29 @@
     {#each rateLimits.windows as w}
       {@const hours = windowHours(w.windowId)}
       {@const pace = paceLabel(w, hours)}
+      {@const eta = etaToLimit(w, hours)}
       <div class="ub-row">
         <div class="ub-head">
           <span class="ub-label">{w.label}</span>
-          <span class="ub-val">{w.utilization}%</span>
+          <div class="ub-head-right">
+            {#if pace}
+              <span class="ub-pace-badge" style="color: {paceColor(w, hours)}">{pace}</span>
+            {/if}
+            <span class="ub-val">{w.utilization}%</span>
+          </div>
         </div>
         <div class="ub-track">
           <div
             class="ub-fill"
-            style="width: {Math.min(w.utilization, 100)}%; background: {utilizationColor(w.utilization)};"
+            style="width: {Math.min(w.utilization, 100)}%; background: {utilizationColor(w.utilization)};{w.utilization >= 80 ? ` box-shadow: 0 0 7px 1px ${utilizationColor(w.utilization)}55;` : ''}"
           ></div>
         </div>
         <div class="ub-sub">
-          {resetsIn(w.resetsAt)}{#if pace}
-            <span class="ub-pace" style="color: {paceColor(w, hours)}"> · {pace}</span>
+          {#if eta}
+            <span class="ub-eta" style="color: {utilizationColor(w.utilization)}">{eta}</span>
+            <span class="ub-eta-reset"> · {resetsIn(w.resetsAt)}</span>
+          {:else}
+            {resetsIn(w.resetsAt)}
           {/if}
         </div>
       </div>
@@ -185,6 +207,15 @@
     justify-content: space-between;
     align-items: baseline;
   }
+  .ub-head-right {
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+  }
+  .ub-pace-badge {
+    font: 500 9px/1 'Inter', sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
   .ub-label {
     font: 500 11px/1 'Inter', sans-serif;
     color: var(--t1);
@@ -211,8 +242,11 @@
     font: 400 9px/1 'Inter', sans-serif;
     color: var(--t3);
   }
-  .ub-pace {
+  .ub-eta {
     font-weight: 500;
+  }
+  .ub-eta-reset {
+    opacity: 0.7;
   }
   .ub-empty {
     display: flex;
