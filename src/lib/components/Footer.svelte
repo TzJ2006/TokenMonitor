@@ -1,13 +1,18 @@
 <script lang="ts">
   import { formatCost, formatTimeAgo } from "../utils/format.js";
-  import type { UsagePayload } from "../types/index.js";
+  import { footerFiveHourPct } from "../footerView.js";
+  import type { UsagePayload, RateLimitsPayload, UsageProvider } from "../types/index.js";
 
   interface Props {
     data: UsagePayload;
+    provider: UsageProvider;
+    rateLimits?: RateLimitsPayload | null;
     onSettings: () => void;
     onCalendar: () => void;
   }
-  let { data, onSettings, onCalendar }: Props = $props();
+  let { data, provider, rateLimits, onSettings, onCalendar }: Props = $props();
+
+  let fiveHourPct = $derived(footerFiveHourPct(rateLimits, provider));
 
   let refreshTick = $state(0);
   let timeAgo = $derived.by(() => {
@@ -26,16 +31,12 @@
 
 <div class="ft">
   <div class="ft-l">
-    {#if data.active_block?.is_active}
-      <div class="dot"></div>
-      <span>Active · {formatCost(data.active_block.burn_rate_per_hour)}/hr</span>
+    {#if fiveHourPct != null}
+      <span>5h · {fiveHourPct}% used</span>
     {:else}
-      <span class="ft-idle">No active session</span>
+      <span>5h · {formatCost(data.five_hour_cost)}</span>
     {/if}
   </div>
-  {#if data.five_hour_cost > 0}
-    <div class="ft-r">5h · {formatCost(data.five_hour_cost)}</div>
-  {/if}
 </div>
 <div class="ft2">
   <span class="ft-ts">
@@ -66,9 +67,6 @@
     animation: fadeUp .28s ease both .14s;
   }
   .ft-l { display: flex; align-items: center; gap: 5px; font: 400 9px/1 'Inter', sans-serif; color: var(--t2); }
-  .ft-idle { color: var(--t3); }
-  .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: softPulse 2.5s ease-in-out infinite; }
-  .ft-r { font: 400 8.5px/1 'Inter', sans-serif; color: var(--t3); font-variant-numeric: tabular-nums; }
   .ft2 {
     padding: 2px 12px 7px;
     display: flex;
