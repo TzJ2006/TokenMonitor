@@ -586,7 +586,8 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
         }
 
         let info = payload.get("info");
-        let last_usage = normalize_codex_raw_usage(info.and_then(|value| value.get("last_token_usage")));
+        let last_usage =
+            normalize_codex_raw_usage(info.and_then(|value| value.get("last_token_usage")));
         let total_usage =
             normalize_codex_raw_usage(info.and_then(|value| value.get("total_token_usage")));
 
@@ -830,6 +831,11 @@ impl UsageParser {
             file_cache: Mutex::new(HashMap::new()),
             last_query_debug: Mutex::new(None),
         }
+    }
+
+    /// Return the Codex sessions directory path.
+    pub fn codex_dir(&self) -> &Path {
+        &self.codex_dir
     }
 
     /// Create with explicit directories for both providers (for testing).
@@ -1698,7 +1704,11 @@ mod tests {
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
         let (entries, reports) = parser.load_entries("claude", parse_since_date("20260301"));
 
-        assert_eq!(entries.len(), 1, "duplicate assistant transcript entries should count once");
+        assert_eq!(
+            entries.len(),
+            1,
+            "duplicate assistant transcript entries should count once"
+        );
         assert_eq!(entries[0].input_tokens, 10);
         assert_eq!(entries[0].output_tokens, 5);
         assert_eq!(entries[0].cache_creation_1h_tokens, 20);

@@ -71,6 +71,47 @@ pub struct KnownModel {
     pub model_key: String,
 }
 
+// ── Rate limits (from provider APIs / JSONL) ──
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitWindow {
+    pub window_id: String,
+    pub label: String,
+    pub utilization: f64,
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraUsageInfo {
+    pub is_enabled: bool,
+    pub monthly_limit: f64,
+    pub used_credits: f64,
+    pub utilization: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRateLimits {
+    pub provider: String,
+    pub plan_tier: Option<String>,
+    pub windows: Vec<RateLimitWindow>,
+    pub extra_usage: Option<ExtraUsageInfo>,
+    pub stale: bool,
+    pub error: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+    pub cooldown_until: Option<String>,
+    pub fetched_at: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitsPayload {
+    pub claude: Option<ProviderRateLimits>,
+    pub codex: Option<ProviderRateLimits>,
+}
+
 // ── Helpers ──
 
 pub fn normalize_claude_model(raw: &str) -> (&str, &str) {
@@ -100,10 +141,7 @@ pub fn normalize_codex_model(raw: &str) -> (String, String) {
         return (String::from("Unknown"), String::from("unknown"));
     }
 
-    (
-        display_name.to_string(),
-        display_name.to_ascii_lowercase(),
-    )
+    (display_name.to_string(), display_name.to_ascii_lowercase())
 }
 
 fn is_codex_model_name(raw: &str) -> bool {
