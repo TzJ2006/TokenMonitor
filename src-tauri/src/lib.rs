@@ -63,8 +63,10 @@ pub fn run() {
                             if window.is_visible().unwrap_or(false) {
                                 let _ = window.hide();
                             } else {
-                                let _ = window.move_window(Position::TrayCenter);
                                 let _ = window.show();
+                                if window.current_monitor().ok().flatten().is_some() {
+                                    let _ = window.move_window(Position::TrayCenter);
+                                }
                                 let _ = window.set_focus();
                             }
                         }
