@@ -121,6 +121,9 @@ export async function fetchData(
   const cached = payloadCache.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL) {
     usageData.set(cached.data);
+    // A warm-cache navigation should never inherit a stale blocking
+    // loader from an earlier cold request that is no longer the active view.
+    isLoading.set(false);
     logResizeDebug("usage:frontend-cache-hit", {
       provider,
       period,

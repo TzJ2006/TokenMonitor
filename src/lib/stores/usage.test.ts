@@ -124,6 +124,37 @@ describe("fetchData", () => {
     expect(get(isLoading)).toBe(false);
   });
 
+  it("clears a stale blocking loader when a newer view resolves from the warm cache path", async () => {
+    const { usageData, isLoading, fetchData } = await loadUsageModule();
+    const warmCached = makePayload({ total_cost: 3.2, period_label: "This week" });
+    mockInvoke.mockResolvedValueOnce(warmCached);
+    await fetchData("all", "week");
+
+    const slow = deferred<UsagePayload>();
+    mockInvoke.mockReturnValueOnce(slow.promise);
+    const firstCall = fetchData("all", "5h");
+    expect(get(isLoading)).toBe(true);
+
+    const backgroundRefresh = deferred<UsagePayload>();
+    mockInvoke.mockReturnValueOnce(backgroundRefresh.promise);
+    const secondCall = fetchData("all", "week");
+
+    expect(get(usageData)).toEqual(warmCached);
+    expect(get(isLoading)).toBe(false);
+
+    await secondCall;
+
+    backgroundRefresh.resolve(makePayload({ total_cost: 4.1, period_label: "This week" }));
+    await vi.waitFor(() => {
+      expect(get(usageData)).toEqual(expect.objectContaining({ total_cost: 4.1 }));
+    });
+
+    slow.resolve(makePayload({ total_cost: 9.9, period_label: "Wrong result" }));
+    await firstCall;
+
+    expect(get(isLoading)).toBe(false);
+  });
+
   it("shows expired cache data while refetching and then replaces it", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-16T12:00:00.000Z"));
