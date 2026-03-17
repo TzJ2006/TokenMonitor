@@ -519,10 +519,12 @@ fn detect_claude_plan(acct: &ClaudeAccountResponse) -> Option<String> {
 }
 
 fn format_claude_plan_tier(tier: &str) -> String {
-    if tier.contains("claude_max_5x") {
+    if tier.contains("claude_max_20x") {
+        "Max 20x".to_string()
+    } else if tier.contains("claude_max_5x") {
         "Max 5x".to_string()
     } else if tier.contains("claude_max") {
-        "Max".to_string()
+        "Max 5x".to_string() // base Max plan is the 5x tier ($100)
     } else if tier.contains("pro") {
         "Pro".to_string()
     } else {
