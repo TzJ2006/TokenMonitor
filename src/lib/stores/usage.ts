@@ -1,13 +1,23 @@
 import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
-import type { UsagePayload } from "../types/index.js";
+import type {
+  UsagePayload,
+  UsagePeriod,
+  UsageProvider,
+} from "../types/index.js";
 import { isResizeDebugEnabled, logResizeDebug } from "../resizeDebug.js";
 
-export const activeProvider = writable<"all" | "claude" | "codex">("claude");
-export const activePeriod = writable<"5h" | "day" | "week" | "month" | "year">("day");
+export const activeProvider = writable<UsageProvider>("claude");
+export const activePeriod = writable<UsagePeriod>("day");
 export const activeOffset = writable<number>(0);
 export const usageData = writable<UsagePayload | null>(null);
 export const isLoading = writable(false);
+
+/** Per-provider 5h data, populated when provider="all" and period="5h". */
+export const splitFiveHourData = writable<{
+  claude: UsagePayload | null;
+  codex: UsagePayload | null;
+}>({ claude: null, codex: null });
 
 function emptyPayload(): UsagePayload {
   return {
@@ -91,7 +101,11 @@ async function logUsageReadDebug(
  * - If no cached data exists, a blocking IPC fetch is performed with a
  *   loading indicator.
  */
-export async function fetchData(provider: string, period: string, offset: number = 0) {
+export async function fetchData(
+  provider: UsageProvider,
+  period: UsagePeriod,
+  offset: number = 0,
+) {
   const requestId = ++currentRequestId;
   const key = cacheKey(provider, period, offset);
   logResizeDebug("usage:fetch-start", {
@@ -198,7 +212,11 @@ export async function fetchData(provider: string, period: string, offset: number
  * Fire-and-forget: the resolved payload is stored in the frontend cache
  * so subsequent tab switches are synchronous.
  */
-export function warmCache(provider: string, period: string, offset: number = 0) {
+export function warmCache(
+  provider: UsageProvider,
+  period: UsagePeriod,
+  offset: number = 0,
+) {
   const key = cacheKey(provider, period, offset);
   invoke<UsagePayload>("get_usage_data", { provider, period, offset })
     .then((data: UsagePayload) => {
@@ -229,8 +247,22 @@ const WARM_PERIODS = ["5h", "day", "week", "month"] as const;
  * Skips the period already being fetched to avoid redundant work.
  * Intentionally excludes `year` because it is the most expensive aggregation.
  */
-export function warmAllPeriods(provider: string, skipPeriod?: string) {
+export function warmAllPeriods(provider: UsageProvider, skipPeriod?: UsagePeriod) {
   for (const p of WARM_PERIODS) {
     if (p !== skipPeriod) warmCache(provider, p);
   }
+}
+
+/**
+ * Fetch per-provider 5h data for the split view (all provider, 5h period).
+ * Fetches Claude and Codex independently and stores results in splitFiveHourData.
+ */
+export async function fetchSplitFiveHour() {
+  const [claude, codex] = await Promise.all([
+    invoke<UsagePayload>("get_usage_data", { provider: "claude", period: "5h", offset: 0 }),
+    invoke<UsagePayload>("get_usage_data", { provider: "codex", period: "5h", offset: 0 }),
+  ]);
+  payloadCache.set(cacheKey("claude", "5h", 0), { data: claude, at: Date.now() });
+  payloadCache.set(cacheKey("codex", "5h", 0), { data: codex, at: Date.now() });
+  splitFiveHourData.set({ claude, codex });
 }

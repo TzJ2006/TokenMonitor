@@ -6,7 +6,7 @@
   import { intensityLevel, computeEarned, heatmapColor } from "../calendar-utils.js";
   import { isResizeDebugEnabled, logResizeDebug } from "../resizeDebug.js";
   import SegmentedControl from "./SegmentedControl.svelte";
-  import type { MonthlyUsagePayload } from "../types/index.js";
+  import type { MonthlyUsagePayload, UsageProvider } from "../types/index.js";
 
   interface Props {
     onBack: () => void;
@@ -20,7 +20,7 @@
 
   let data = $state<MonthlyUsagePayload | null>(null);
   let loading = $state(false);
-  let provider = $state<"all" | "claude" | "codex">("claude");
+  let provider = $state<UsageProvider>("claude");
   let brandTheming = $state(true);
   let claudePlan = $state(0);
   let codexPlan = $state(0);
@@ -80,7 +80,7 @@
     }
   }
 
-  async function fetchMonth(prov: string, year: number, month: number) {
+  async function fetchMonth(prov: UsageProvider, year: number, month: number) {
     loading = true;
     logResizeDebug("calendar:fetch-start", {
       provider: prov,

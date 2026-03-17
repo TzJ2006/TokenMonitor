@@ -130,6 +130,10 @@
     const first = pts[0];
     return `${line} L${last.x},${CHART_H} L${first.x},${CHART_H} Z`;
   }
+
+  function bucketAriaLabel(bucket: ChartBucket): string {
+    return `${bucket.label}: ${formatCost(bucket.total)}`;
+  }
 </script>
 
 <div class="ch">
@@ -145,14 +149,28 @@
         {/each}
       </div>
       <div class="mode-toggle">
-        <button class:on={chartMode === "bar"} onclick={() => (chartMode = "bar")}>
+        <button
+          type="button"
+          class:on={chartMode === "bar"}
+          aria-label="Show bar chart"
+          aria-pressed={chartMode === "bar"}
+          title="Show bar chart"
+          onclick={() => (chartMode = "bar")}
+        >
           <svg width="10" height="10" viewBox="0 0 10 10">
             <rect x="1" y="4" width="2" height="6" rx=".5" fill="currentColor"/>
             <rect x="4" y="1" width="2" height="9" rx=".5" fill="currentColor"/>
             <rect x="7" y="3" width="2" height="7" rx=".5" fill="currentColor"/>
           </svg>
         </button>
-        <button class:on={chartMode === "line"} onclick={() => (chartMode = "line")}>
+        <button
+          type="button"
+          class:on={chartMode === "line"}
+          aria-label="Show line chart"
+          aria-pressed={chartMode === "line"}
+          title="Show line chart"
+          onclick={() => (chartMode = "line")}
+        >
           <svg width="10" height="10" viewBox="0 0 10 10">
             <path d="M1,7 C3,3 5,5 9,2" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
           </svg>
@@ -187,7 +205,7 @@
               {@const isActive = hoveredIdx === i}
               <g
                 role="img"
-                aria-label="{bucket.label}: {formatCost(bucket.total)}"
+                aria-label={bucketAriaLabel(bucket)}
                 onmouseenter={() => onEnter(i)}
                 onmouseleave={onLeave}
                 style="cursor:pointer"
@@ -253,16 +271,21 @@
             {#each filteredBuckets as bucket, i}
               {@const stepX = filteredBuckets.length > 1 ? CHART_W / (filteredBuckets.length - 1) : CHART_W}
               {@const x = filteredBuckets.length > 1 ? i * stepX : CHART_W / 2}
-              <rect
-                x={x - stepX / 2}
-                y="0"
-                width={stepX}
-                height={CHART_H}
-                fill="transparent"
+              <g
+                role="img"
+                aria-label={bucketAriaLabel(bucket)}
                 onmouseenter={() => onEnter(i)}
                 onmouseleave={onLeave}
                 style="cursor:pointer"
-              />
+              >
+                <rect
+                  x={x - stepX / 2}
+                  y="0"
+                  width={stepX}
+                  height={CHART_H}
+                  fill="transparent"
+                />
+              </g>
             {/each}
 
             <!-- Hover vertical line -->

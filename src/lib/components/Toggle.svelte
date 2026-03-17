@@ -1,12 +1,14 @@
 <script lang="ts">
+  import type { UsageProvider } from "../types/index.js";
+
   interface Props {
-    active: "all" | "claude" | "codex";
-    onChange: (provider: "all" | "claude" | "codex") => void;
+    active: UsageProvider;
+    onChange: (provider: UsageProvider) => void;
     brandTheming?: boolean;
   }
   let { active, onChange, brandTheming = true }: Props = $props();
 
-  const options: Array<{ value: "all" | "claude" | "codex"; label: string }> = [
+  const options: Array<{ value: UsageProvider; label: string }> = [
     { value: "all", label: "All" },
     { value: "claude", label: "Claude" },
     { value: "codex", label: "Codex" },

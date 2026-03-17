@@ -2,13 +2,13 @@
   import { formatCost, formatTokens } from "../utils/format.js";
   import { settings } from "../stores/settings.js";
   import { activePeriod } from "../stores/usage.js";
-  import type { UsagePayload } from "../types/index.js";
+  import type { UsagePayload, UsagePeriod } from "../types/index.js";
 
   interface Props { data: UsagePayload }
   let { data }: Props = $props();
 
   let threshold = $state(0); // 0 = disabled by default; user configures in Settings
-  let period = $state<"5h" | "day" | "week" | "month" | "year">("day");
+  let period = $state<UsagePeriod>("day");
   $effect(() => {
     const unsub = settings.subscribe((s) => (threshold = s.costAlertThreshold));
     return unsub;

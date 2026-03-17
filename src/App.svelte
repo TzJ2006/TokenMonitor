@@ -13,8 +13,16 @@
     fetchData,
     warmCache,
     warmAllPeriods,
+    splitFiveHourData,
+    fetchSplitFiveHour,
   } from "./lib/stores/usage.js";
 
+  import {
+    rateLimitsData,
+    rateLimitsRequestState,
+    hydrateRateLimits,
+    fetchRateLimits,
+  } from "./lib/stores/rateLimits.js";
   import { loadSettings, settings, applyProvider } from "./lib/stores/settings.js";
   import { initializeRuntimeFromSettings } from "./lib/bootstrap.js";
   import {
@@ -47,17 +55,26 @@
   import Settings from "./lib/components/Settings.svelte";
   import Calendar from "./lib/components/Calendar.svelte";
   import DateNav from "./lib/components/DateNav.svelte";
+  import type { UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
 
   let showSplash = $state(true);
   let appReady = $state(false);
   let showSettings = $state(false);
   let showCalendar = $state(false);
-  let provider = $state<"all" | "claude" | "codex">("claude");
-  let period = $state<"5h" | "day" | "week" | "month" | "year">("day");
+  let provider = $state<UsageProvider>("claude");
+  let period = $state<UsagePeriod>("day");
   let offset = $state(0);
   let data = $state($usageData);
   let loading = $state(false);
   let showRefresh = $state(false);
+  let splitData = $state($splitFiveHourData);
+  let rateLimits = $state<RateLimitsPayload | null>(null);
+  let rateLimitsRequest = $state({
+    loading: false,
+    loaded: false,
+    error: null as string | null,
+    deferredUntil: null as string | null,
+  });
   let brandTheming = $state(true);
   let popEl: HTMLDivElement | null = null;
   let maxWindowH = DEFAULT_MAX_WINDOW_HEIGHT;
@@ -67,7 +84,10 @@
     const unsub1 = usageData.subscribe((v) => (data = v));
     const unsub2 = isLoading.subscribe((v) => (loading = v));
     const unsub3 = settings.subscribe((s) => (brandTheming = s.brandTheming));
-    return () => { unsub1(); unsub2(); unsub3(); };
+    const unsub4 = splitFiveHourData.subscribe((v) => (splitData = v));
+    const unsub5 = rateLimitsData.subscribe((v) => (rateLimits = v));
+    const unsub6 = rateLimitsRequestState.subscribe((v) => (rateLimitsRequest = v));
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5(); unsub6(); };
   });
 
   // Apply/remove data-provider attribute reactively
@@ -86,13 +106,13 @@
     }
   });
 
-  async function handleProviderChange(p: "all" | "claude" | "codex") {
+  async function handleProviderChange(p: UsageProvider) {
     if (provider === p) return;
     provider = p;
-    activeProvider.set(p as any);
+    activeProvider.set(p);
     await fetchData(p, period, offset);
-    // Guard: if the user switched again while we were fetching, bail out
-    // so we don't kick off stale warm-ups.
+    if (provider !== p) return;
+    if (period === "5h") await fetchRateLimits(p);
     if (provider !== p) return;
     await tick();
     syncSizeAndVerify("provider-change");
@@ -101,7 +121,7 @@
     else if (p === "codex") warmCache("claude", period);
   }
 
-  async function handlePeriodChange(p: "5h" | "day" | "week" | "month" | "year") {
+  async function handlePeriodChange(p: UsagePeriod) {
     if (period === p && offset === 0) return;
     const prov = provider;
     period = p;
@@ -109,7 +129,8 @@
     activePeriod.set(p);
     activeOffset.set(0);
     await fetchData(prov, p, 0);
-    // Guard: if provider or period changed while we were fetching, bail out.
+    if (period !== p || provider !== prov) return;
+    if (p === "5h") await fetchRateLimits(provider);
     if (period !== p || provider !== prov) return;
     await tick();
     syncSizeAndVerify("period-change");
@@ -412,6 +433,8 @@
 
       await fetchData(provider, period, offset);
       if (cancelled) return;
+      if (provider === "all" && period === "5h") await fetchSplitFiveHour();
+      if (cancelled) return;
       logResizeDebug("app:data-ready", {
         provider,
         period,
@@ -419,6 +442,8 @@
         ...captureDebugSnapshot("data-ready"),
       });
 
+      await hydrateRateLimits();
+      if (cancelled) return;
       warmAllPeriods(provider, period);
       warmAllPeriods(provider === "claude" ? "codex" : "claude");
       appReady = true;
@@ -445,6 +470,8 @@
           offset,
         });
         fetchData(provider, period, offset);
+        if (provider === "all" && period === "5h") fetchSplitFiveHour();
+        if (period === "5h") fetchRateLimits(provider);
       });
 
       unlistenWindowResize = await tauriWindow.onResized(({ payload }) => {
@@ -522,8 +549,29 @@
       <MetricsRow {data} />
       <div class="hr"></div>
 
-      {#if period === "5h"}
-        <UsageBars {data} />
+      {#if period === "5h" && provider === "all" && (rateLimits?.claude || rateLimits?.codex)}
+        {#if rateLimits?.claude}
+          <UsageBars providerLabel="Claude" rateLimits={rateLimits.claude} />
+        {/if}
+        {#if rateLimits?.claude && rateLimits?.codex}
+          <div class="hr"></div>
+        {/if}
+        {#if rateLimits?.codex}
+          <UsageBars providerLabel="Codex" rateLimits={rateLimits.codex} />
+        {/if}
+      {:else if period === "5h" && provider === "claude" && rateLimits?.claude}
+        <UsageBars rateLimits={rateLimits.claude} />
+      {:else if period === "5h" && provider === "codex" && rateLimits?.codex}
+        <UsageBars rateLimits={rateLimits.codex} />
+      {:else if period === "5h" && rateLimitsRequest.loading}
+        <div class="loading-bars"><div class="spinner"></div></div>
+      {:else if period === "5h"}
+        <div class="rate-limit-empty">
+          <div class="rate-limit-empty-title">Rate limits unavailable</div>
+          <div class="rate-limit-empty-text">
+            {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
+          </div>
+        </div>
       {:else if data.total_cost === 0 && data.total_tokens === 0}
         <div class="empty-period">No usage data for this period</div>
       {:else}
@@ -534,7 +582,7 @@
         <div class="hr"></div>
         <ModelList models={data.model_breakdown} />
       {/if}
-      <Footer {data} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} />
+      <Footer {data} {provider} {rateLimits} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} />
     {:else}
       <div class="loading">
         <div class="spinner"></div>
@@ -583,6 +631,25 @@
   }
   .loading-text {
     font: 400 10px/1 'Inter', sans-serif;
+    color: var(--t3);
+  }
+  .loading-bars {
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px 0;
+  }
+  .rate-limit-empty {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 18px 14px 16px;
+    animation: fadeUp .28s ease both .09s;
+  }
+  .rate-limit-empty-title {
+    font: 500 11px/1 'Inter', sans-serif;
+    color: var(--t1);
+  }
+  .rate-limit-empty-text {
+    font: 400 9px/1.4 'Inter', sans-serif;
     color: var(--t3);
   }
   .refresh-bar {

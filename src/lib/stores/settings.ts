@@ -1,11 +1,12 @@
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 import { load } from "@tauri-apps/plugin-store";
+import type { DefaultPeriod, DefaultProvider, UsageProvider } from "../types/index.js";
 import { setCurrency } from "../utils/format.js";
 
 export interface Settings {
   theme: "light" | "dark" | "system";
-  defaultProvider: "claude" | "codex";
-  defaultPeriod: "5h" | "day" | "week" | "month";
+  defaultProvider: DefaultProvider;
+  defaultPeriod: DefaultPeriod;
   refreshInterval: number; // seconds: 30, 60, 300, 0 = off
   costAlertThreshold: number;
   launchAtLogin: boolean;
@@ -47,8 +48,23 @@ export async function loadSettings(): Promise<Settings> {
     setCurrency(merged.currency);
     return merged;
   } catch (e) {
+    const fallback = { ...DEFAULTS };
+    storeInstance = null;
+    settings.set(fallback);
+    setCurrency(fallback.currency);
     console.warn("Failed to load settings, using defaults:", e);
-    return { ...DEFAULTS };
+    return fallback;
+  }
+}
+
+async function persistSettings(next: Settings): Promise<void> {
+  if (!storeInstance) return;
+
+  try {
+    await storeInstance.set("settings", next);
+    await storeInstance.save();
+  } catch (error) {
+    console.warn("Failed to persist settings:", error);
   }
 }
 
@@ -56,18 +72,14 @@ export async function updateSetting<K extends keyof Settings>(
   key: K,
   value: Settings[K],
 ) {
-  settings.update((s) => {
-    const updated = { ...s, [key]: value };
-    // Persist and flush to disk
-    if (storeInstance) {
-      storeInstance.set("settings", updated).then(() => storeInstance!.save());
-    }
-    // Apply currency change immediately
-    if (key === "currency") {
-      setCurrency(value as string);
-    }
-    return updated;
-  });
+  const updated = { ...get(settings), [key]: value };
+  settings.set(updated);
+
+  if (key === "currency" && typeof value === "string") {
+    setCurrency(value);
+  }
+
+  await persistSettings(updated);
 }
 
 export function applyTheme(theme: Settings["theme"]) {
@@ -79,7 +91,7 @@ export function applyTheme(theme: Settings["theme"]) {
   }
 }
 
-export function applyProvider(provider: "all" | "claude" | "codex", brandTheming: boolean) {
+export function applyProvider(provider: UsageProvider, brandTheming: boolean) {
   const root = document.documentElement;
   if (!brandTheming || provider === "all") {
     root.removeAttribute("data-provider");

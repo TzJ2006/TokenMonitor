@@ -1,12 +1,13 @@
 <script lang="ts">
-  type Period = "5h" | "day" | "week" | "month" | "year";
+  import type { UsagePeriod } from "../types/index.js";
+
   interface Props {
-    active: string;
-    onChange: (period: Period) => void;
+    active: UsagePeriod;
+    onChange: (period: UsagePeriod) => void;
   }
   let { active, onChange }: Props = $props();
 
-  const tabs: Array<{ value: Period; label: string }> = [
+  const tabs: Array<{ value: UsagePeriod; label: string }> = [
     { value: "5h", label: "5H" },
     { value: "day", label: "Day" },
     { value: "week", label: "Week" },
