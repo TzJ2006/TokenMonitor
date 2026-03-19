@@ -105,7 +105,7 @@ export function rateLimitWindowResetLabel(
 
   if (shouldAwaitRefresh) {
     if (providerHasActiveCooldown(rateLimits, now)) {
-      return formatRetryIn(rateLimits.cooldownUntil, now);
+      return formatRetryIn(rateLimits!.cooldownUntil, now);
     }
     return "Awaiting refresh";
   }

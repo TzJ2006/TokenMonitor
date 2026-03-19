@@ -36,10 +36,10 @@ export function parseCssColor(value: string): WindowSurface | null {
         return null;
       }
       return {
-        red,
-        green,
-        blue,
-        alpha,
+        red: red!,
+        green: green!,
+        blue: blue!,
+        alpha: alpha!,
       };
     }
 
@@ -52,10 +52,10 @@ export function parseCssColor(value: string): WindowSurface | null {
         return null;
       }
       return {
-        red,
-        green,
-        blue,
-        alpha,
+        red: red!,
+        green: green!,
+        blue: blue!,
+        alpha: alpha!,
       };
     }
 

@@ -96,7 +96,7 @@ describe("readSurfaceColor", () => {
     expect(
       readSurfaceColor(root, () => ({
         getPropertyValue: () => " #FFFFFF ",
-      }) as CSSStyleDeclaration),
+      }) as unknown as CSSStyleDeclaration),
     ).toEqual({
       red: 255,
       green: 255,
