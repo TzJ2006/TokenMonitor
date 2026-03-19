@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { get } from "svelte/store";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
@@ -25,6 +26,7 @@
   } from "./lib/stores/rateLimits.js";
   import { loadSettings, settings, applyProvider } from "./lib/stores/settings.js";
   import { initializeRuntimeFromSettings } from "./lib/bootstrap.js";
+  import { syncTrayConfig } from "./lib/traySync.js";
   import {
     DEFAULT_MAX_WINDOW_HEIGHT,
     MIN_WINDOW_HEIGHT,
@@ -38,6 +40,7 @@
   import { syncNativeWindowSurface } from "./lib/windowAppearance.js";
   import {
     captureResizeDebugSnapshot,
+    formatDebugError,
     initResizeDebug,
     isResizeDebugEnabled,
     logResizeDebug,
@@ -78,6 +81,7 @@
   let brandTheming = $state(true);
   let popEl: HTMLDivElement | null = null;
   let maxWindowH = DEFAULT_MAX_WINDOW_HEIGHT;
+  let lastVisibleDetailHeight = 0;
 
   // Subscribe to stores
   $effect(() => {
@@ -223,25 +227,6 @@
       : {};
   }
 
-  function formatDebugError(error: unknown) {
-    if (error instanceof Error) {
-      return {
-        name: error.name,
-        message: error.message,
-      };
-    }
-
-    if (typeof error === "string") {
-      return { message: error };
-    }
-
-    if (error && typeof error === "object") {
-      return JSON.parse(JSON.stringify(error));
-    }
-
-    return { message: String(error) };
-  }
-
   function clearPendingResize() {
     logResizeDebug("resize:clear-pending", {
       hadTimer: Boolean(resizeTimer),
@@ -278,10 +263,25 @@
 
   function measureContentHeight(): number | null {
     if (!popEl) return null;
-    // .pop has overflow:hidden → scrollHeight reports the FULL content
-    // height including any overflow below the viewport.  Add 2 for
-    // .pop's 1px top + 1px bottom border (excluded from scrollHeight).
-    return measureTargetWindowHeight(popEl.scrollHeight + 2);
+    const detailRoot = popEl.querySelector<HTMLElement>(".detail");
+    const detailEl = popEl.querySelector<HTMLElement>(".detail.visible");
+    if (!detailRoot) {
+      lastVisibleDetailHeight = 0;
+    }
+    if (detailEl?.scrollHeight) {
+      lastVisibleDetailHeight = detailEl.scrollHeight;
+    }
+    // The chart detail panel animates open via max-height. During that
+    // transition, popEl.scrollHeight only reflects the current interpolated
+    // height, which makes the window chase the animation and visibly glitch.
+    // Add the panel's hidden remainder so grow resizes can jump to the final
+    // target height in one pass.
+    const pendingDetailGrowth = detailEl
+      ? Math.max(0, detailEl.scrollHeight - detailEl.clientHeight)
+      : 0;
+    // .pop has overflow:hidden → scrollHeight reports the full content
+    // height including any overflow below the viewport.
+    return measureTargetWindowHeight(popEl.scrollHeight + pendingDetailGrowth);
   }
 
   function applyWindowHeight(targetHeight: number, source = "unknown") {
@@ -370,6 +370,9 @@
     if (measuredHeight == null) return;
     const nextHeight = clampWindowHeight(measuredHeight, maxWindowH, MIN_WINDOW_HEIGHT);
     const disposition = classifyResize(nextHeight, lastWindowH, MIN_WINDOW_HEIGHT);
+    const detailJustCollapsed = Boolean(popEl?.querySelector(".detail"))
+      && !popEl?.querySelector(".detail.visible")
+      && lastVisibleDetailHeight > 0;
 
     switch (disposition) {
       case "grow":
@@ -380,6 +383,13 @@
         scheduleSettledResize(100, `${source}:grow`);
         return;
       case "shrink":
+        if (detailJustCollapsed) {
+          clearPendingResize();
+          lastVisibleDetailHeight = 0;
+          applyWindowHeight(measuredHeight, `${source}:detail-shrink`);
+          scheduleSettledResize(0, `${source}:detail-shrink`);
+          return;
+        }
         scheduleSettledResize(RESIZE_SETTLE_DELAY_MS, `${source}:shrink`);
         return;
       default:
@@ -398,7 +408,7 @@
         logResizeDebug("theme:system-change", {
           matchesLight: colorScheme.matches,
         });
-        void syncNativeWindowSurface().catch(() => {});
+        void syncNativeWindowSurface(undefined, get(settings).glassEffect).catch(() => {});
       }
     };
     const handleBrowserResize = () => {
@@ -406,7 +416,7 @@
     };
     const handleWindowFocus = () => {
       logResizeDebug("window:focus", captureDebugSnapshot("window-focus"));
-      void syncNativeWindowSurface().catch(() => {});
+      void syncNativeWindowSurface(undefined, get(settings).glassEffect).catch(() => {});
       syncSizeAndVerify("window-focus");
     };
     const handleWindowBlur = () => {
@@ -454,6 +464,8 @@
       });
 
       await hydrateRateLimits();
+      if (cancelled) return;
+      await syncTrayConfig(get(settings).trayConfig, get(rateLimitsData)).catch(() => {});
       if (cancelled) return;
       warmAllPeriods(provider, period);
       warmAllPeriods(provider === "claude" ? "codex" : "claude");
@@ -580,7 +592,11 @@
         <div class="rate-limit-empty">
           <div class="rate-limit-empty-title">Rate limits unavailable</div>
           <div class="rate-limit-empty-text">
-            {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
+            {#if provider === "codex" && (data.total_tokens > 0 || data.total_cost > 0)}
+              Codex usage is being recorded, but this session has not emitted rate-limit metadata yet.
+            {:else}
+              {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
+            {/if}
           </div>
         </div>
       {:else if data.total_cost === 0 && data.total_tokens === 0}
@@ -605,23 +621,10 @@
 
 <style>
   .pop {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 14px;
     width: 340px;
     min-height: 200px;
-    overflow: hidden;
     box-shadow: none;
     animation: popIn .32s cubic-bezier(.25,.8,.25,1) both;
-    /* Force GPU compositing layer — prevents macOS transparent window
-       compositor from retaining stale pixels during resize.
-       NOTE: do NOT use contain:paint here — it implies overflow:clip
-       which caps scrollHeight/getBoundingClientRect, breaking the
-       window-resize measurement. */
-    isolation: isolate;
-    -webkit-backface-visibility: hidden;
-    /* Provider theme tint — transparent when neutral */
-    background-image: linear-gradient(var(--provider-bg), var(--provider-bg));
   }
   .pop-content {
     min-width: 0;

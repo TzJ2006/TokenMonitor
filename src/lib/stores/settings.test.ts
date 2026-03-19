@@ -44,7 +44,14 @@ describe("loadSettings", () => {
       currency: "EUR",
       hiddenModels: ["haiku"],
       refreshInterval: 300,
-      showTrayAmount: false,
+      trayConfig: {
+        barDisplay: 'both',
+        barProvider: 'claude',
+        showPercentages: false,
+        percentageFormat: 'compact',
+        showCost: false,
+        costPrecision: 'full',
+      },
     });
     mockLoad.mockResolvedValueOnce(store);
 
@@ -66,9 +73,17 @@ describe("loadSettings", () => {
       currency: "EUR",
       hiddenModels: ["haiku"],
       brandTheming: true,
-      showTrayAmount: false,
+      trayConfig: {
+        barDisplay: 'both',
+        barProvider: 'claude',
+        showPercentages: false,
+        percentageFormat: 'compact',
+        showCost: false,
+        costPrecision: 'full',
+      },
       claudePlan: 0,
       codexPlan: 0,
+      glassEffect: true,
     });
     expect(get(settings)).toEqual(loaded);
     expect(mockSetCurrency).toHaveBeenCalledWith("EUR");
@@ -100,13 +115,47 @@ describe("loadSettings", () => {
       currency: "USD",
       hiddenModels: [],
       brandTheming: true,
-      showTrayAmount: true,
+      trayConfig: {
+        barDisplay: 'both',
+        barProvider: 'claude',
+        showPercentages: false,
+        percentageFormat: 'compact',
+        showCost: true,
+        costPrecision: 'full',
+      },
       claudePlan: 0,
       codexPlan: 0,
+      glassEffect: true,
     });
     expect(get(settings)).toEqual(fallback);
     expect(mockSetCurrency).toHaveBeenCalledWith("USD");
     expect(warnSpy).toHaveBeenCalled();
+  });
+});
+
+describe("loadSettings migration", () => {
+  it("migrates showTrayAmount: true to trayConfig.showCost === true and barDisplay === 'off'", async () => {
+    const legacy = { showTrayAmount: true } as unknown as Record<string, unknown>;
+    const store = makePersistedStore(legacy as Partial<Settings>);
+    mockLoad.mockResolvedValueOnce(store);
+
+    const { loadSettings } = await loadSettingsModule();
+    const loaded = await loadSettings();
+
+    expect(loaded.trayConfig.showCost).toBe(true);
+    expect(loaded.trayConfig.barDisplay).toBe('off');
+  });
+
+  it("migrates showTrayAmount: false to trayConfig.showCost === false and barDisplay === 'off'", async () => {
+    const legacy = { showTrayAmount: false } as unknown as Record<string, unknown>;
+    const store = makePersistedStore(legacy as Partial<Settings>);
+    mockLoad.mockResolvedValueOnce(store);
+
+    const { loadSettings } = await loadSettingsModule();
+    const loaded = await loadSettings();
+
+    expect(loaded.trayConfig.showCost).toBe(false);
+    expect(loaded.trayConfig.barDisplay).toBe('off');
   });
 });
 

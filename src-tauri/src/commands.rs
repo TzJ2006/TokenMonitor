@@ -8,7 +8,11 @@ use tauri::{Manager, State};
 use tokio::sync::RwLock;
 
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSColor, NSView, NSWindow};
+use objc2_app_kit::{
+    NSAutoresizingMaskOptions, NSColor, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+    NSWindowOrderingMode,
+};
 #[cfg(target_os = "macos")]
 use objc2_quartz_core::CALayer;
 #[cfg(target_os = "macos")]
@@ -16,12 +20,50 @@ use tauri::AppHandle;
 #[cfg(target_os = "macos")]
 use tokio::sync::oneshot;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrayConfig {
+    pub bar_display: String,  // "off" | "single" | "both"
+    pub bar_provider: String, // "claude" | "codex"
+    pub show_percentages: bool,
+    pub percentage_format: String, // "compact" | "verbose"
+    pub show_cost: bool,
+    pub cost_precision: String, // "whole" | "full"
+}
+
+impl Default for TrayConfig {
+    fn default() -> Self {
+        Self {
+            bar_display: "both".to_string(),
+            bar_provider: "claude".to_string(),
+            show_percentages: false,
+            percentage_format: "compact".to_string(),
+            show_cost: true,
+            cost_precision: "full".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct TrayUtilization {
+    claude: Option<f64>,
+    codex: Option<f64>,
+}
+
+impl TrayUtilization {
+    fn has_any(self) -> bool {
+        self.claude.is_some() || self.codex.is_some()
+    }
+}
+
 pub struct AppState {
     pub parser: Arc<UsageParser>,
     pub refresh_interval: Arc<RwLock<u64>>,
-    pub show_tray_amount: Arc<RwLock<bool>>,
+    pub tray_config: Arc<RwLock<TrayConfig>>,
+    tray_utilization: Arc<RwLock<TrayUtilization>>,
     pub last_usage_debug: Arc<RwLock<Option<UsageDebugReport>>>,
     pub cached_rate_limits: Arc<RwLock<Option<RateLimitsPayload>>>,
+    pub glass_enabled: Arc<RwLock<bool>>,
 }
 
 impl AppState {
@@ -29,9 +71,11 @@ impl AppState {
         Self {
             parser: Arc::new(UsageParser::new()),
             refresh_interval: Arc::new(RwLock::new(30)),
-            show_tray_amount: Arc::new(RwLock::new(true)),
+            tray_config: Arc::new(RwLock::new(TrayConfig::default())),
+            tray_utilization: Arc::new(RwLock::new(TrayUtilization::default())),
             last_usage_debug: Arc::new(RwLock::new(None)),
             cached_rate_limits: Arc::new(RwLock::new(None)),
+            glass_enabled: Arc::new(RwLock::new(true)),
         }
     }
 }
@@ -75,25 +119,15 @@ fn apply_window_surface(
     window: &tauri::WebviewWindow,
     surface: WindowSurface,
     corner_radius: f64,
+    glass_enabled: bool,
 ) -> Result<(), String> {
     let ns_window = window
         .ns_window()
         .map_err(|e| format!("Failed to access NSWindow: {e}"))?;
     let ns_window = unsafe { &*(ns_window.cast::<NSWindow>()) };
 
-    let color = NSColor::colorWithSRGBRed_green_blue_alpha(
-        f64::from(surface.red) / 255.0,
-        f64::from(surface.green) / 255.0,
-        f64::from(surface.blue) / 255.0,
-        f64::from(surface.alpha) / 255.0,
-    );
-    let cg_color = color.CGColor();
     let clear = NSColor::clearColor();
-
     ns_window.setOpaque(false);
-    // Keep the window itself clear so the clipped corner triangles stay
-    // transparent, and let the native content-view layer provide the
-    // surface fill that resizes with the window.
     ns_window.setBackgroundColor(Some(&clear));
 
     let content_view = ns_window
@@ -111,10 +145,116 @@ fn apply_window_surface(
         }
     };
 
-    layer.setBackgroundColor(Some(&cg_color));
+    // When glass is active the NSVisualEffectView provides the background fill;
+    // set the content-view layer to fully transparent so the blur shows through.
+    // When glass is off use the solid surface color instead.
+    let bg_cg_color = if glass_enabled {
+        clear.CGColor()
+    } else {
+        let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+            f64::from(surface.red) / 255.0,
+            f64::from(surface.green) / 255.0,
+            f64::from(surface.blue) / 255.0,
+            1.0,
+        );
+        color.CGColor()
+    };
+    layer.setBackgroundColor(Some(&bg_cg_color));
+    // The content view owns clipping for the WKWebView subtree.
     layer.setCornerRadius(corner_radius);
     layer.setMasksToBounds(true);
     layer.setOpaque(false);
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn apply_glass_effect(
+    window: &tauri::WebviewWindow,
+    enabled: bool,
+    corner_radius: f64,
+) -> Result<(), String> {
+    use objc2::{MainThreadMarker, MainThreadOnly};
+    use objc2_foundation::NSObjectProtocol;
+
+    let ns_window = window
+        .ns_window()
+        .map_err(|e| format!("Failed to access NSWindow: {e}"))?;
+    let ns_window = unsafe { &*(ns_window.cast::<NSWindow>()) };
+    let content_view = ns_window
+        .contentView()
+        .ok_or_else(|| String::from("NSWindow is missing a content view"))?;
+
+    // Check whether an NSVisualEffectView already exists among direct subviews
+    let has_effect_view = || -> bool {
+        let subviews = content_view.subviews();
+        for i in 0..subviews.len() {
+            if subviews.objectAtIndex(i).is_kind_of::<NSVisualEffectView>() {
+                return true;
+            }
+        }
+        false
+    };
+
+    if enabled {
+        if !has_effect_view() {
+            let frame = content_view.frame();
+            // SAFETY: called from run_on_main_thread, so we are on the main thread
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let effect_view =
+                unsafe { NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame) };
+            effect_view.setMaterial(NSVisualEffectMaterial::Popover);
+            effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+            effect_view.setState(NSVisualEffectState::Active);
+
+            // Auto-resize with parent
+            unsafe {
+                effect_view.setAutoresizingMask(
+                    NSAutoresizingMaskOptions::ViewWidthSizable
+                        | NSAutoresizingMaskOptions::ViewHeightSizable,
+                );
+            }
+
+            // Corner radius on the effect view's layer
+            effect_view.setWantsLayer(true);
+            if let Some(layer) = effect_view.layer() {
+                layer.setCornerRadius(corner_radius);
+                layer.setMasksToBounds(true);
+            }
+
+            // Insert behind all other subviews (behind webview)
+            unsafe {
+                content_view.addSubview_positioned_relativeTo(
+                    &effect_view,
+                    NSWindowOrderingMode::Below,
+                    None,
+                );
+            }
+        }
+
+        // Keep the content view clipped as well, otherwise the transparent
+        // webview paints square corners over the rounded blur view.
+        if let Some(layer) = content_view.layer() {
+            layer.setCornerRadius(corner_radius);
+            layer.setMasksToBounds(true);
+        }
+    } else {
+        // Find and remove the visual effect view by class type
+        let subviews = content_view.subviews();
+        for i in 0..subviews.len() {
+            let view = subviews.objectAtIndex(i);
+            if view.is_kind_of::<NSVisualEffectView>() {
+                view.removeFromSuperview();
+                break;
+            }
+        }
+
+        // Restore corner radius on content view's own layer
+        if let Some(layer) = content_view.layer() {
+            layer.setCornerRadius(corner_radius);
+            layer.setMasksToBounds(true);
+        }
+    }
 
     Ok(())
 }
@@ -124,33 +264,144 @@ pub fn apply_default_window_surface(app: &AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| String::from("Main window not found"))?;
-    apply_window_surface(&window, DEFAULT_DARK_SURFACE, DEFAULT_WINDOW_CORNER_RADIUS)
+    apply_window_surface(&window, DEFAULT_DARK_SURFACE, DEFAULT_WINDOW_CORNER_RADIUS, false)
 }
 
-fn format_tray_title(show: bool, total_cost: f64) -> String {
-    if show {
-        format!("${:.2}", total_cost)
-    } else {
-        String::new()
+fn format_tray_title(
+    config: &TrayConfig,
+    total_cost: f64,
+    claude_util: Option<f64>,
+    codex_util: Option<f64>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Percentages — independent of bar_display.
+    // Utilization values are already 0–100.
+    if config.show_percentages {
+        if let (Some(c), Some(x)) = (claude_util, codex_util) {
+            let c_pct = c.round() as i64;
+            let x_pct = x.round() as i64;
+            if config.percentage_format == "compact" {
+                parts.push(format!("{} · {}", c_pct, x_pct));
+            } else {
+                parts.push(format!("Claude Code {}%  Codex {}%", c_pct, x_pct));
+            }
+        } else if let Some(c) = claude_util {
+            let pct = c.round() as i64;
+            if config.percentage_format == "compact" {
+                parts.push(format!("{}", pct));
+            } else {
+                parts.push(format!("Claude Code {}%", pct));
+            }
+        } else if let Some(x) = codex_util {
+            let pct = x.round() as i64;
+            if config.percentage_format == "compact" {
+                parts.push(format!("{}", pct));
+            } else {
+                parts.push(format!("Codex {}%", pct));
+            }
+        }
     }
+
+    // Cost
+    if config.show_cost {
+        if config.cost_precision == "whole" {
+            parts.push(format!("${}", total_cost.round() as i64));
+        } else {
+            parts.push(format!("${:.2}", total_cost));
+        }
+    }
+
+    parts.join("  ")
+}
+
+fn primary_window_utilization(rate_limits: Option<&ProviderRateLimits>) -> Option<f64> {
+    rate_limits
+        .and_then(|provider| provider.windows.first())
+        .map(|window| window.utilization)
+}
+
+fn tray_utilization_from_rate_limits(payload: Option<&RateLimitsPayload>) -> TrayUtilization {
+    TrayUtilization {
+        claude: primary_window_utilization(
+            payload.and_then(|rate_limits| rate_limits.claude.as_ref()),
+        ),
+        codex: primary_window_utilization(
+            payload.and_then(|rate_limits| rate_limits.codex.as_ref()),
+        ),
+    }
+}
+
+fn merge_tray_utilization(current: TrayUtilization, patch: TrayUtilization) -> TrayUtilization {
+    TrayUtilization {
+        claude: patch.claude.or(current.claude),
+        codex: patch.codex.or(current.codex),
+    }
+}
+
+fn current_daily_total_cost(state: &AppState) -> f64 {
+    let today = Local::now().format("%Y%m%d").to_string();
+    let claude = state.parser.get_daily("claude", &today);
+    let codex = state.parser.get_daily("codex", &today);
+    claude.total_cost + codex.total_cost
+}
+
+fn should_update_tray_icon(config: &TrayConfig, utilization: TrayUtilization) -> bool {
+    config.bar_display == "off" || utilization.has_any()
+}
+
+fn apply_tray_presentation(
+    app: &tauri::AppHandle,
+    config: &TrayConfig,
+    total_cost: f64,
+    utilization: TrayUtilization,
+) {
+    let title = format_tray_title(config, total_cost, utilization.claude, utilization.codex);
+
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_title(Some(title));
+
+        if should_update_tray_icon(config, utilization) {
+            let base_icon = include_bytes!("../icons/tray-icon@2x.rgba");
+            let dark_bar = crate::tray_render::is_menu_bar_dark();
+            let (icon_buf, w, h, use_template) = crate::tray_render::render_tray_icon(
+                base_icon,
+                config,
+                utilization.claude,
+                utilization.codex,
+                dark_bar,
+            );
+            let expected_size = (w * h * 4) as usize;
+            if icon_buf.len() == expected_size {
+                let icon = tauri::image::Image::new_owned(icon_buf, w, h);
+                let _ = tray.set_icon(Some(icon));
+                let _ = tray.set_icon_as_template(use_template);
+            }
+        }
+    }
+}
+
+async fn patch_tray_utilization(state: &AppState, patch: TrayUtilization) -> TrayUtilization {
+    let mut current = state.tray_utilization.write().await;
+    *current = merge_tray_utilization(*current, patch);
+    *current
+}
+
+async fn current_tray_utilization(state: &AppState) -> TrayUtilization {
+    let current = *state.tray_utilization.read().await;
+    if current.has_any() {
+        return current;
+    }
+
+    let cached = state.cached_rate_limits.read().await;
+    tray_utilization_from_rate_limits(cached.as_ref())
 }
 
 pub async fn sync_tray_title(app: &tauri::AppHandle, state: &AppState) {
-    let show = *state.show_tray_amount.read().await;
-    let title = if show {
-        let today = Local::now().format("%Y%m%d").to_string();
-        let claude = state.parser.get_daily("claude", &today);
-        let codex = state.parser.get_daily("codex", &today);
-        format_tray_title(true, claude.total_cost + codex.total_cost)
-    } else {
-        format_tray_title(false, 0.0)
-    };
-
-    if let Some(tray) = app.tray_by_id("main-tray") {
-        // `tray-icon` on macOS ignores `None` here, so clearing must use an
-        // empty string to collapse the title width immediately.
-        let _ = tray.set_title(Some(title));
-    }
+    let config = state.tray_config.read().await.clone();
+    let total_cost = current_daily_total_cost(state);
+    let utilization = current_tray_utilization(state).await;
+    apply_tray_presentation(app, &config, total_cost, utilization);
 }
 
 async fn set_last_usage_debug(state: &AppState, report: UsageDebugReport) {
@@ -167,11 +418,13 @@ fn capture_query_debug(parser: &UsageParser) -> Result<UsageQueryDebugReport, St
 #[tauri::command]
 pub async fn set_window_surface(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     surface: WindowSurface,
     corner_radius: Option<f64>,
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
+        let glass = *state.glass_enabled.read().await;
         let window = app
             .get_webview_window("main")
             .ok_or_else(|| String::from("Main window not found"))?;
@@ -185,6 +438,7 @@ pub async fn set_window_surface(
                     &window_for_main_thread,
                     surface,
                     next_radius,
+                    glass,
                 ));
             })
             .map_err(|e| format!("Failed to schedule native window surface update: {e}"))?;
@@ -196,7 +450,46 @@ pub async fn set_window_surface(
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (app, surface, corner_radius);
+        let _ = (app, state, surface, corner_radius);
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub async fn set_glass_effect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    *state.glass_enabled.write().await = enabled;
+
+    #[cfg(target_os = "macos")]
+    {
+        let window = app
+            .get_webview_window("main")
+            .ok_or_else(|| String::from("Main window not found"))?;
+        let (tx, rx) = oneshot::channel();
+        let window_clone = window.clone();
+
+        // AppKit operations MUST run on the main thread
+        window
+            .run_on_main_thread(move || {
+                let _ = tx.send(apply_glass_effect(
+                    &window_clone,
+                    enabled,
+                    DEFAULT_WINDOW_CORNER_RADIUS,
+                ));
+            })
+            .map_err(|e| format!("Failed to schedule glass effect update: {e}"))?;
+
+        return rx
+            .await
+            .map_err(|_| String::from("Glass effect update was cancelled"))?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
         Ok(())
     }
 }
@@ -209,16 +502,32 @@ pub async fn set_refresh_interval(interval: u64, state: State<'_, AppState>) -> 
 }
 
 #[tauri::command]
-pub async fn set_show_tray_amount(
-    show: bool,
+pub async fn set_tray_config(
+    config: TrayConfig,
+    claude_util: Option<f64>,
+    codex_util: Option<f64>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut current = state.show_tray_amount.write().await;
-    *current = show;
-    drop(current);
+    {
+        let mut current = state.tray_config.write().await;
+        *current = config.clone();
+    }
 
-    sync_tray_title(&app, &state).await;
+    let utilization = if claude_util.is_some() || codex_util.is_some() {
+        patch_tray_utilization(
+            &state,
+            TrayUtilization {
+                claude: claude_util,
+                codex: codex_util,
+            },
+        )
+        .await
+    } else {
+        current_tray_utilization(&state).await
+    };
+
+    apply_tray_presentation(&app, &config, current_daily_total_cost(&state), utilization);
 
     Ok(())
 }
@@ -232,6 +541,7 @@ pub async fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_rate_limits(
     provider: Option<String>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RateLimitsPayload, String> {
     let selection = match provider.as_deref() {
@@ -250,6 +560,10 @@ pub async fn get_rate_limits(
     let merged = crate::rate_limits::merge_rate_limits(fresh, cached.as_ref());
 
     *state.cached_rate_limits.write().await = Some(merged.clone());
+    patch_tray_utilization(&state, tray_utilization_from_rate_limits(Some(&merged))).await;
+
+    sync_tray_title(&app, &state).await;
+
     Ok(merged)
 }
 
@@ -722,12 +1036,155 @@ mod tests {
 
     #[test]
     fn format_tray_title_returns_empty_string_when_hidden() {
-        assert_eq!(format_tray_title(false, 12.34), "");
+        let config = TrayConfig {
+            show_cost: false,
+            ..TrayConfig::default()
+        };
+        assert_eq!(format_tray_title(&config, 12.34, None, None), "");
     }
 
     #[test]
     fn format_tray_title_formats_cost_when_visible() {
-        assert_eq!(format_tray_title(true, 12.345), "$12.35");
+        let config = TrayConfig::default(); // show_cost: true, cost_precision: "full"
+        assert_eq!(format_tray_title(&config, 12.345, None, None), "$12.35");
+    }
+
+    #[test]
+    fn format_tray_title_whole_cost() {
+        let config = TrayConfig {
+            cost_precision: "whole".to_string(),
+            ..TrayConfig::default()
+        };
+        assert_eq!(format_tray_title(&config, 12.345, None, None), "$12");
+    }
+
+    #[test]
+    fn format_tray_title_compact_percentages() {
+        let config = TrayConfig {
+            show_percentages: true,
+            ..TrayConfig::default()
+        };
+        assert_eq!(
+            format_tray_title(&config, 5.0, Some(72.0), Some(35.0)),
+            "72 · 35  $5.00"
+        );
+    }
+
+    #[test]
+    fn format_tray_title_verbose_percentages() {
+        let config = TrayConfig {
+            show_percentages: true,
+            percentage_format: "verbose".to_string(),
+            show_cost: false,
+            ..TrayConfig::default()
+        };
+        assert_eq!(
+            format_tray_title(&config, 0.0, Some(72.0), Some(35.0)),
+            "Claude Code 72%  Codex 35%"
+        );
+    }
+
+    #[test]
+    fn merge_tray_utilization_keeps_existing_values_when_patch_is_empty() {
+        let current = TrayUtilization {
+            claude: Some(72.0),
+            codex: Some(35.0),
+        };
+
+        assert_eq!(
+            merge_tray_utilization(current, TrayUtilization::default()),
+            current
+        );
+    }
+
+    #[test]
+    fn merge_tray_utilization_updates_only_present_providers() {
+        let current = TrayUtilization {
+            claude: Some(72.0),
+            codex: Some(35.0),
+        };
+        let patch = TrayUtilization {
+            claude: None,
+            codex: Some(41.0),
+        };
+
+        assert_eq!(
+            merge_tray_utilization(current, patch),
+            TrayUtilization {
+                claude: Some(72.0),
+                codex: Some(41.0),
+            }
+        );
+    }
+
+    #[test]
+    fn tray_utilization_from_rate_limits_extracts_primary_windows() {
+        let payload = RateLimitsPayload {
+            claude: Some(ProviderRateLimits {
+                provider: "claude".to_string(),
+                plan_tier: Some("Max 5x".to_string()),
+                windows: vec![RateLimitWindow {
+                    window_id: "c".to_string(),
+                    label: "Primary".to_string(),
+                    utilization: 72.0,
+                    resets_at: None,
+                }],
+                extra_usage: None,
+                stale: false,
+                error: None,
+                retry_after_seconds: None,
+                cooldown_until: None,
+                fetched_at: "2026-03-18T00:00:00Z".to_string(),
+            }),
+            codex: Some(ProviderRateLimits {
+                provider: "codex".to_string(),
+                plan_tier: Some("Pro".to_string()),
+                windows: vec![RateLimitWindow {
+                    window_id: "x".to_string(),
+                    label: "Primary".to_string(),
+                    utilization: 35.0,
+                    resets_at: None,
+                }],
+                extra_usage: None,
+                stale: false,
+                error: None,
+                retry_after_seconds: None,
+                cooldown_until: None,
+                fetched_at: "2026-03-18T00:00:00Z".to_string(),
+            }),
+        };
+
+        assert_eq!(
+            tray_utilization_from_rate_limits(Some(&payload)),
+            TrayUtilization {
+                claude: Some(72.0),
+                codex: Some(35.0),
+            }
+        );
+    }
+
+    #[test]
+    fn should_update_tray_icon_skips_bar_overwrite_without_data() {
+        let config = TrayConfig::default();
+
+        assert!(!should_update_tray_icon(
+            &config,
+            TrayUtilization::default()
+        ));
+        assert!(should_update_tray_icon(
+            &config,
+            TrayUtilization {
+                claude: Some(72.0),
+                codex: None,
+            }
+        ));
+        assert!(should_update_tray_icon(
+            &TrayConfig {
+                bar_display: "off".to_string(),
+                ..TrayConfig::default()
+            },
+            TrayUtilization::default(),
+        ));
     }
 
     #[test]
@@ -964,7 +1421,8 @@ mod tests {
         let state = AppState {
             parser: Arc::new(parser),
             refresh_interval: Arc::new(RwLock::new(30)),
-            show_tray_amount: Arc::new(RwLock::new(true)),
+            tray_config: Arc::new(RwLock::new(TrayConfig::default())),
+            tray_utilization: Arc::new(RwLock::new(TrayUtilization::default())),
             last_usage_debug: Arc::new(RwLock::new(None)),
             cached_rate_limits: Arc::new(RwLock::new(None)),
         };
@@ -1000,7 +1458,8 @@ mod tests {
         let state = AppState {
             parser: Arc::new(parser),
             refresh_interval: Arc::new(RwLock::new(30)),
-            show_tray_amount: Arc::new(RwLock::new(true)),
+            tray_config: Arc::new(RwLock::new(TrayConfig::default())),
+            tray_utilization: Arc::new(RwLock::new(TrayUtilization::default())),
             last_usage_debug: Arc::new(RwLock::new(None)),
             cached_rate_limits: Arc::new(RwLock::new(None)),
         };
@@ -1035,7 +1494,8 @@ mod tests {
         let state = AppState {
             parser: Arc::new(parser),
             refresh_interval: Arc::new(RwLock::new(30)),
-            show_tray_amount: Arc::new(RwLock::new(true)),
+            tray_config: Arc::new(RwLock::new(TrayConfig::default())),
+            tray_utilization: Arc::new(RwLock::new(TrayUtilization::default())),
             last_usage_debug: Arc::new(RwLock::new(None)),
             cached_rate_limits: Arc::new(RwLock::new(None)),
         };

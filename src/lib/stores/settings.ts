@@ -1,6 +1,6 @@
 import { get, writable } from "svelte/store";
 import { load } from "@tauri-apps/plugin-store";
-import type { DefaultPeriod, DefaultProvider, UsageProvider } from "../types/index.js";
+import type { DefaultPeriod, DefaultProvider, TrayConfig, UsageProvider } from "../types/index.js";
 import { setCurrency } from "../utils/format.js";
 
 export interface Settings {
@@ -13,9 +13,10 @@ export interface Settings {
   currency: string;
   hiddenModels: string[];
   brandTheming: boolean;
-  showTrayAmount: boolean;
+  trayConfig: TrayConfig;
   claudePlan: number;
   codexPlan: number;
+  glassEffect: boolean;
 }
 
 const DEFAULTS: Settings = {
@@ -28,9 +29,17 @@ const DEFAULTS: Settings = {
   currency: "USD",
   hiddenModels: [],
   brandTheming: true,
-  showTrayAmount: true,
+  trayConfig: {
+    barDisplay: 'both',
+    barProvider: 'claude',
+    showPercentages: false,
+    percentageFormat: 'compact',
+    showCost: true,
+    costPrecision: 'full',
+  },
   claudePlan: 0,
   codexPlan: 0,
+  glassEffect: true,
 };
 
 export const settings = writable<Settings>({ ...DEFAULTS });
@@ -44,6 +53,18 @@ export async function loadSettings(): Promise<Settings> {
 
     const saved = await store.get<Partial<Settings>>("settings");
     const merged = { ...DEFAULTS, ...saved };
+
+    // Migrate legacy showTrayAmount → trayConfig
+    if (saved && 'showTrayAmount' in saved && !('trayConfig' in saved)) {
+      const legacy = saved as Record<string, unknown>;
+      merged.trayConfig = {
+        ...DEFAULTS.trayConfig,
+        barDisplay: 'off',
+        showCost: legacy.showTrayAmount !== false,
+      };
+    }
+    delete (merged as Record<string, unknown>).showTrayAmount;
+
     settings.set(merged);
     setCurrency(merged.currency);
     return merged;
@@ -89,6 +110,10 @@ export function applyTheme(theme: Settings["theme"]) {
   } else {
     root.setAttribute("data-theme", theme);
   }
+}
+
+export function applyGlass(enabled: boolean) {
+  document.documentElement.setAttribute("data-glass", enabled ? "true" : "false");
 }
 
 export function applyProvider(provider: UsageProvider, brandTheming: boolean) {

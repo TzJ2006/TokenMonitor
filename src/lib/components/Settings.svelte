@@ -1,11 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { settings, updateSetting, applyTheme, type Settings as SettingsType } from "../stores/settings.js";
+  import { settings, updateSetting, applyTheme, applyGlass, type Settings as SettingsType } from "../stores/settings.js";
   import { currencySymbol, modelColor } from "../utils/format.js";
   import { copyResizeDebugToClipboard, logResizeDebug } from "../resizeDebug.js";
   import { syncNativeWindowSurface } from "../windowAppearance.js";
-  import type { KnownModel } from "../types/index.js";
+  import type { KnownModel, TrayConfig, RateLimitsPayload } from "../types/index.js";
+  import { rateLimitsData } from "../stores/rateLimits.js";
+  import { syncTrayConfig } from "../traySync.js";
+  import { formatTrayTitle } from "../trayTitle.js";
   import SegmentedControl from "./SegmentedControl.svelte";
   import ToggleSwitch from "./ToggleSwitch.svelte";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
@@ -26,15 +29,37 @@
     currency: "USD",
     hiddenModels: [],
     brandTheming: true,
-    showTrayAmount: true,
+    trayConfig: {
+      barDisplay: 'both',
+      barProvider: 'claude',
+      showPercentages: false,
+      percentageFormat: 'compact',
+      showCost: true,
+      costPrecision: 'full',
+    },
     claudePlan: 0,
     codexPlan: 0,
+    glassEffect: true,
   });
 
   let costInput = $state("50.00");
   let costEnabled = $state(true);
   let copiedDebug = $state(false);
   let availableModels = $state<KnownModel[]>([]);
+
+  const PREVIEW_RATE_LIMITS = {
+    claude: { provider: 'claude', planTier: null, windows: [{ windowId: 'p', label: 'Primary', utilization: 72, resetsAt: null }], extraUsage: null, stale: false, error: null, cooldownUntil: null, retryAfterSeconds: null, fetchedAt: '' },
+    codex: { provider: 'codex', planTier: null, windows: [{ windowId: 'p', label: 'Primary', utilization: 35, resetsAt: null }], extraUsage: null, stale: false, error: null, cooldownUntil: null, retryAfterSeconds: null, fetchedAt: '' },
+  } as RateLimitsPayload;
+
+  // Use a function call to ensure Svelte tracks all trayConfig fields
+  let titlePreview = $derived.by(() => {
+    const cfg = current.trayConfig;
+    return formatTrayTitle(cfg, PREVIEW_RATE_LIMITS, 17.19);
+  });
+
+  let previewBarDisplay = $derived(current.trayConfig.barDisplay);
+  let previewBarProvider = $derived(current.trayConfig.barProvider);
 
   $effect(() => {
     const unsub = settings.subscribe((s) => {
@@ -70,7 +95,18 @@
     const theme = val as SettingsType["theme"];
     updateSetting("theme", theme);
     applyTheme(theme);
-    void syncNativeWindowSurface().catch(() => {});
+    void syncNativeWindowSurface(invoke, current.glassEffect).catch(() => {});
+  }
+
+  async function handleGlassEffect(checked: boolean) {
+    updateSetting("glassEffect", checked);
+    applyGlass(checked);
+    try {
+      await invoke("set_glass_effect", { enabled: checked });
+      await syncNativeWindowSurface(invoke, checked);
+    } catch (e) {
+      console.error("Failed to toggle glass effect:", e);
+    }
   }
 
   function handleProvider(val: string) {
@@ -82,16 +118,17 @@
   }
 
   function handleClaudePlan(val: string) {
-    updateSetting("claudePlan", parseInt(val));
+    updateSetting("claudePlan", parseInt(val, 10) || 0);
   }
 
   function handleCodexPlan(val: string) {
-    updateSetting("codexPlan", parseInt(val));
+    updateSetting("codexPlan", parseInt(val, 10) || 0);
   }
 
-  function handleShowTrayAmount(checked: boolean) {
-    updateSetting("showTrayAmount", checked);
-    invoke("set_show_tray_amount", { show: checked }).catch(() => {});
+  function handleTrayConfig<K extends keyof TrayConfig>(key: K, value: TrayConfig[K]) {
+    const next = { ...current.trayConfig, [key]: value };
+    updateSetting("trayConfig", next);
+    void syncTrayConfig(next, $rateLimitsData).catch(() => {});
   }
 
   function handlePeriod(val: string) {
@@ -99,7 +136,7 @@
   }
 
   function handleRefresh(val: string) {
-    const interval = parseInt(val);
+    const interval = parseInt(val, 10) || 0;
     updateSetting("refreshInterval", interval);
     invoke("set_refresh_interval", { interval }).catch(() => {});
   }
@@ -247,10 +284,114 @@
           />
         </div>
         <div class="row">
-          <span class="label">Menu Bar Cost</span>
+          <span class="label">Glass Effect</span>
           <ToggleSwitch
-            checked={current.showTrayAmount}
-            onChange={handleShowTrayAmount}
+            checked={current.glassEffect}
+            onChange={handleGlassEffect}
+          />
+        </div>
+      </div>
+    </div>
+
+    <!-- Menu Bar -->
+    <div class="group">
+      <div class="group-label">Menu Bar</div>
+
+      <div class="tray-preview">
+        <div class="tp-inner">
+          <!-- Icon (TokenMonitor winking face) -->
+          <svg class="tp-icon" width="14" height="14" viewBox="0 0 44 44" fill="none">
+            <circle cx="22" cy="22" r="20" fill="currentColor"/>
+            <circle cx="16" cy="23" r="3" fill="#262628"/>
+            <path d="M28 20l-4 3.5 4 3.5" stroke="#262628" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+          </svg>
+          <!-- Bars -->
+          {#if previewBarDisplay === 'both'}
+            <div class="tp-bars">
+              <div class="tp-track"><div class="tp-fill claude" style="width:72%"></div></div>
+              <div class="tp-track"><div class="tp-fill codex" style="width:35%"></div></div>
+            </div>
+          {:else if previewBarDisplay === 'single'}
+            <div class="tp-bars">
+              <div class="tp-track single">
+                <div class="tp-fill {previewBarProvider}" style="width:72%"></div>
+              </div>
+            </div>
+          {/if}
+          <!-- Text -->
+          {#if titlePreview}
+            <span class="tp-text">{titlePreview}</span>
+          {/if}
+        </div>
+      </div>
+
+      <!-- Bars card -->
+      <div class="card" style="margin-bottom: 4px;">
+        <div class="row border">
+          <span class="label">Display</span>
+          <SegmentedControl
+            options={[
+              { value: "off", label: "Off" },
+              { value: "single", label: "Single" },
+              { value: "both", label: "Both" },
+            ]}
+            value={current.trayConfig.barDisplay}
+            onChange={(v) => handleTrayConfig("barDisplay", v as TrayConfig["barDisplay"])}
+          />
+        </div>
+        <div class="row" class:dim={current.trayConfig.barDisplay !== 'single'}>
+          <span class="label">Provider</span>
+          <SegmentedControl
+            options={[
+              { value: "claude", label: "Claude" },
+              { value: "codex", label: "Codex" },
+            ]}
+            value={current.trayConfig.barProvider}
+            onChange={(v) => handleTrayConfig("barProvider", v as TrayConfig["barProvider"])}
+          />
+        </div>
+      </div>
+
+      <!-- Percentages card -->
+      <div class="card" style="margin-bottom: 4px;">
+        <div class="row border">
+          <span class="label">Show Percentages</span>
+          <ToggleSwitch
+            checked={current.trayConfig.showPercentages}
+            onChange={(checked) => handleTrayConfig("showPercentages", checked)}
+          />
+        </div>
+        <div class="row" class:dim={!current.trayConfig.showPercentages}>
+          <span class="label">Format</span>
+          <SegmentedControl
+            options={[
+              { value: "compact", label: "72 · 35" },
+              { value: "verbose", label: "Claude Code 72% Codex 35%" },
+            ]}
+            value={current.trayConfig.percentageFormat}
+            onChange={(v) => handleTrayConfig("percentageFormat", v as TrayConfig["percentageFormat"])}
+          />
+        </div>
+      </div>
+
+      <!-- Cost card -->
+      <div class="card">
+        <div class="row border">
+          <span class="label">Show Cost</span>
+          <ToggleSwitch
+            checked={current.trayConfig.showCost}
+            onChange={(checked) => handleTrayConfig("showCost", checked)}
+          />
+        </div>
+        <div class="row" class:dim={!current.trayConfig.showCost}>
+          <span class="label">Precision</span>
+          <SegmentedControl
+            options={[
+              { value: "whole", label: "$17" },
+              { value: "full", label: "$17.19" },
+            ]}
+            value={current.trayConfig.costPrecision}
+            onChange={(v) => handleTrayConfig("costPrecision", v as TrayConfig["costPrecision"])}
           />
         </div>
       </div>
@@ -453,6 +594,11 @@
   .row.center {
     justify-content: center;
   }
+  .row.dim {
+    opacity: 0.25;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+  }
 
   .actions {
     display: flex;
@@ -553,5 +699,63 @@
   }
   .reset-btn:hover {
     color: var(--t2);
+  }
+
+  /* Tray preview — always renders as a dark macOS menu bar fragment,
+     regardless of app theme (the real menu bar is always dark). */
+  .tray-preview {
+    background: var(--surface-2);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 4px;
+    display: flex;
+    justify-content: center;
+  }
+  .tp-inner {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    /* Always dark — matches real macOS dark menu bar */
+    background: #262628;
+    border-radius: 5px;
+    padding: 4px 8px;
+    height: 22px;
+    border: 0.5px solid rgba(255,255,255,0.06);
+  }
+  .tp-icon {
+    /* Always white inside the dark preview strip */
+    color: rgba(255,255,255,0.85);
+    flex-shrink: 0;
+  }
+  .tp-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5px;
+  }
+  .tp-track {
+    width: 30px;
+    height: 2.5px;
+    background: rgba(255,255,255,0.12);
+    border-radius: 1.25px;
+    overflow: hidden;
+  }
+  .tp-track.single {
+    width: 38px;
+    height: 3.5px;
+    border-radius: 1.75px;
+  }
+  .tp-fill {
+    height: 100%;
+    border-radius: inherit;
+  }
+  .tp-fill.claude { background: #d4a574; }
+  .tp-fill.codex { background: #7aafff; }
+  .tp-text {
+    font: 400 10px/1 'Inter', -apple-system, sans-serif;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.2px;
+    /* Always light text inside dark preview strip */
+    color: rgba(255,255,255,0.88);
+    white-space: nowrap;
   }
 </style>
