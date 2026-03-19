@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-${{ hashFiles('package-lock.json') }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cargo-
+
+      - name: Install Node deps
+        run: npm ci
+
+      - name: Version consistency check
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          TAURI_VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          NPM_VERSION=$(node -p "require('./package.json').version")
+
+          FAIL=0
+          if [ "$CARGO_VERSION" != "$TAG" ]; then
+            echo "::error::src-tauri/Cargo.toml version ($CARGO_VERSION) does not match tag ($TAG)"
+            FAIL=1
+          fi
+          if [ "$TAURI_VERSION" != "$TAG" ]; then
+            echo "::error::src-tauri/tauri.conf.json version ($TAURI_VERSION) does not match tag ($TAG)"
+            FAIL=1
+          fi
+          if [ "$NPM_VERSION" != "$TAG" ]; then
+            echo "::error::package.json version ($NPM_VERSION) does not match tag ($TAG)"
+            FAIL=1
+          fi
+          exit $FAIL
+
+      - name: Set up ephemeral keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          P12_PATH="$RUNNER_TEMP/certificate.p12"
+
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$P12_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import Developer ID G2 CA intermediate (may not be in runner system keychain)
+          curl -fsSL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" \
+            -o "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
+            -k "$KEYCHAIN_PATH" -T /usr/bin/codesign 2>/dev/null || true
+
+          # Import Developer ID Application cert + private key
+          security import "$P12_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Write API key
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          P8_PATH="$RUNNER_TEMP/apikey.p8"
+          echo "$APPLE_API_KEY" > "$P8_PATH"
+          echo "APPLE_API_KEY_PATH=$P8_PATH" >> "$GITHUB_ENV"
+
+      - name: Build DMG
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: npm run tauri build -- --bundles dmg
+
+      - name: Cleanup secrets
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/apikey.p8" \
+                "$RUNNER_TEMP/certificate.p12" \
+                "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/target/release/bundle/dmg/*.dmg
