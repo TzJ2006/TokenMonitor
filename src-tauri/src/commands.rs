@@ -9,9 +9,8 @@ use tokio::sync::RwLock;
 
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSColor, NSView, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
-    NSWindowOrderingMode,
+    NSAutoresizingMaskOptions, NSColor, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowOrderingMode,
 };
 #[cfg(target_os = "macos")]
 use objc2_quartz_core::CALayer;
@@ -99,6 +98,7 @@ pub struct WindowSurface {
     pub green: u8,
     pub blue: u8,
     #[serde(default = "default_surface_alpha")]
+    #[allow(dead_code)]
     pub alpha: u8,
 }
 
@@ -169,6 +169,7 @@ fn apply_window_surface(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(deprecated)]
 fn apply_glass_effect(
     window: &tauri::WebviewWindow,
     enabled: bool,
@@ -202,18 +203,16 @@ fn apply_glass_effect(
             // SAFETY: called from run_on_main_thread, so we are on the main thread
             let mtm = unsafe { MainThreadMarker::new_unchecked() };
             let effect_view =
-                unsafe { NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame) };
+                NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
             effect_view.setMaterial(NSVisualEffectMaterial::Popover);
             effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
             effect_view.setState(NSVisualEffectState::Active);
 
             // Auto-resize with parent
-            unsafe {
-                effect_view.setAutoresizingMask(
-                    NSAutoresizingMaskOptions::ViewWidthSizable
-                        | NSAutoresizingMaskOptions::ViewHeightSizable,
-                );
-            }
+            effect_view.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
 
             // Corner radius on the effect view's layer
             effect_view.setWantsLayer(true);
@@ -223,13 +222,11 @@ fn apply_glass_effect(
             }
 
             // Insert behind all other subviews (behind webview)
-            unsafe {
-                content_view.addSubview_positioned_relativeTo(
-                    &effect_view,
-                    NSWindowOrderingMode::Below,
-                    None,
-                );
-            }
+            content_view.addSubview_positioned_relativeTo(
+                &effect_view,
+                NSWindowOrderingMode::Below,
+                None,
+            );
         }
 
         // Keep the content view clipped as well, otherwise the transparent
@@ -264,7 +261,12 @@ pub fn apply_default_window_surface(app: &AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| String::from("Main window not found"))?;
-    apply_window_surface(&window, DEFAULT_DARK_SURFACE, DEFAULT_WINDOW_CORNER_RADIUS, false)
+    apply_window_surface(
+        &window,
+        DEFAULT_DARK_SURFACE,
+        DEFAULT_WINDOW_CORNER_RADIUS,
+        false,
+    )
 }
 
 fn format_tray_title(
@@ -443,9 +445,8 @@ pub async fn set_window_surface(
             })
             .map_err(|e| format!("Failed to schedule native window surface update: {e}"))?;
 
-        return rx
-            .await
-            .map_err(|_| String::from("Native window surface update was cancelled"))?;
+        rx.await
+            .map_err(|_| String::from("Native window surface update was cancelled"))?
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -482,9 +483,8 @@ pub async fn set_glass_effect(
             })
             .map_err(|e| format!("Failed to schedule glass effect update: {e}"))?;
 
-        return rx
-            .await
-            .map_err(|_| String::from("Glass effect update was cancelled"))?;
+        rx.await
+            .map_err(|_| String::from("Glass effect update was cancelled"))?
     }
 
     #[cfg(not(target_os = "macos"))]
