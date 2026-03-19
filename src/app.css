@@ -192,24 +192,24 @@
 
 html, body {
   width: 100%;
-  background: transparent;
 }
 
-/* Prevent scrollbars without capping descendant measurements.
-   overflow:hidden (not clip) — clip causes WebKit/WKWebView to cap
-   offsetHeight on descendants to the viewport height. */
+/* html owns the surface background so that it fills the viewport
+   immediately on resize — the native content-view layer clips it to
+   rounded corners.  This prevents the 1-2 frame gap where the
+   NSVisualEffectView blur would show untinted at the bottom edge. */
 html {
   overflow: hidden;
+  background: var(--surface);
+  background-image: linear-gradient(var(--provider-bg), var(--provider-bg));
 }
 
-/* Paint the single app surface on the root container so the transparent
-   native window and the web content stay visually unified. */
+/* #app provides shape (rounded corners, inset border) but no background
+   of its own — html is the single surface owner. */
 #app {
   width: 100%;
   height: auto;
   min-height: 100%;
-  background: var(--surface);
-  background-image: linear-gradient(var(--provider-bg), var(--provider-bg));
   border-radius: 14px;
   overflow: hidden;
   box-shadow: inset 0 0 0 1px var(--border);

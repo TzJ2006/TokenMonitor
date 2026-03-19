@@ -93,12 +93,12 @@ pub struct UsageDebugReport {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct WindowSurface {
     pub red: u8,
     pub green: u8,
     pub blue: u8,
     #[serde(default = "default_surface_alpha")]
-    #[allow(dead_code)]
     pub alpha: u8,
 }
 
@@ -117,9 +117,9 @@ const fn default_surface_alpha() -> u8 {
 #[cfg(target_os = "macos")]
 fn apply_window_surface(
     window: &tauri::WebviewWindow,
-    surface: WindowSurface,
+    _surface: WindowSurface,
     corner_radius: f64,
-    glass_enabled: bool,
+    _glass_enabled: bool,
 ) -> Result<(), String> {
     let ns_window = window
         .ns_window()
@@ -145,21 +145,13 @@ fn apply_window_surface(
         }
     };
 
-    // When glass is active the NSVisualEffectView provides the background fill;
-    // set the content-view layer to fully transparent so the blur shows through.
-    // When glass is off use the solid surface color instead.
-    let bg_cg_color = if glass_enabled {
-        clear.CGColor()
-    } else {
-        let color = NSColor::colorWithSRGBRed_green_blue_alpha(
-            f64::from(surface.red) / 255.0,
-            f64::from(surface.green) / 255.0,
-            f64::from(surface.blue) / 255.0,
-            1.0,
-        );
-        color.CGColor()
-    };
-    layer.setBackgroundColor(Some(&bg_cg_color));
+    // Always keep the native content-view layer transparent so that the
+    // webview's #app div is the single surface owner.  This prevents the
+    // two-layer desync visible during async window resizes (hover detail
+    // expand/collapse).  When glass is active the NSVisualEffectView
+    // provides the blur backdrop; when glass is off #app paints --surface.
+    let transparent_cg = clear.CGColor();
+    layer.setBackgroundColor(Some(&transparent_cg));
     // The content view owns clipping for the WKWebView subtree.
     layer.setCornerRadius(corner_radius);
     layer.setMasksToBounds(true);
