@@ -33,31 +33,66 @@ It reads the session logs already on your machine, applies provider-aware pricin
 
 No API keys. No cloud sync. No runtime dependency on `ccusage` or another external usage CLI for usage parsing.
 
-## Why It Feels Different
+## Features
 
-- Built for quick menu bar check-ins, not a dashboard you keep open all day
-- Designed around glanceability so spend, burn rate, model mix, and pace are visible in one compact surface
-- Fast to navigate across recent and historical windows without depending on a remote backend
-- Local-first by default, with usage history staying on disk where it already lives
+### Usage Monitoring
 
-## What TokenMonitor Shows
+- Current-session spend, burn rate, and 5-hour context
+- Period views for `5h`, `day`, `week`, `month`, and `year`
+- Historical navigation with offset-based browsing
+- Claude-only, Codex-only, and merged provider views
+- Optional live tray spend display for quick menu bar check-ins
 
-- **Current session**: live spend, burn rate, and 5-hour context for the session you are in right now
-- **History**: quick views across `5h`, `day`, `week`, `month`, and `year`
-- **Model mix**: which models are actually driving usage and cost
-- **Provider context**: Claude, Codex, or a merged view when you want the full picture
-- **Rate limits**: utilization, reset timing, pace hints, and cooldown state when available
+### Analysis & Visualization
 
-## Highlights
+- Per-model cost and token breakdowns
+- Hidden-model filtering
+- Bar-chart and line-chart modes
+- Calendar heatmap for monthly usage patterns
+- Active-session footer with pacing and recent spend context
 
-- **Menu bar native**: compact popover UI with optional live tray spend display
-- **Provider-aware views**: Claude, Codex, and merged provider views with matching theming
-- **History that stays readable**: fast navigation across recent and historical windows
-- **Model breakdowns**: per-model cost and token summaries with filtering plus bar and line chart modes
-- **Calendar heatmap**: a month-level view for spotting expensive streaks and quiet periods
-- **Session pacing**: active-session footer with live burn rate and 5-hour spend context
-- **Rate-limit context**: utilization, reset timing, pace hints, and cooldown handling when available
-- **Desktop controls**: launch-at-login, theme, refresh, currency, and branding settings
+### Rate Limits & Session Context
+
+- Claude and Codex rate-limit panels when provider data is available
+- Utilization, reset timing, cooldown state, and pace hints
+- Local fallback paths for rate-limit context when direct provider data is incomplete
+
+### Desktop UX & Settings
+
+- Native macOS menu bar popover workflow
+- Launch-at-login support
+- Theme, currency, refresh interval, and branding controls
+- Integrated settings and calendar panels inside the same popover flow
+
+### Pricing Accuracy
+
+- Native Rust parsing of local session logs with no runtime dependency on `ccusage`
+- Claude cache-write pricing separated into 5-minute and 1-hour tiers
+- Codex/OpenAI cached input separated from standard input
+- Codex `token_count` normalization for both per-turn and cumulative log formats
+- Reasoning output folded into output billing where applicable
+
+#### Claude Cache-Write Tiers
+
+| Model | 5m Cache Write | 1h Cache Write | Difference |
+|---|---:|---:|---:|
+| Opus 4.6 | $6.25 / MTok | $10.00 / MTok | +60% |
+| Sonnet 4.6 | $3.75 / MTok | $6.00 / MTok | +60% |
+| Haiku 4.5 | $1.25 / MTok | $2.00 / MTok | +60% |
+
+### Local-First & Privacy
+
+- Reads Claude Code and Codex logs already present on disk
+- No cloud sync and no remote account required for usage history
+- Works passively until local logs exist
+- Optional rate-limit panels only use provider-authenticated state already available on the machine
+
+### Performance
+
+- Parsed-file reuse avoids reparsing unchanged logs
+- In-memory caches keyed by provider, period, and offset
+- Stale-while-revalidate loading for fast repeat views
+- Adjacent-window warming for quicker historical navigation
 
 ## Local Data
 
@@ -78,38 +113,6 @@ Rate-limit visibility is separate from usage history parsing:
 - Codex rate limits are read from recent session metadata in local Codex JSONL files
 
 Usage history and cost analytics stay local. Optional rate-limit panels may use authenticated provider data already available on the machine.
-
-## Privacy
-
-- **Usage history stays local**: Claude Code and Codex logs are read from disk on your machine
-- **No cloud sync**: TokenMonitor does not need a remote account to show usage history
-- **No parsing dependency on external CLIs**: usage totals come from native parsing rather than shelling out to `ccusage`
-- **Optional provider context only where needed**: rate-limit panels may use provider-authenticated state already present on the machine
-
-## Why The Numbers Are Useful
-
-TokenMonitor is built to answer the practical question: "What is this usage actually costing me?"
-
-For Claude models, cache traffic is not treated as one flat bucket. TokenMonitor reads cache-creation details from the logs and distinguishes between 5-minute and 1-hour cache writes before pricing them.
-
-For Codex and OpenAI models, cached input stays separate from standard input, and Codex `token_count` events are normalized into billable deltas whether the source log emits per-turn usage or cumulative totals. Reasoning output is folded into output billing where applicable.
-
-This keeps cost calculation aligned with provider-specific billing behavior reflected in the source logs.
-
-### Claude Cache-Write Tiers
-
-| Model | 5m Cache Write | 1h Cache Write | Difference |
-|---|---:|---:|---:|
-| Opus 4.6 | $6.25 / MTok | $10.00 / MTok | +60% |
-| Sonnet 4.6 | $3.75 / MTok | $6.00 / MTok | +60% |
-| Haiku 4.5 | $1.25 / MTok | $2.00 / MTok | +60% |
-
-## Why It Feels Fast
-
-- Native Rust parser with parsed-file reuse so unchanged logs are not reparsed unnecessarily
-- In-memory caches keyed by provider, period, and offset for immediate repeat loads
-- Stale-while-revalidate loading so cached views appear instantly and refresh silently
-- Adjacent-window warming for quicker historical navigation
 
 ## Installation
 
