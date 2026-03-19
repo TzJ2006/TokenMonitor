@@ -89,7 +89,7 @@ pub fn run() {
             // Hide window on focus loss (popover behavior)
             let window = app.get_webview_window("main").unwrap();
             #[cfg(target_os = "macos")]
-            if let Err(err) = apply_default_window_surface(&app.handle()) {
+            if let Err(err) = apply_default_window_surface(app.handle()) {
                 eprintln!("failed to apply default native window surface: {err}");
             }
             let window_clone = window.clone();

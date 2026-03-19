@@ -26,12 +26,32 @@ struct Color {
     a: u8,
 }
 
-const CLAUDE_COLOR: Color = Color { r: 212, g: 165, b: 116, a: 255 }; // #d4a574
-const CODEX_COLOR: Color = Color { r: 122, g: 175, b: 255, a: 255 };  // #7aafff
+const CLAUDE_COLOR: Color = Color {
+    r: 212,
+    g: 165,
+    b: 116,
+    a: 255,
+}; // #d4a574
+const CODEX_COLOR: Color = Color {
+    r: 122,
+    g: 175,
+    b: 255,
+    a: 255,
+}; // #7aafff
 
 /// Track and icon colors adapt to menu bar appearance
-const TRACK_COLOR_DARK: Color = Color { r: 255, g: 255, b: 255, a: 50 };  // white @ ~20% for dark bar
-const TRACK_COLOR_LIGHT: Color = Color { r: 0, g: 0, b: 0, a: 40 };      // black @ ~16% for light bar
+const TRACK_COLOR_DARK: Color = Color {
+    r: 255,
+    g: 255,
+    b: 255,
+    a: 50,
+}; // white @ ~20% for dark bar
+const TRACK_COLOR_LIGHT: Color = Color {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 40,
+}; // black @ ~16% for light bar
 
 /// Detect whether the macOS menu bar is currently using a dark appearance.
 /// Falls back to true (dark) on non-macOS or if detection fails.
@@ -50,7 +70,9 @@ pub fn is_menu_bar_dark() -> bool {
         NSString::from_str("NSAppearanceNameDarkAqua"),
     ]);
 
-    let best = app.effectiveAppearance().bestMatchFromAppearancesWithNames(&names);
+    let best = app
+        .effectiveAppearance()
+        .bestMatchFromAppearancesWithNames(&names);
     match best {
         Some(name) => name.to_string().contains("Dark"),
         None => true,
@@ -113,7 +135,11 @@ pub fn render_tray_icon(
 
     // Icon color: white on dark menu bar, keep black on light menu bar
     let icon_rgb: u8 = if dark_bar { 255 } else { 0 };
-    let track_color = if dark_bar { TRACK_COLOR_DARK } else { TRACK_COLOR_LIGHT };
+    let track_color = if dark_bar {
+        TRACK_COLOR_DARK
+    } else {
+        TRACK_COLOR_LIGHT
+    };
 
     let width = canvas_width(config);
     let height = ICON_H;
@@ -148,10 +174,30 @@ pub fn render_tray_icon(
         let top_y = (ICON_H - total_h) / 2;
 
         // Claude bar (top)
-        draw_bar(&mut buf, width, bar_x, top_y, bar_w, BAR_H_BOTH, c_util, &CLAUDE_COLOR, &track_color);
+        draw_bar(
+            &mut buf,
+            width,
+            bar_x,
+            top_y,
+            bar_w,
+            BAR_H_BOTH,
+            c_util,
+            &CLAUDE_COLOR,
+            &track_color,
+        );
         // Codex bar (bottom)
         let bottom_y = top_y + BAR_H_BOTH + BAR_SPACING;
-        draw_bar(&mut buf, width, bar_x, bottom_y, bar_w, BAR_H_BOTH, x_util, &CODEX_COLOR, &track_color);
+        draw_bar(
+            &mut buf,
+            width,
+            bar_x,
+            bottom_y,
+            bar_w,
+            BAR_H_BOTH,
+            x_util,
+            &CODEX_COLOR,
+            &track_color,
+        );
     } else if config.bar_display == "single" {
         let util = if config.bar_provider == "claude" {
             claude_util
@@ -167,13 +213,24 @@ pub fn render_tray_icon(
 
         // Vertically center single bar
         let top_y = (ICON_H - BAR_H_SINGLE) / 2;
-        draw_bar(&mut buf, width, bar_x, top_y, bar_w, BAR_H_SINGLE, u, color, &track_color);
+        draw_bar(
+            &mut buf,
+            width,
+            bar_x,
+            top_y,
+            bar_w,
+            BAR_H_SINGLE,
+            u,
+            color,
+            &track_color,
+        );
     }
 
     (buf, width, height, false) // false = don't use template mode, we rendered colors
 }
 
 /// Draw a rounded progress bar: track background + filled portion.
+#[allow(clippy::too_many_arguments)]
 fn draw_bar(
     buf: &mut [u8],
     canvas_w: u32,

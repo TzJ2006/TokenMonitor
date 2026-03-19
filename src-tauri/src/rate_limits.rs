@@ -152,7 +152,7 @@ struct ClaudeCliRateLimitInfo {
 }
 
 async fn fetch_claude_rate_limits() -> Result<ProviderRateLimits, RateLimitFetchError> {
-    let token = get_claude_oauth_token().map_err(|error| RateLimitFetchError::message(error))?;
+    let token = get_claude_oauth_token().map_err(RateLimitFetchError::message)?;
 
     let client = reqwest::Client::new();
 
@@ -520,10 +520,8 @@ fn detect_claude_plan(acct: &ClaudeAccountResponse) -> Option<String> {
 fn format_claude_plan_tier(tier: &str) -> String {
     if tier.contains("claude_max_20x") {
         "Max 20x".to_string()
-    } else if tier.contains("claude_max_5x") {
-        "Max 5x".to_string()
     } else if tier.contains("claude_max") {
-        "Max 5x".to_string() // base Max plan is the 5x tier ($100)
+        "Max 5x".to_string() // covers claude_max_5x and base Max plan ($100)
     } else if tier.contains("pro") {
         "Pro".to_string()
     } else {
@@ -661,7 +659,7 @@ fn find_newest_jsonl(
         } else if path.extension().is_some_and(|e| e == "jsonl") {
             if let Ok(meta) = std::fs::metadata(&path) {
                 if let Ok(mtime) = meta.modified() {
-                    if newest.as_ref().map_or(true, |(prev, _)| mtime > *prev) {
+                    if newest.as_ref().is_none_or(|(prev, _)| mtime > *prev) {
                         *newest = Some((mtime, path));
                     }
                 }
