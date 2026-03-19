@@ -445,7 +445,7 @@
   .xa { display: flex; justify-content: space-between; margin-top: 8px; padding: 0 29px 0 32px; }
   .xa span { font: 400 8px/1 'Inter', sans-serif; color: var(--t4); font-variant-numeric: tabular-nums; }
 
-  /* Detail panel */
+  /* Detail panel — smooth expand/collapse to reduce resize jank */
   .detail {
     margin-top: 10px;
     background: var(--surface-2);
@@ -453,7 +453,7 @@
     overflow: hidden;
     max-height: 0;
     opacity: 0;
-    transition: max-height .3s cubic-bezier(.25,.8,.25,1), opacity .2s ease;
+    transition: max-height 0.15s ease-out, opacity 0.12s ease;
   }
   .detail.visible { max-height: 120px; opacity: 1; }
   .detail-inner {
