@@ -1920,6 +1920,7 @@ impl UsageParser {
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
+            subagent_stats: None,
         };
 
         self.store_cache(&cache_key, payload.clone());
@@ -2022,6 +2023,7 @@ impl UsageParser {
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
+            subagent_stats: None,
         };
 
         self.store_cache(&cache_key, payload.clone());
@@ -2137,6 +2139,7 @@ impl UsageParser {
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
+            subagent_stats: None,
         };
 
         self.store_cache(&cache_key, payload.clone());
@@ -2289,6 +2292,7 @@ impl UsageParser {
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
+            subagent_stats: None,
         };
 
         self.store_cache(&cache_key, payload.clone());

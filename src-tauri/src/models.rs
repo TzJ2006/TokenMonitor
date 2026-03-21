@@ -20,6 +20,7 @@ pub struct UsagePayload {
     pub period_label: String,
     pub has_earlier_data: bool,
     pub change_stats: Option<ChangeStats>,
+    pub subagent_stats: Option<crate::subagent_stats::SubagentStats>,
 }
 
 #[derive(Debug, Serialize, Clone)]
