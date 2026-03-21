@@ -1,3 +1,5 @@
+#[allow(dead_code)] // Used by later tasks in the change-stats feature
+mod change_stats;
 mod commands;
 mod models;
 mod parser;
