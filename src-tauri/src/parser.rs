@@ -632,15 +632,115 @@ pub fn read_claude_entries(projects_dir: &Path, since: Option<NaiveDate>) -> Vec
 /// In current Codex logs, `input_tokens` already includes cached input.
 /// Normalize it to billable uncached input here so downstream pricing and
 /// token totals do not count cached input twice.
-type CodexParseResult = (Vec<ParsedEntry>, usize, bool);
+/// Count added and removed lines in a unified diff.
+/// Lines starting with `+` (but not `+++`) are additions.
+/// Lines starting with `-` (but not `---`) are removals.
+fn count_diff_lines(patch: &str) -> (u64, u64) {
+    let mut added: u64 = 0;
+    let mut removed: u64 = 0;
+    for line in patch.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+/// Extract file paths from unified diff headers.
+/// Looks for `+++ b/path` lines and strips the `b/` prefix.
+/// Falls back to `diff --git a/path b/path` headers.
+fn extract_diff_paths(patch: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            let path = rest.trim();
+            if !path.is_empty() {
+                paths.push(path.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            // Handle `+++ path` without `b/` prefix (but skip `+++ /dev/null`)
+            let path = rest.trim();
+            if !path.is_empty() && path != "/dev/null" {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    // Fall back to diff --git headers if no +++ lines found
+    if paths.is_empty() {
+        for line in patch.lines() {
+            if let Some(rest) = line.strip_prefix("diff --git ") {
+                // Format: "a/path b/path"
+                if let Some(b_idx) = rest.find(" b/") {
+                    let path = &rest[b_idx + 3..];
+                    let path = path.trim();
+                    if !path.is_empty() {
+                        paths.push(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// Split a multi-file unified diff into per-file (path, added, removed) tuples.
+fn split_patch_by_file(patch: &str, paths: &[String]) -> Vec<(String, u64, u64)> {
+    // Split on `diff --git` boundaries or `--- a/` boundaries
+    let mut results = Vec::new();
+    let mut current_path_idx: Option<usize> = None;
+    let mut current_added: u64 = 0;
+    let mut current_removed: u64 = 0;
+
+    for line in patch.lines() {
+        if line.starts_with("diff --git ") || line.starts_with("--- a/") || line.starts_with("--- ") {
+            // Check if this starts a new file section
+            if let Some(new_idx) = paths.iter().position(|p| line.contains(p)) {
+                // Flush previous file
+                if let Some(idx) = current_path_idx {
+                    results.push((paths[idx].clone(), current_added, current_removed));
+                }
+                current_path_idx = Some(new_idx);
+                current_added = 0;
+                current_removed = 0;
+                continue;
+            }
+        }
+        if current_path_idx.is_some() {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                current_added += 1;
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                current_removed += 1;
+            }
+        }
+    }
+    // Flush last file
+    if let Some(idx) = current_path_idx {
+        results.push((paths[idx].clone(), current_added, current_removed));
+    }
+
+    // If splitting failed, fall back to one entry per path with even distribution
+    if results.is_empty() && !paths.is_empty() {
+        let (total_added, total_removed) = count_diff_lines(patch);
+        for path in paths {
+            results.push((path.clone(), total_added / paths.len() as u64, total_removed / paths.len() as u64));
+        }
+    }
+
+    results
+}
+
+type CodexParseResult = (Vec<ParsedEntry>, Vec<ParsedChangeEvent>, usize, bool);
 
 fn parse_codex_session_file(path: &Path) -> CodexParseResult {
     let file = match fs::File::open(path) {
         Ok(file) => file,
-        Err(_) => return (Vec::new(), 0, false),
+        Err(_) => return (Vec::new(), Vec::new(), 0, false),
     };
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
+    let mut change_events = Vec::new();
     let mut previous_totals: Option<CodexRawUsage> = None;
     let mut current_model: Option<String> = None;
     let mut lines_read = 0;
@@ -674,7 +774,89 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
             Some(p) => p,
             None => continue,
         };
-        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        // Check for apply_patch tool calls (change events)
+        let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        if payload_type == "function_call"
+            || payload_type == "custom_tool_call"
+            || payload_type == "tool_call"
+        {
+            let tool_name = payload
+                .get("name")
+                .or_else(|| payload.get("function"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if tool_name == "apply_patch" || tool_name.ends_with("apply_patch") {
+                let patch_content = payload
+                    .get("arguments")
+                    .or_else(|| payload.get("content"))
+                    .or_else(|| payload.get("input"))
+                    .and_then(|v| {
+                        // Could be a string directly or a JSON object with a "patch" key
+                        v.as_str().map(String::from).or_else(|| {
+                            v.get("patch").and_then(Value::as_str).map(String::from)
+                        })
+                    });
+
+                if let Some(patch) = patch_content {
+                    let ts_str = entry.timestamp.as_deref().unwrap_or("");
+                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                        let ts = ts.with_timezone(&Local);
+                        let model_raw = extract_codex_model(payload)
+                            .or_else(|| current_model.clone())
+                            .unwrap_or_else(|| String::from("gpt-5"));
+                        let model_key = crate::models::normalize_codex_model(&model_raw).1;
+                        let paths = extract_diff_paths(&patch);
+                        let (total_added, total_removed) = count_diff_lines(&patch);
+
+                        if paths.is_empty() {
+                            // Single file or unparseable diff — emit one event
+                            if total_added > 0 || total_removed > 0 {
+                                change_events.push(ParsedChangeEvent {
+                                    timestamp: ts,
+                                    model: model_key,
+                                    provider: "codex".to_string(),
+                                    path: String::from("unknown"),
+                                    kind: ChangeEventKind::PatchEdit,
+                                    added_lines: total_added,
+                                    removed_lines: total_removed,
+                                    category: classify_file("unknown"),
+                                });
+                            }
+                        } else if paths.len() == 1 {
+                            change_events.push(ParsedChangeEvent {
+                                timestamp: ts,
+                                model: model_key,
+                                provider: "codex".to_string(),
+                                path: paths[0].clone(),
+                                kind: ChangeEventKind::PatchEdit,
+                                added_lines: total_added,
+                                removed_lines: total_removed,
+                                category: classify_file(&paths[0]),
+                            });
+                        } else {
+                            // Multiple files in one patch — split by file
+                            // Re-parse per-file diffs using `diff --git` or `--- a/` separators
+                            let file_diffs = split_patch_by_file(&patch, &paths);
+                            for (file_path, file_added, file_removed) in file_diffs {
+                                change_events.push(ParsedChangeEvent {
+                                    timestamp: ts,
+                                    model: model_key.clone(),
+                                    provider: "codex".to_string(),
+                                    path: file_path.clone(),
+                                    kind: ChangeEventKind::PatchEdit,
+                                    added_lines: file_added,
+                                    removed_lines: file_removed,
+                                    category: classify_file(&file_path),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if payload_type != "token_count" {
             continue;
         }
 
@@ -736,7 +918,7 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
     }
 
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    (entries, lines_read, true)
+    (entries, change_events, lines_read, true)
 }
 
 /// Read all Codex session entries from `sessions_dir`, recursively scanning
@@ -769,7 +951,7 @@ fn read_codex_entries_with_debug(
 
         report.attempted_paths += 1;
         push_sample_path(&mut report.sample_paths, &path);
-        let (parsed_entries, lines_read, opened) = parse_codex_session_file(&path);
+        let (parsed_entries, _change_events, lines_read, opened) = parse_codex_session_file(&path);
         report.lines_read += lines_read;
         if opened {
             report.opened_paths += 1;
@@ -1015,8 +1197,8 @@ impl UsageParser {
         let (entries, change_events, lines_read, opened) = match kind {
             ProviderFileKind::Claude => parse_claude_session_file(path),
             ProviderFileKind::Codex => {
-                let (e, lr, op) = parse_codex_session_file(path);
-                (e, Vec::new(), lr, op)
+                let (e, ce, lr, op) = parse_codex_session_file(path);
+                (e, ce, lr, op)
             }
         };
         let earliest_date = earliest_entry_date(&entries);
@@ -1130,8 +1312,9 @@ impl UsageParser {
     fn load_codex_entries_with_debug(
         &self,
         since: Option<NaiveDate>,
-    ) -> (Vec<ParsedEntry>, ProviderReadDebug) {
+    ) -> (Vec<ParsedEntry>, Vec<ParsedChangeEvent>, ProviderReadDebug) {
         let mut entries = Vec::new();
+        let mut change_events = Vec::new();
         let files = glob_jsonl_files(&self.codex_dir);
         let mut report = ProviderReadDebug {
             provider: String::from("codex"),
@@ -1170,6 +1353,14 @@ impl UsageParser {
                 }
             }
 
+            // Collect change events (filtered by since date)
+            for cev in loaded.change_events {
+                if since.is_some_and(|since_date| cev.timestamp.date_naive() < since_date) {
+                    continue;
+                }
+                change_events.push(cev);
+            }
+
             for parsed in loaded.entries {
                 if since.is_some_and(|since_date| parsed.timestamp.date_naive() < since_date) {
                     continue;
@@ -1179,7 +1370,7 @@ impl UsageParser {
             }
         }
 
-        (entries, report)
+        (entries, change_events, report)
     }
 
     // ── Internal: load entries for a provider/since combination ──
@@ -1192,14 +1383,16 @@ impl UsageParser {
         match provider {
             "claude" => self.load_claude_entries_with_debug(since),
             "codex" => {
-                let (entries, report) = self.load_codex_entries_with_debug(since);
-                (entries, Vec::new(), vec![report])
+                let (entries, change_events, report) = self.load_codex_entries_with_debug(since);
+                (entries, change_events, vec![report])
             }
             _ => {
-                let (mut claude_entries, change_events, mut claude_reports) =
+                let (mut claude_entries, mut change_events, mut claude_reports) =
                     self.load_claude_entries_with_debug(since);
-                let (codex_entries, codex_report) = self.load_codex_entries_with_debug(since);
+                let (codex_entries, codex_change_events, codex_report) =
+                    self.load_codex_entries_with_debug(since);
                 claude_entries.extend(codex_entries);
+                change_events.extend(codex_change_events);
                 claude_reports.push(codex_report);
                 (claude_entries, change_events, claude_reports)
             }
@@ -2473,6 +2666,181 @@ mod tests {
         assert!(is_provider_internal_path("/Users/foo/.claude/plans/something"));
         assert!(!is_provider_internal_path("src/main.rs"));
         assert!(!is_provider_internal_path("/home/user/.claude/projects/foo.jsonl"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Codex apply_patch change event parsing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn count_diff_lines_basic() {
+        let patch = "\
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
+ fn main() {
+-    println!(\"old\");
++    println!(\"new\");
++    println!(\"extra\");
+ }";
+        let (added, removed) = count_diff_lines(patch);
+        assert_eq!(added, 2);
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn count_diff_lines_ignores_header_lines() {
+        let patch = "\
+--- a/foo.rs
++++ b/foo.rs
++added line";
+        let (added, removed) = count_diff_lines(patch);
+        assert_eq!(added, 1);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn extract_diff_paths_from_plus_plus_plus_b() {
+        let patch = "\
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-old
++new";
+        let paths = extract_diff_paths(patch);
+        assert_eq!(paths, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn extract_diff_paths_from_diff_git_header() {
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\nindex abc..def 100644";
+        let paths = extract_diff_paths(patch);
+        assert_eq!(paths, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn extract_diff_paths_skips_dev_null() {
+        let patch = "\
+--- /dev/null
++++ b/src/new_file.rs
++content";
+        let paths = extract_diff_paths(patch);
+        assert_eq!(paths, vec!["src/new_file.rs"]);
+    }
+
+    #[test]
+    fn parse_codex_apply_patch_emits_change_event() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("workspace");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let ts = "2026-03-21T10:00:00+00:00";
+        let content = format!(
+            r#"{{"type":"turn_context","payload":{{"cwd":"/tmp/demo","model":"gpt-5.4"}}}}
+{{"type":"event_msg","timestamp":"{ts}","payload":{{"type":"function_call","name":"apply_patch","arguments":"--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n fn main() {{\n-    old();\n+    new();\n+    extra();\n }}"}}}}
+{{"type":"event_msg","timestamp":"{ts}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":50}}}}}}}}"#,
+            ts = ts
+        );
+        write_file(&session_dir.join("session.jsonl"), &content);
+
+        let (_entries, change_events, _, _) =
+            parse_codex_session_file(&session_dir.join("session.jsonl"));
+        assert_eq!(change_events.len(), 1);
+
+        let cev = &change_events[0];
+        assert_eq!(cev.path, "src/main.rs");
+        assert_eq!(cev.provider, "codex");
+        assert_eq!(cev.model, "gpt-5.4");
+        assert_eq!(cev.kind, ChangeEventKind::PatchEdit);
+        assert_eq!(cev.added_lines, 2);
+        assert_eq!(cev.removed_lines, 1);
+        assert_eq!(cev.category, FileCategory::Code);
+    }
+
+    #[test]
+    fn parse_codex_apply_patch_with_custom_tool_call() {
+        let dir = TempDir::new().unwrap();
+
+        let ts = "2026-03-21T10:00:00+00:00";
+        let content = format!(
+            r#"{{"type":"turn_context","payload":{{"cwd":"/tmp","model":"o3-2025-04-16"}}}}
+{{"type":"event_msg","timestamp":"{ts}","payload":{{"type":"custom_tool_call","name":"apply_patch","arguments":"--- a/config.yaml\n+++ b/config.yaml\n@@ -1 +1,2 @@\n key: old\n+key2: new"}}}}"#,
+            ts = ts
+        );
+        write_file(&dir.path().join("session.jsonl"), &content);
+
+        let (_entries, change_events, _, _) =
+            parse_codex_session_file(&dir.path().join("session.jsonl"));
+        assert_eq!(change_events.len(), 1);
+
+        let cev = &change_events[0];
+        assert_eq!(cev.path, "config.yaml");
+        assert_eq!(cev.model, "o3-2025-04-16");
+        assert_eq!(cev.added_lines, 1);
+        assert_eq!(cev.removed_lines, 0);
+        assert_eq!(cev.category, FileCategory::Config);
+    }
+
+    #[test]
+    fn parse_codex_apply_patch_flows_through_load_entries() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("workspace");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let ts = "2026-03-21T10:00:00+00:00";
+        let content = format!(
+            r#"{{"type":"turn_context","payload":{{"cwd":"/tmp","model":"gpt-5.4"}}}}
+{{"type":"event_msg","timestamp":"{ts}","payload":{{"type":"function_call","name":"apply_patch","arguments":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new"}}}}
+{{"type":"event_msg","timestamp":"{ts}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":50}}}}}}}}"#,
+            ts = ts
+        );
+        write_file(&session_dir.join("session.jsonl"), &content);
+
+        let parser = UsageParser::with_codex_dir(dir.path().to_path_buf());
+        let (_entries, change_events, _reports) =
+            parser.load_entries("codex", parse_since_date("20260301"));
+        assert_eq!(change_events.len(), 1);
+        assert_eq!(change_events[0].path, "src/lib.rs");
+        assert_eq!(change_events[0].provider, "codex");
+
+        // Second call should come from cache and still have change events
+        let (_entries2, change_events2, _reports2) =
+            parser.load_entries("codex", parse_since_date("20260301"));
+        assert_eq!(change_events2.len(), 1);
+        assert_eq!(change_events2[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn codex_change_events_merge_in_all_provider() {
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+
+        // Claude edit
+        let claude_content = r#"{"type":"assistant","timestamp":"2026-03-21T10:00:00+00:00","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"src/a.rs","old_string":"a","new_string":"b"}}],"usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        write_file(&claude_dir.path().join("session.jsonl"), claude_content);
+
+        // Codex apply_patch
+        let ts = "2026-03-21T10:00:00+00:00";
+        let codex_content = format!(
+            r#"{{"type":"turn_context","payload":{{"cwd":"/tmp","model":"gpt-5.4"}}}}
+{{"type":"event_msg","timestamp":"{ts}","payload":{{"type":"function_call","name":"apply_patch","arguments":"--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-x\n+y"}}}}
+{{"type":"event_msg","timestamp":"{ts}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":50}}}}}}}}"#,
+            ts = ts
+        );
+        write_file(&codex_dir.path().join("session.jsonl"), &codex_content);
+
+        let parser = UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        );
+        let (_entries, change_events, _reports) =
+            parser.load_entries("all", parse_since_date("20260301"));
+        assert_eq!(change_events.len(), 2);
+
+        let providers: Vec<&str> = change_events.iter().map(|e| e.provider.as_str()).collect();
+        assert!(providers.contains(&"claude"));
+        assert!(providers.contains(&"codex"));
     }
 }
 
