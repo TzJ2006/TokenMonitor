@@ -634,6 +634,8 @@ pub async fn get_usage_data(
                 },
             )
             .await;
+            let claude_sa = claude.subagent_stats.clone();
+            let codex_sa = codex.subagent_stats.clone();
             let mut merged = merge_payloads(claude, codex);
 
             // Re-aggregate change stats from all providers' change events
@@ -644,6 +646,10 @@ pub async fn get_usage_data(
                 model.change_stats =
                     aggregate_model_change_summary(&all_change_events, &model.model_key);
             }
+
+            // Merge subagent stats
+            merged.subagent_stats =
+                crate::subagent_stats::merge_subagent_stats(claude_sa, codex_sa, merged.total_cost);
 
             Ok(merged)
         }
@@ -877,11 +883,19 @@ fn get_provider_data(
         model.change_stats = aggregate_model_change_summary(&change_events, &model.model_key);
     }
 
+    let period_entries = load_entries_for_period(parser, provider, period, offset);
+
     if period != "5h" {
-        let entries = load_entries_for_period(parser, provider, period, offset);
-        payload.input_tokens = entries.iter().map(|entry| entry.input_tokens).sum();
-        payload.output_tokens = entries.iter().map(|entry| entry.output_tokens).sum();
+        payload.input_tokens = period_entries.iter().map(|entry| entry.input_tokens).sum();
+        payload.output_tokens = period_entries.iter().map(|entry| entry.output_tokens).sum();
     }
+
+    // Attach subagent stats
+    payload.subagent_stats = crate::subagent_stats::aggregate_subagent_stats(
+        &period_entries,
+        &change_events,
+        payload.total_cost,
+    );
 
     Ok(payload)
 }
@@ -1135,6 +1149,7 @@ mod tests {
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
+            subagent_stats: None,
         }
     }
 
@@ -1348,6 +1363,7 @@ mod tests {
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
+            subagent_stats: None,
         };
         let right = UsagePayload {
             total_cost: 2.0,
@@ -1369,6 +1385,7 @@ mod tests {
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
+            subagent_stats: None,
         };
 
         let merged = merge_payloads(left, right);
