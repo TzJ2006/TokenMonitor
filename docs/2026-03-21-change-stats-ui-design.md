@@ -40,7 +40,7 @@ Replace the current 3-card horizontal row with a 2×2 grid. This elevates change
 ┌─────────────────┬─────────────────┐
 │     COST        │    CHANGES      │
 │    $12.34       │  +842 / −311    │
-│  $2.10/h        │ net +531 · 37f  │
+│  $2.10/h        │net +531 · 37 files│
 ├─────────────────┼─────────────────┤
 │    TOKENS       │  COMPOSITION    │
 │    245.3K       │  [████████░░]   │
@@ -59,8 +59,9 @@ Replace the current 3-card horizontal row with a 2×2 grid. This elevates change
 **Changes (top-right):**
 - Value: `+{added_lines}` (green) `/` `−{removed_lines}` (red)
 - Label: "Changes"
-- Sublabel: `net +{net_lines} · {files_touched} files`
-- When net is negative: sublabel text turns red (`net −414`)
+- Sublabel: `net +{net_lines} · {files_touched} files` (spell out "files" — do not abbreviate)
+- When net is negative: sublabel text turns red (`net −414 · 22 files`)
+- Note: `net_lines` is the only signed integer field — it can be negative. All other integer fields (`added_lines`, `removed_lines`, `files_touched`, etc.) are non-negative.
 - Empty state: value `—`, sublabel "No structured edits detected"
 
 **Tokens (bottom-left):**
@@ -72,7 +73,7 @@ Replace the current 3-card horizontal row with a 2×2 grid. This elevates change
 - Header row: label "Composition" left-aligned, efficiency metric right-aligned (`$X.XX/100L`)
 - Composition bar: 5px tall, rounded, segmented by file category
 - Legend: inline items with 4px dots — show categories with >0 share
-- Efficiency metric: `cost_per_100_net_lines` — only shown when `net_lines > 0`, otherwise `—`
+- Efficiency metric: `cost_per_100_net_lines` — the label and value area always render, but the value shows `—` when `net_lines <= 0` (not hidden, just dashed)
 - Empty state: value `—`, sublabel "No file changes to classify"
 
 #### Grid CSS
@@ -153,7 +154,7 @@ The model list stays clean by default — cost and tokens only. No change stats 
 
 #### Optional Toggle
 
-Add a setting `showModelChangeStats` (default: `false`) in the Settings panel under an "Advanced" or "Display" group. When enabled, each model row gains:
+Add a setting `showModelChangeStats` (default: `false`) in the Settings panel under the same section group where `hiddenModels` lives. When enabled, each model row gains:
 - Net lines displayed as `+{added} / −{removed}` in 9px font between the model name and cost
 - Uses the same green/red coloring as the Changes card
 
@@ -222,6 +223,10 @@ other_pct = other_lines_changed / total * 100
 
 When `total === 0`, the composition card shows the empty state.
 
+**Invariant:** `code_lines_changed + docs_lines_changed + config_lines_changed + other_lines_changed` must equal `added_lines + removed_lines`. The four categories partition all changed lines — every file is classified into exactly one bucket. This should be asserted in Rust unit tests.
+
+**Note:** `files_touched` is deduplicated server-side (one count per distinct normalized path, not per edit event). The frontend uses this value directly.
+
 ## Settings Changes
 
 Add to the `Settings` interface:
@@ -279,6 +284,19 @@ All new elements follow existing animation patterns:
 
 ### Rust Tests
 - Covered by the data model design doc's testing plan
+
+## Fields Present but Not Rendered in v1
+
+The following fields are included in the `ChangeStats` TypeScript interface (and computed by the Rust backend) but have no UI surface in v1. They are available for phase 2 features and are intentionally carried in the payload:
+
+- `write_events` — useful for rewrite inflation analysis (phase 2)
+- `avg_lines_per_event` — useful for behavioral analysis (phase 2)
+- `rewrite_ratio` — Claude-only, useful for rewrite detection (phase 2)
+- `churn_ratio` — useful for session quality analysis (phase 2)
+- `tokens_per_net_line` — efficiency metric, candidate for phase 2 UI
+- `dominant_extension` — candidate for phase 2 composition detail
+
+These fields may be `null` in the payload. The frontend must not assume they are populated.
 
 ## Out of Scope (v1)
 
