@@ -25,6 +25,7 @@ export interface UsagePayload {
   period_label: string;
   has_earlier_data: boolean;
   change_stats: ChangeStats | null;
+  subagent_stats: SubagentStats | null;
 }
 
 export interface ChartBucket {
@@ -86,6 +87,31 @@ export interface ModelChangeSummary {
   net_lines: number;
   files_touched: number;
   change_events: number;
+}
+
+export interface ScopeModelUsage {
+  display_name: string;
+  model_key: string;
+  cost: number;
+}
+
+export interface ScopeUsageSummary {
+  cost: number;
+  tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  session_count: number;
+  pct_of_total_cost: number | null;
+  top_models: ScopeModelUsage[];
+  added_lines: number;
+  removed_lines: number;
+}
+
+export interface SubagentStats {
+  main: ScopeUsageSummary;
+  subagents: ScopeUsageSummary;
 }
 
 export interface CalendarDay {

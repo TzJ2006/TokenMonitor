@@ -39,6 +39,8 @@ function makePayload(overrides: Partial<UsagePayload> = {}): UsagePayload {
     from_cache: false,
     period_label: "Today",
     has_earlier_data: false,
+    change_stats: null,
+    subagent_stats: null,
     ...overrides,
   };
 }

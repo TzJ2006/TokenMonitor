@@ -34,6 +34,8 @@ function emptyPayload(): UsagePayload {
     from_cache: false,
     period_label: "",
     has_earlier_data: false,
+    change_stats: null,
+    subagent_stats: null,
   };
 }
 export const setupStatus = writable({ ready: false, installing: false, error: null as string | null });
