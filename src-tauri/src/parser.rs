@@ -1,6 +1,6 @@
-use crate::change_stats::{classify_file, ChangeEventKind, ParsedChangeEvent};
 #[cfg(test)]
 use crate::change_stats::FileCategory;
+use crate::change_stats::{classify_file, ChangeEventKind, ParsedChangeEvent};
 use crate::models::{ActiveBlock, ChartBucket, ChartSegment, ModelSummary, UsagePayload};
 use chrono::{DateTime, Local, NaiveDate, Timelike};
 use serde::{Deserialize, Serialize};
@@ -104,8 +104,16 @@ struct ClaudeJsonlEntry {
     entry_type: String,
     #[serde(default)]
     timestamp: String,
+    #[serde(default)]
+    _uuid: Option<String>,
+    #[serde(default)]
+    _cwd: Option<String>,
     #[serde(rename = "requestId")]
     request_id: Option<String>,
+    #[serde(rename = "sourceToolAssistantUUID")]
+    _source_tool_assistant_uuid: Option<String>,
+    #[serde(rename = "toolUseResult")]
+    tool_use_result: Option<ClaudeToolUseResult>,
     message: Option<ClaudeJsonlMessage>,
 }
 
@@ -123,8 +131,14 @@ struct ClaudeJsonlMessage {
 enum ClaudeContentBlock {
     #[serde(rename = "tool_use")]
     ToolUse {
+        id: Option<String>,
         name: String,
         input: serde_json::Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        #[serde(rename = "tool_use_id")]
+        tool_use_id: String,
     },
     #[serde(other)]
     Other,
@@ -142,6 +156,30 @@ struct EditToolInput {
 #[derive(Deserialize)]
 struct WriteToolInput {
     file_path: String,
+    #[serde(default, rename = "content")]
+    _content: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ClaudeToolUseResult {
+    #[serde(rename = "filePath")]
+    file_path: Option<String>,
+    #[serde(rename = "oldString")]
+    old_string: Option<String>,
+    #[serde(rename = "newString")]
+    new_string: Option<String>,
+    #[serde(rename = "originalFile")]
+    original_file: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(rename = "structuredPatch", default)]
+    structured_patch: Vec<ClaudeStructuredPatchChunk>,
+}
+
+#[derive(Deserialize, Default)]
+struct ClaudeStructuredPatchChunk {
+    #[serde(default)]
+    lines: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -301,6 +339,16 @@ fn create_claude_unique_hash(entry: &ClaudeJsonlEntry) -> Option<String> {
     Some(format!("{message_id}:{request_id}"))
 }
 
+struct PendingClaudeTool {
+    model_key: String,
+    timestamp: DateTime<Local>,
+    path: String,
+    kind: ChangeEventKind,
+    fallback_added_lines: u64,
+    fallback_removed_lines: u64,
+    dedupe_key: Option<String>,
+}
+
 #[derive(Clone, Copy, Default)]
 struct CodexRawUsage {
     input_tokens: u64,
@@ -401,6 +449,57 @@ fn extract_codex_model(value: &Value) -> Option<String> {
         .and_then(|metadata| value_as_non_empty_string(metadata.get("model")))
 }
 
+fn assign_pending_codex_models(
+    model_raw: &str,
+    entries: &mut [ParsedEntry],
+    pending_entry_indices: &mut Vec<usize>,
+    change_events: &mut [ParsedChangeEvent],
+    pending_change_indices: &mut Vec<usize>,
+) {
+    let model_raw = model_raw.to_string();
+    let model_key = crate::models::normalize_codex_model(&model_raw).1;
+
+    for idx in pending_entry_indices.drain(..) {
+        if let Some(entry) = entries.get_mut(idx) {
+            entry.model = model_raw.clone();
+        }
+    }
+
+    for idx in pending_change_indices.drain(..) {
+        if let Some(event) = change_events.get_mut(idx) {
+            event.model = model_key.clone();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_codex_change_event(
+    change_events: &mut Vec<ParsedChangeEvent>,
+    pending_model_indices: &mut Vec<usize>,
+    model_key: Option<&str>,
+    timestamp: DateTime<Local>,
+    path: String,
+    kind: ChangeEventKind,
+    added_lines: u64,
+    removed_lines: u64,
+) {
+    change_events.push(ParsedChangeEvent {
+        timestamp,
+        model: model_key.unwrap_or("").to_string(),
+        provider: "codex".to_string(),
+        category: classify_file(&path),
+        path,
+        kind,
+        added_lines,
+        removed_lines,
+        dedupe_key: None,
+    });
+
+    if model_key.is_none() {
+        pending_model_indices.push(change_events.len() - 1);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Model normalisation helper
 // ─────────────────────────────────────────────────────────────────────────────
@@ -439,6 +538,53 @@ fn is_provider_internal_path(path: &str) -> bool {
     path.contains("/.claude/plans/")
 }
 
+fn count_claude_structured_patch_lines(
+    chunks: &[ClaudeStructuredPatchChunk],
+) -> Option<(u64, u64)> {
+    if chunks.is_empty() {
+        return None;
+    }
+
+    let patch = chunks
+        .iter()
+        .flat_map(|chunk| chunk.lines.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (added, removed) = count_diff_lines(&patch);
+    Some((added, removed))
+}
+
+fn extract_claude_tool_result_counts(
+    tool_result: &ClaudeToolUseResult,
+    pending: &PendingClaudeTool,
+) -> (u64, u64) {
+    if let Some(counts) = count_claude_structured_patch_lines(&tool_result.structured_patch) {
+        return counts;
+    }
+
+    if let (Some(old), Some(new)) = (
+        tool_result.old_string.as_deref(),
+        tool_result.new_string.as_deref(),
+    ) {
+        return (count_lines(new), count_lines(old));
+    }
+
+    if let (Some(old), Some(new)) = (
+        tool_result.original_file.as_deref(),
+        tool_result.content.as_deref(),
+    ) {
+        return (count_lines(new), count_lines(old));
+    }
+
+    if pending.kind == ChangeEventKind::FullWrite {
+        if let Some(content) = tool_result.content.as_deref() {
+            return (count_lines(content), 0);
+        }
+    }
+
+    (pending.fallback_added_lines, pending.fallback_removed_lines)
+}
+
 type ClaudeParseResult = (Vec<ParsedEntry>, Vec<ParsedChangeEvent>, usize, bool);
 
 fn parse_claude_session_file(path: &Path) -> ClaudeParseResult {
@@ -450,6 +596,8 @@ fn parse_claude_session_file(path: &Path) -> ClaudeParseResult {
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
     let mut change_events = Vec::new();
+    let mut pending_tools: Vec<Option<PendingClaudeTool>> = Vec::new();
+    let mut pending_tool_indices: HashMap<String, usize> = HashMap::new();
     let mut lines_read = 0;
 
     for line in reader.lines() {
@@ -459,8 +607,8 @@ fn parse_claude_session_file(path: &Path) -> ClaudeParseResult {
             Err(_) => continue,
         };
 
-        // Fast pre-filter: skip lines that can't be assistant entries
-        if !line.contains("\"assistant\"") {
+        // Fast pre-filter: skip lines that can't contain assistant/tool_result data
+        if !line.contains("\"assistant\"") && !line.contains("\"tool_result\"") {
             continue;
         }
 
@@ -468,92 +616,165 @@ fn parse_claude_session_file(path: &Path) -> ClaudeParseResult {
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        if entry.entry_type != "assistant" {
-            continue;
-        }
-
-        let msg = match &entry.message {
-            Some(message) => message,
-            None => continue,
-        };
-        let usage = match &msg.usage {
-            Some(usage) => usage,
-            None => continue,
-        };
-        let model = match &msg.model {
-            Some(model) if !model.starts_with('<') => model.clone(), // skip <synthetic> etc.
-            _ => continue,
-        };
         let ts = match chrono::DateTime::parse_from_rfc3339(&entry.timestamp) {
             Ok(ts) => ts.with_timezone(&Local),
             Err(_) => continue,
         };
 
-        // Extract change events from tool_use content blocks
-        let model_key = crate::models::normalize_claude_model(&model).1.to_string();
-        for block in &msg.content {
-            match block {
-                ClaudeContentBlock::ToolUse { name, input } if name == "Edit" => {
-                    if let Ok(edit) = serde_json::from_value::<EditToolInput>(input.clone()) {
-                        if is_provider_internal_path(&edit.file_path) {
-                            continue;
+        match entry.entry_type.as_str() {
+            "assistant" => {
+                let msg = match &entry.message {
+                    Some(message) => message,
+                    None => continue,
+                };
+                let model = match &msg.model {
+                    Some(model) if !model.starts_with('<') => model.clone(), // skip <synthetic> etc.
+                    _ => continue,
+                };
+
+                let model_key = crate::models::normalize_claude_model(&model).1.to_string();
+                let unique_hash = create_claude_unique_hash(&entry);
+                for (block_index, block) in msg.content.iter().enumerate() {
+                    let pending = match block {
+                        ClaudeContentBlock::ToolUse { id, name, input } if name == "Edit" => {
+                            serde_json::from_value::<EditToolInput>(input.clone())
+                                .ok()
+                                .and_then(|edit| {
+                                    if is_provider_internal_path(&edit.file_path) {
+                                        return None;
+                                    }
+                                    Some((
+                                        id.clone(),
+                                        PendingClaudeTool {
+                                            model_key: model_key.clone(),
+                                            timestamp: ts,
+                                            path: edit.file_path.clone(),
+                                            kind: ChangeEventKind::PatchEdit,
+                                            fallback_added_lines: count_lines(&edit.new_string),
+                                            fallback_removed_lines: count_lines(&edit.old_string),
+                                            dedupe_key: unique_hash
+                                                .as_ref()
+                                                .map(|hash| format!("{hash}:{block_index}")),
+                                        },
+                                    ))
+                                })
                         }
-                        let added_lines = count_lines(&edit.new_string);
-                        let removed_lines = count_lines(&edit.old_string);
-                        change_events.push(ParsedChangeEvent {
-                            timestamp: ts,
-                            model: model_key.clone(),
-                            provider: "claude".to_string(),
-                            path: edit.file_path.clone(),
-                            kind: ChangeEventKind::PatchEdit,
-                            added_lines,
-                            removed_lines,
-                            category: classify_file(&edit.file_path),
-                        });
+                        ClaudeContentBlock::ToolUse { id, name, input } if name == "Write" => {
+                            serde_json::from_value::<WriteToolInput>(input.clone())
+                                .ok()
+                                .and_then(|write| {
+                                    if is_provider_internal_path(&write.file_path) {
+                                        return None;
+                                    }
+                                    Some((
+                                        id.clone(),
+                                        PendingClaudeTool {
+                                            model_key: model_key.clone(),
+                                            timestamp: ts,
+                                            path: write.file_path.clone(),
+                                            kind: ChangeEventKind::FullWrite,
+                                            fallback_added_lines: 0,
+                                            fallback_removed_lines: 0,
+                                            dedupe_key: unique_hash
+                                                .as_ref()
+                                                .map(|hash| format!("{hash}:{block_index}")),
+                                        },
+                                    ))
+                                })
+                        }
+                        _ => None,
+                    };
+
+                    if let Some((tool_id, pending)) = pending {
+                        let idx = pending_tools.len();
+                        pending_tools.push(Some(pending));
+                        if let Some(tool_id) = tool_id {
+                            pending_tool_indices.insert(tool_id, idx);
+                        }
                     }
                 }
-                ClaudeContentBlock::ToolUse { name, input } if name == "Write" => {
-                    if let Ok(write) = serde_json::from_value::<WriteToolInput>(input.clone()) {
-                        if is_provider_internal_path(&write.file_path) {
-                            continue;
-                        }
-                        change_events.push(ParsedChangeEvent {
-                            timestamp: ts,
-                            model: model_key.clone(),
-                            provider: "claude".to_string(),
-                            path: write.file_path.clone(),
-                            kind: ChangeEventKind::FullWrite,
-                            added_lines: 0,
-                            removed_lines: 0,
-                            category: classify_file(&write.file_path),
-                        });
-                    }
+
+                if let Some(usage) = msg.usage.as_ref() {
+                    // Split cache creation into 5m and 1h tiers.
+                    // If the breakdown sub-object exists, use it directly.
+                    // Otherwise default all cache creation to 1h (Claude Code's default).
+                    let total_cw = usage.cache_creation_input_tokens.unwrap_or(0);
+                    let (cw_5m, cw_1h) = match &usage.cache_creation {
+                        Some(bd) => (
+                            bd.ephemeral_5m_input_tokens.unwrap_or(0),
+                            bd.ephemeral_1h_input_tokens.unwrap_or(0),
+                        ),
+                        None => (0, total_cw),
+                    };
+
+                    entries.push(ParsedEntry {
+                        timestamp: ts,
+                        model,
+                        input_tokens: usage.input_tokens.unwrap_or(0),
+                        output_tokens: usage.output_tokens.unwrap_or(0),
+                        cache_creation_5m_tokens: cw_5m,
+                        cache_creation_1h_tokens: cw_1h,
+                        cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                        unique_hash,
+                    });
                 }
-                _ => {}
             }
+            "user" => {
+                let Some(tool_result) = entry.tool_use_result.as_ref() else {
+                    continue;
+                };
+                let Some(msg) = entry.message.as_ref() else {
+                    continue;
+                };
+
+                for block in &msg.content {
+                    let ClaudeContentBlock::ToolResult { tool_use_id } = block else {
+                        continue;
+                    };
+                    let Some(idx) = pending_tool_indices.remove(tool_use_id) else {
+                        continue;
+                    };
+                    let Some(pending) = pending_tools.get_mut(idx).and_then(Option::take) else {
+                        continue;
+                    };
+
+                    let path = tool_result
+                        .file_path
+                        .clone()
+                        .filter(|path| !is_provider_internal_path(path))
+                        .unwrap_or_else(|| pending.path.clone());
+                    let (added_lines, removed_lines) =
+                        extract_claude_tool_result_counts(tool_result, &pending);
+
+                    change_events.push(ParsedChangeEvent {
+                        timestamp: ts,
+                        model: pending.model_key,
+                        provider: "claude".to_string(),
+                        path: path.clone(),
+                        kind: pending.kind,
+                        added_lines,
+                        removed_lines,
+                        category: classify_file(&path),
+                        dedupe_key: pending.dedupe_key,
+                    });
+                }
+            }
+            _ => {}
         }
+    }
 
-        // Split cache creation into 5m and 1h tiers.
-        // If the breakdown sub-object exists, use it directly.
-        // Otherwise default all cache creation to 1h (Claude Code's default).
-        let total_cw = usage.cache_creation_input_tokens.unwrap_or(0);
-        let (cw_5m, cw_1h) = match &usage.cache_creation {
-            Some(bd) => (
-                bd.ephemeral_5m_input_tokens.unwrap_or(0),
-                bd.ephemeral_1h_input_tokens.unwrap_or(0),
-            ),
-            None => (0, total_cw),
-        };
-
-        entries.push(ParsedEntry {
-            timestamp: ts,
-            model,
-            input_tokens: usage.input_tokens.unwrap_or(0),
-            output_tokens: usage.output_tokens.unwrap_or(0),
-            cache_creation_5m_tokens: cw_5m,
-            cache_creation_1h_tokens: cw_1h,
-            cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-            unique_hash: create_claude_unique_hash(&entry),
+    for pending in pending_tools.into_iter().flatten() {
+        let path = pending.path.clone();
+        change_events.push(ParsedChangeEvent {
+            timestamp: pending.timestamp,
+            model: pending.model_key,
+            provider: "claude".to_string(),
+            path: path.clone(),
+            kind: pending.kind,
+            added_lines: pending.fallback_added_lines,
+            removed_lines: pending.fallback_removed_lines,
+            category: classify_file(&path),
+            dedupe_key: pending.dedupe_key,
         });
     }
 
@@ -593,8 +814,7 @@ fn read_claude_entries_with_debug(
         report.attempted_paths += 1;
         push_sample_path(&mut report.sample_paths, &path);
 
-        let (parsed_entries, _change_events, lines_read, opened) =
-            parse_claude_session_file(&path);
+        let (parsed_entries, _change_events, lines_read, opened) = parse_claude_session_file(&path);
         report.lines_read += lines_read;
         if opened {
             report.opened_paths += 1;
@@ -682,6 +902,21 @@ fn extract_diff_paths(patch: &str) -> Vec<String> {
             }
         }
     }
+    // Fall back to Codex *** Add/Update File: headers
+    if paths.is_empty() {
+        for line in patch.lines() {
+            let rest = line
+                .strip_prefix("*** Add File: ")
+                .or_else(|| line.strip_prefix("*** Update File: "))
+                .or_else(|| line.strip_prefix("*** Delete File: "));
+            if let Some(file_path) = rest {
+                let file_path = file_path.trim();
+                if !file_path.is_empty() {
+                    paths.push(file_path.to_string());
+                }
+            }
+        }
+    }
     paths
 }
 
@@ -694,7 +929,13 @@ fn split_patch_by_file(patch: &str, paths: &[String]) -> Vec<(String, u64, u64)>
     let mut current_removed: u64 = 0;
 
     for line in patch.lines() {
-        if line.starts_with("diff --git ") || line.starts_with("--- a/") || line.starts_with("--- ") {
+        if line.starts_with("diff --git ")
+            || line.starts_with("--- a/")
+            || line.starts_with("--- ")
+            || line.starts_with("*** Add File: ")
+            || line.starts_with("*** Update File: ")
+            || line.starts_with("*** Delete File: ")
+        {
             // Check if this starts a new file section
             if let Some(new_idx) = paths.iter().position(|p| line.contains(p)) {
                 // Flush previous file
@@ -724,7 +965,11 @@ fn split_patch_by_file(patch: &str, paths: &[String]) -> Vec<(String, u64, u64)>
     if results.is_empty() && !paths.is_empty() {
         let (total_added, total_removed) = count_diff_lines(patch);
         for path in paths {
-            results.push((path.clone(), total_added / paths.len() as u64, total_removed / paths.len() as u64));
+            results.push((
+                path.clone(),
+                total_added / paths.len() as u64,
+                total_removed / paths.len() as u64,
+            ));
         }
     }
 
@@ -743,6 +988,8 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
     let mut change_events = Vec::new();
     let mut previous_totals: Option<CodexRawUsage> = None;
     let mut current_model: Option<String> = None;
+    let mut pending_entry_model_indices = Vec::new();
+    let mut pending_change_model_indices = Vec::new();
     let mut lines_read = 0;
 
     for line in reader.lines() {
@@ -761,12 +1008,21 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
             if let Some(payload) = entry.payload.as_ref() {
                 if let Some(model) = extract_codex_model(payload) {
                     current_model = Some(model);
+                    assign_pending_codex_models(
+                        current_model.as_deref().unwrap_or("gpt-5"),
+                        &mut entries,
+                        &mut pending_entry_model_indices,
+                        &mut change_events,
+                        &mut pending_change_model_indices,
+                    );
                 }
             }
             continue;
         }
 
-        if entry.entry_type != "event_msg" {
+        // Accept both "event_msg" and "response_item" — newer Codex CLI versions
+        // emit apply_patch tool calls as "response_item" entries.
+        if entry.entry_type != "event_msg" && entry.entry_type != "response_item" {
             continue;
         }
 
@@ -780,6 +1036,18 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
             || payload_type == "custom_tool_call"
             || payload_type == "tool_call"
         {
+            let model_raw = extract_codex_model(payload).or_else(|| current_model.clone());
+            if let Some(model) = model_raw.as_ref() {
+                current_model = Some(model.clone());
+                assign_pending_codex_models(
+                    model,
+                    &mut entries,
+                    &mut pending_entry_model_indices,
+                    &mut change_events,
+                    &mut pending_change_model_indices,
+                );
+            }
+
             let tool_name = payload
                 .get("name")
                 .or_else(|| payload.get("function"))
@@ -792,62 +1060,61 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
                     .or_else(|| payload.get("input"))
                     .and_then(|v| {
                         // Could be a string directly or a JSON object with a "patch" key
-                        v.as_str().map(String::from).or_else(|| {
-                            v.get("patch").and_then(Value::as_str).map(String::from)
-                        })
+                        v.as_str()
+                            .map(String::from)
+                            .or_else(|| v.get("patch").and_then(Value::as_str).map(String::from))
                     });
 
                 if let Some(patch) = patch_content {
                     let ts_str = entry.timestamp.as_deref().unwrap_or("");
                     if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
                         let ts = ts.with_timezone(&Local);
-                        let model_raw = extract_codex_model(payload)
-                            .or_else(|| current_model.clone())
-                            .unwrap_or_else(|| String::from("gpt-5"));
-                        let model_key = crate::models::normalize_codex_model(&model_raw).1;
+                        let model_key = model_raw
+                            .as_deref()
+                            .map(|raw| crate::models::normalize_codex_model(raw).1);
                         let paths = extract_diff_paths(&patch);
                         let (total_added, total_removed) = count_diff_lines(&patch);
 
                         if paths.is_empty() {
                             // Single file or unparseable diff — emit one event
                             if total_added > 0 || total_removed > 0 {
-                                change_events.push(ParsedChangeEvent {
-                                    timestamp: ts,
-                                    model: model_key,
-                                    provider: "codex".to_string(),
-                                    path: String::from("unknown"),
-                                    kind: ChangeEventKind::PatchEdit,
-                                    added_lines: total_added,
-                                    removed_lines: total_removed,
-                                    category: classify_file("unknown"),
-                                });
+                                push_codex_change_event(
+                                    &mut change_events,
+                                    &mut pending_change_model_indices,
+                                    model_key.as_deref(),
+                                    ts,
+                                    String::from("unknown"),
+                                    ChangeEventKind::PatchEdit,
+                                    total_added,
+                                    total_removed,
+                                );
                             }
                         } else if paths.len() == 1 {
-                            change_events.push(ParsedChangeEvent {
-                                timestamp: ts,
-                                model: model_key,
-                                provider: "codex".to_string(),
-                                path: paths[0].clone(),
-                                kind: ChangeEventKind::PatchEdit,
-                                added_lines: total_added,
-                                removed_lines: total_removed,
-                                category: classify_file(&paths[0]),
-                            });
+                            push_codex_change_event(
+                                &mut change_events,
+                                &mut pending_change_model_indices,
+                                model_key.as_deref(),
+                                ts,
+                                paths[0].clone(),
+                                ChangeEventKind::PatchEdit,
+                                total_added,
+                                total_removed,
+                            );
                         } else {
                             // Multiple files in one patch — split by file
                             // Re-parse per-file diffs using `diff --git` or `--- a/` separators
                             let file_diffs = split_patch_by_file(&patch, &paths);
                             for (file_path, file_added, file_removed) in file_diffs {
-                                change_events.push(ParsedChangeEvent {
-                                    timestamp: ts,
-                                    model: model_key.clone(),
-                                    provider: "codex".to_string(),
-                                    path: file_path.clone(),
-                                    kind: ChangeEventKind::PatchEdit,
-                                    added_lines: file_added,
-                                    removed_lines: file_removed,
-                                    category: classify_file(&file_path),
-                                });
+                                push_codex_change_event(
+                                    &mut change_events,
+                                    &mut pending_change_model_indices,
+                                    model_key.as_deref(),
+                                    ts,
+                                    file_path,
+                                    ChangeEventKind::PatchEdit,
+                                    file_added,
+                                    file_removed,
+                                );
                             }
                         }
                     }
@@ -866,10 +1133,10 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
         let total_usage =
             normalize_codex_raw_usage(info.and_then(|value| value.get("total_token_usage")));
 
-        let raw_usage = if let Some(last_usage) = last_usage {
-            last_usage
-        } else if let Some(total_usage) = total_usage {
+        let raw_usage = if let Some(total_usage) = total_usage {
             subtract_codex_raw_usage(total_usage, previous_totals)
+        } else if let Some(last_usage) = last_usage {
+            last_usage
         } else {
             continue;
         };
@@ -895,19 +1162,25 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
         let extracted_model = extract_codex_model(payload);
         if let Some(model) = extracted_model.as_ref() {
             current_model = Some(model.clone());
+            assign_pending_codex_models(
+                model,
+                &mut entries,
+                &mut pending_entry_model_indices,
+                &mut change_events,
+                &mut pending_change_model_indices,
+            );
         }
 
-        let model = extracted_model
-            .or_else(|| current_model.clone())
-            .unwrap_or_else(|| String::from("gpt-5"));
+        let model = extracted_model.or_else(|| current_model.clone());
 
         let uncached_input_tokens = raw_usage
             .input_tokens
             .saturating_sub(raw_usage.cached_input_tokens);
 
+        let entry_model = model.unwrap_or_default();
         entries.push(ParsedEntry {
             timestamp: ts,
-            model,
+            model: entry_model,
             input_tokens: uncached_input_tokens,
             output_tokens: raw_usage.output_tokens,
             cache_creation_5m_tokens: 0,
@@ -915,7 +1188,18 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
             cache_read_tokens: raw_usage.cached_input_tokens,
             unique_hash: None,
         });
+        if entries.last().is_some_and(|entry| entry.model.is_empty()) {
+            pending_entry_model_indices.push(entries.len() - 1);
+        }
     }
+
+    assign_pending_codex_models(
+        "gpt-5",
+        &mut entries,
+        &mut pending_entry_model_indices,
+        &mut change_events,
+        &mut pending_change_model_indices,
+    );
 
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     (entries, change_events, lines_read, true)
@@ -1236,11 +1520,16 @@ impl UsageParser {
     fn load_claude_entries_with_debug(
         &self,
         since: Option<NaiveDate>,
-    ) -> (Vec<ParsedEntry>, Vec<ParsedChangeEvent>, Vec<ProviderReadDebug>) {
+    ) -> (
+        Vec<ParsedEntry>,
+        Vec<ParsedChangeEvent>,
+        Vec<ProviderReadDebug>,
+    ) {
         let mut entries = Vec::new();
         let mut change_events = Vec::new();
         let mut reports = Vec::new();
         let mut processed_hashes = HashSet::new();
+        let mut processed_change_keys = HashSet::new();
 
         for claude_dir in &self.claude_dirs {
             let files = glob_jsonl_files(claude_dir);
@@ -1285,6 +1574,11 @@ impl UsageParser {
                 for cev in loaded.change_events {
                     if since.is_some_and(|since_date| cev.timestamp.date_naive() < since_date) {
                         continue;
+                    }
+                    if let Some(dedupe_key) = cev.dedupe_key.as_ref() {
+                        if !processed_change_keys.insert(dedupe_key.clone()) {
+                            continue;
+                        }
                     }
                     change_events.push(cev);
                 }
@@ -1379,7 +1673,11 @@ impl UsageParser {
         &self,
         provider: &str,
         since: Option<NaiveDate>,
-    ) -> (Vec<ParsedEntry>, Vec<ParsedChangeEvent>, Vec<ProviderReadDebug>) {
+    ) -> (
+        Vec<ParsedEntry>,
+        Vec<ParsedChangeEvent>,
+        Vec<ProviderReadDebug>,
+    ) {
         match provider {
             "claude" => self.load_claude_entries_with_debug(since),
             "codex" => {
@@ -1693,7 +1991,12 @@ impl UsageParser {
         }
 
         let since_date = parse_since_date(since);
+        let end_date = since_date.map(|date| date + chrono::Duration::days(1));
         let (entries, _change_events, sources) = self.load_entries(provider, since_date);
+        let entries: Vec<ParsedEntry> = entries
+            .into_iter()
+            .filter(|entry| end_date.is_none_or(|end| entry.timestamp.date_naive() < end))
+            .collect();
         self.set_last_query_debug(UsageQueryDebugReport {
             provider: provider.to_string(),
             aggregation: String::from("hourly"),
@@ -2012,7 +2315,8 @@ mod tests {
         write_file(&dir.path().join("session.jsonl"), content);
 
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
-        let (entries, _change_events, reports) = parser.load_entries("claude", parse_since_date("20260301"));
+        let (entries, _change_events, reports) =
+            parser.load_entries("claude", parse_since_date("20260301"));
 
         assert_eq!(
             entries.len(),
@@ -2088,6 +2392,60 @@ mod tests {
         assert_eq!(entries[1].input_tokens, 130);
         assert_eq!(entries[1].output_tokens, 60);
         assert_eq!(entries[1].cache_read_tokens, 20);
+    }
+
+    #[test]
+    fn parse_codex_total_token_usage_skips_duplicate_replays() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("nested");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let ts1 = "2026-03-15T12:00:00+00:00";
+        let ts2 = "2026-03-15T12:00:01+00:00";
+        let ts3 = "2026-03-15T12:00:02+00:00";
+        let content = format!(
+            r#"{{"type":"turn_context","payload":{{"cwd":"/tmp/demo","model":"gpt-5.4"}}}}
+{{"type":"event_msg","timestamp":"{ts1}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30,"total_tokens":150}},"last_token_usage":{{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30,"total_tokens":150}}}}}}}}
+{{"type":"event_msg","timestamp":"{ts2}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30,"total_tokens":150}},"last_token_usage":{{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30,"total_tokens":150}}}}}}}}
+{{"type":"event_msg","timestamp":"{ts3}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":170,"cached_input_tokens":30,"output_tokens":50,"total_tokens":220}},"last_token_usage":{{"input_tokens":50,"cached_input_tokens":10,"output_tokens":20,"total_tokens":70}}}}}}}}"#,
+        );
+        write_file(&session_dir.join("session.jsonl"), &content);
+
+        let entries = read_codex_entries(dir.path(), parse_since_date("20260301"));
+        assert_eq!(
+            entries.len(),
+            2,
+            "duplicate replay should not emit a second entry"
+        );
+        assert_eq!(entries[0].input_tokens, 100);
+        assert_eq!(entries[0].output_tokens, 30);
+        assert_eq!(entries[0].cache_read_tokens, 20);
+        assert_eq!(entries[1].input_tokens, 40);
+        assert_eq!(entries[1].output_tokens, 20);
+        assert_eq!(entries[1].cache_read_tokens, 10);
+    }
+
+    #[test]
+    fn parse_codex_assigns_pre_context_usage_to_first_known_model() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("workspace");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let ts1 = "2026-03-15T12:00:00+00:00";
+        let ts2 = "2026-03-15T12:05:00+00:00";
+        let content = format!(
+            r#"{{"type":"event_msg","timestamp":"{ts1}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30,"total_tokens":150}}}}}}}}
+{{"type":"turn_context","payload":{{"cwd":"/tmp/demo","model":"gpt-5.4"}}}}
+{{"type":"event_msg","timestamp":"{ts2}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":150,"cached_input_tokens":25,"output_tokens":45,"total_tokens":195}}}}}}}}"#,
+        );
+        write_file(&session_dir.join("session.jsonl"), &content);
+
+        let entries = read_codex_entries(dir.path(), parse_since_date("20260301"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].model, "gpt-5.4");
+        assert_eq!(entries[1].model, "gpt-5.4");
+        assert_eq!(entries[0].input_tokens, 100);
+        assert_eq!(entries[1].input_tokens, 25);
     }
 
     #[test]
@@ -2547,12 +2905,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_edit_tool_use_emits_change_event() {
+    fn parse_claude_edit_tool_result_prefers_structured_patch_counts() {
         let dir = TempDir::new().unwrap();
-        let content = r#"{"type":"assistant","timestamp":"2026-03-21T10:00:00+00:00","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"src/main.rs","old_string":"fn old()","new_string":"fn new()\nfn extra()"}}],"usage":{"input_tokens":100,"output_tokens":50}}}"#;
+        let content = r#"{"type":"assistant","timestamp":"2026-03-21T10:00:00+00:00","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"src/main.rs","old_string":"let a = 1;\nlet b = 2;","new_string":"let a = 1;\nlet b = 3;\nlet c = 4;"}}],"usage":{"input_tokens":100,"output_tokens":50}}}
+{"type":"user","timestamp":"2026-03-21T10:00:01+00:00","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"Applied patch"}]},"toolUseResult":{"filePath":"src/main.rs","oldString":"let a = 1;\nlet b = 2;","newString":"let a = 1;\nlet b = 3;\nlet c = 4;","structuredPatch":[{"lines":["@@"," let a = 1;","-let b = 2;","+let b = 3;","+let c = 4;"]}]}}"#;
         write_file(&dir.path().join("session.jsonl"), content);
 
-        let (entries, change_events, _, _) = parse_claude_session_file(&dir.path().join("session.jsonl"));
+        let (entries, change_events, _, _) =
+            parse_claude_session_file(&dir.path().join("session.jsonl"));
         assert_eq!(entries.len(), 1);
         assert_eq!(change_events.len(), 1);
 
@@ -2561,18 +2921,23 @@ mod tests {
         assert_eq!(cev.model, "opus-4-6");
         assert_eq!(cev.provider, "claude");
         assert_eq!(cev.kind, ChangeEventKind::PatchEdit);
-        assert_eq!(cev.removed_lines, 1); // "fn old()"
-        assert_eq!(cev.added_lines, 2); // "fn new()\nfn extra()"
+        assert_eq!(cev.removed_lines, 1);
+        assert_eq!(cev.added_lines, 2);
         assert_eq!(cev.category, FileCategory::Code);
     }
 
     #[test]
-    fn parse_claude_write_tool_use_emits_change_event() {
+    fn parse_claude_write_tool_result_emits_change_event_with_line_counts() {
         let dir = TempDir::new().unwrap();
-        let content = "{\"type\":\"assistant\",\"timestamp\":\"2026-03-21T10:00:00+00:00\",\"requestId\":\"req_1\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6-20260301\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Write\",\"input\":{\"file_path\":\"docs/README.md\",\"content\":\"# Hello\\nWorld\"}}],\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}}";
+        let content = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-03-21T10:00:00+00:00\",\"requestId\":\"req_1\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6-20260301\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Write\",\"input\":{\"file_path\":\"docs/README.md\",\"content\":\"# Hello\\nWorld\\nAgain\"}}],\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}}",
+            "\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-03-21T10:00:01+00:00\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_1\",\"content\":\"Wrote file\"}]},\"toolUseResult\":{\"filePath\":\"docs/README.md\",\"content\":\"# Hello\\nWorld\\nAgain\",\"originalFile\":\"# Hello\\nWorld\",\"structuredPatch\":[{\"lines\":[\"@@\",\" # Hello\",\" World\",\"+Again\"]}]}}"
+        );
         write_file(&dir.path().join("session.jsonl"), content);
 
-        let (entries, change_events, _, _) = parse_claude_session_file(&dir.path().join("session.jsonl"));
+        let (entries, change_events, _, _) =
+            parse_claude_session_file(&dir.path().join("session.jsonl"));
         assert_eq!(entries.len(), 1);
         assert_eq!(change_events.len(), 1);
 
@@ -2580,9 +2945,23 @@ mod tests {
         assert_eq!(cev.path, "docs/README.md");
         assert_eq!(cev.model, "sonnet-4-6");
         assert_eq!(cev.kind, ChangeEventKind::FullWrite);
-        assert_eq!(cev.added_lines, 0); // conservative: no line count for Write
+        assert_eq!(cev.added_lines, 1);
         assert_eq!(cev.removed_lines, 0);
         assert_eq!(cev.category, FileCategory::Docs);
+    }
+
+    #[test]
+    fn parse_claude_unresolved_write_tool_use_falls_back_to_zero_change_count() {
+        let dir = TempDir::new().unwrap();
+        let content = "{\"type\":\"assistant\",\"timestamp\":\"2026-03-21T10:00:00+00:00\",\"requestId\":\"req_1\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6-20260301\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Write\",\"input\":{\"file_path\":\"docs/README.md\",\"content\":\"# Hello\\nWorld\"}}],\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}}";
+        write_file(&dir.path().join("session.jsonl"), content);
+
+        let (_entries, change_events, _, _) =
+            parse_claude_session_file(&dir.path().join("session.jsonl"));
+        assert_eq!(change_events.len(), 1);
+        assert_eq!(change_events[0].kind, ChangeEventKind::FullWrite);
+        assert_eq!(change_events[0].added_lines, 0);
+        assert_eq!(change_events[0].removed_lines, 0);
     }
 
     #[test]
@@ -2591,7 +2970,8 @@ mod tests {
         let content = r#"{"type":"assistant","timestamp":"2026-03-21T10:00:00+00:00","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"src/a.rs","old_string":"a","new_string":"b\nc"}},{"type":"tool_use","id":"tu_2","name":"Edit","input":{"file_path":"src/b.rs","old_string":"x\ny","new_string":"z"}},{"type":"text","text":"Done"}],"usage":{"input_tokens":100,"output_tokens":50}}}"#;
         write_file(&dir.path().join("session.jsonl"), content);
 
-        let (_entries, change_events, _, _) = parse_claude_session_file(&dir.path().join("session.jsonl"));
+        let (_entries, change_events, _, _) =
+            parse_claude_session_file(&dir.path().join("session.jsonl"));
         assert_eq!(change_events.len(), 2);
 
         assert_eq!(change_events[0].path, "src/a.rs");
@@ -2609,7 +2989,8 @@ mod tests {
         let content = r#"{"type":"assistant","timestamp":"2026-03-21T10:00:00+00:00","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Write","input":{"file_path":"/home/user/.claude/plans/plan_123.md","content":"step 1"}},{"type":"tool_use","id":"tu_2","name":"Edit","input":{"file_path":"src/real.rs","old_string":"old","new_string":"new"}}],"usage":{"input_tokens":100,"output_tokens":50}}}"#;
         write_file(&dir.path().join("session.jsonl"), content);
 
-        let (_entries, change_events, _, _) = parse_claude_session_file(&dir.path().join("session.jsonl"));
+        let (_entries, change_events, _, _) =
+            parse_claude_session_file(&dir.path().join("session.jsonl"));
         assert_eq!(change_events.len(), 1);
         assert_eq!(change_events[0].path, "src/real.rs");
     }
@@ -2621,15 +3002,13 @@ mod tests {
         write_file(&dir.path().join("session.jsonl"), content);
 
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
-        let (entries, change_events, _reports) =
-            parser.load_claude_entries_with_debug(None);
+        let (entries, change_events, _reports) = parser.load_claude_entries_with_debug(None);
         assert_eq!(entries.len(), 1);
         assert_eq!(change_events.len(), 1);
         assert_eq!(change_events[0].path, "src/main.rs");
 
         // Second call should come from cache and still have change events
-        let (_entries2, change_events2, _reports2) =
-            parser.load_claude_entries_with_debug(None);
+        let (_entries2, change_events2, _reports2) = parser.load_claude_entries_with_debug(None);
         assert_eq!(change_events2.len(), 1);
         assert_eq!(change_events2[0].path, "src/main.rs");
     }
@@ -2643,10 +3022,31 @@ mod tests {
 
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
         let since = parse_since_date("20260301");
-        let (_entries, change_events, _reports) =
-            parser.load_claude_entries_with_debug(since);
+        let (_entries, change_events, _reports) = parser.load_claude_entries_with_debug(since);
         assert_eq!(change_events.len(), 1);
         assert_eq!(change_events[0].path, "src/new.rs");
+    }
+
+    #[test]
+    fn load_claude_entries_dedupes_change_events_across_roots() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let content = r#"{"type":"assistant","timestamp":"2026-03-21T10:00:00+00:00","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"src/main.rs","old_string":"old","new_string":"new\nextra"}}],"usage":{"input_tokens":100,"output_tokens":50}}}
+{"type":"user","timestamp":"2026-03-21T10:00:01+00:00","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"Applied patch"}]},"toolUseResult":{"filePath":"src/main.rs","structuredPatch":[{"lines":["@@","-old","+new","+extra"]}]}}"#;
+        write_file(&dir_a.path().join("session.jsonl"), content);
+        write_file(&dir_b.path().join("session.jsonl"), content);
+
+        let parser = UsageParser::with_claude_dirs(vec![
+            dir_a.path().to_path_buf(),
+            dir_b.path().to_path_buf(),
+        ]);
+        let (entries, change_events, _reports) = parser.load_claude_entries_with_debug(None);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(change_events.len(), 1);
+        assert_eq!(change_events[0].path, "src/main.rs");
+        assert_eq!(change_events[0].added_lines, 2);
+        assert_eq!(change_events[0].removed_lines, 1);
     }
 
     #[test]
@@ -2656,16 +3056,23 @@ mod tests {
         let content = r#"{"type":"assistant","timestamp":"2026-03-21T10:00:00+00:00","message":{"model":"claude-opus-4-6-20260301","usage":{"input_tokens":100,"output_tokens":50}}}"#;
         write_file(&dir.path().join("session.jsonl"), content);
 
-        let (_entries, change_events, _, _) = parse_claude_session_file(&dir.path().join("session.jsonl"));
+        let (_entries, change_events, _, _) =
+            parse_claude_session_file(&dir.path().join("session.jsonl"));
         assert!(change_events.is_empty());
     }
 
     #[test]
     fn is_provider_internal_path_detects_plans() {
-        assert!(is_provider_internal_path("/home/user/.claude/plans/plan_abc.md"));
-        assert!(is_provider_internal_path("/Users/foo/.claude/plans/something"));
+        assert!(is_provider_internal_path(
+            "/home/user/.claude/plans/plan_abc.md"
+        ));
+        assert!(is_provider_internal_path(
+            "/Users/foo/.claude/plans/something"
+        ));
         assert!(!is_provider_internal_path("src/main.rs"));
-        assert!(!is_provider_internal_path("/home/user/.claude/projects/foo.jsonl"));
+        assert!(!is_provider_internal_path(
+            "/home/user/.claude/projects/foo.jsonl"
+        ));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2842,6 +3249,45 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(providers.contains(&"claude"));
         assert!(providers.contains(&"codex"));
     }
+
+    #[test]
+    fn parse_codex_response_item_apply_patch() {
+        // Newer Codex CLI emits apply_patch as "response_item" with "input" field
+        // instead of "event_msg" with "arguments" field.
+        let dir = TempDir::new().unwrap();
+
+        let ts = "2026-03-21T10:00:00+00:00";
+        let content = format!(
+            r#"{{"type":"turn_context","payload":{{"cwd":"/tmp","model":"gpt-5.4"}}}}
+{{"type":"response_item","timestamp":"{ts}","payload":{{"type":"custom_tool_call","status":"completed","name":"apply_patch","input":"*** Begin Patch\n*** Update File: /Users/test/project/src/main.rs\n@@\n-old_line\n+new_line\n+added_line"}}}}
+{{"type":"event_msg","timestamp":"{ts}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":50}}}}}}}}"#,
+            ts = ts
+        );
+        write_file(&dir.path().join("session.jsonl"), &content);
+
+        let (_entries, change_events, _, _) =
+            parse_codex_session_file(&dir.path().join("session.jsonl"));
+        assert_eq!(change_events.len(), 1);
+
+        let cev = &change_events[0];
+        assert_eq!(cev.path, "/Users/test/project/src/main.rs");
+        assert_eq!(cev.model, "gpt-5.4");
+        assert_eq!(cev.added_lines, 2);
+        assert_eq!(cev.removed_lines, 1);
+        assert_eq!(cev.category, FileCategory::Code);
+
+        // Token entries should still be parsed
+        assert_eq!(_entries.len(), 1);
+    }
+
+    #[test]
+    fn extract_diff_paths_from_codex_patch_format() {
+        let patch = "*** Begin Patch\n*** Add File: /Users/test/project/src/new.rs\n+fn main() {}\n*** Update File: /Users/test/project/src/lib.rs\n@@\n-old\n+new";
+        let paths = extract_diff_paths(patch);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], "/Users/test/project/src/new.rs");
+        assert_eq!(paths[1], "/Users/test/project/src/lib.rs");
+    }
 }
 
 #[cfg(test)]
@@ -2893,8 +3339,7 @@ mod debug_compare {
         let parser = UsageParser::new();
         let today = chrono::Local::now().format("%Y%m%d").to_string();
 
-        let (claude, _, _) = parser
-            .load_entries("claude", Some(parse_since_date(&today).unwrap()));
+        let (claude, _, _) = parser.load_entries("claude", Some(parse_since_date(&today).unwrap()));
         print_provider("CLAUDE", &claude);
         println!("\n=== CLAUDE: ccusage ===");
         println!("  opus:   inp=19,875 out=129,193 cw=3,180,937 cr=74,758,016 total=78,088,021 cost=$65.768004");
@@ -2906,8 +3351,7 @@ mod debug_compare {
         );
         println!("  TOTAL: tokens=85,666,713 cost=$68.325146");
 
-        let (codex, _, _) = parser
-            .load_entries("codex", Some(parse_since_date(&today).unwrap()));
+        let (codex, _, _) = parser.load_entries("codex", Some(parse_since_date(&today).unwrap()));
         print_provider("CODEX", &codex);
         println!("\n=== CODEX: ccusage ===");
         println!("  gpt-5.4: inp=231,247 out=7,338 reasoning=5,997 total=238,585 cost=$0.277788");
