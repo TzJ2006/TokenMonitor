@@ -1,5 +1,6 @@
+use crate::change_stats::{aggregate_change_stats, aggregate_model_change_summary};
 use crate::models::*;
-use crate::parser::{UsageParser, UsageQueryDebugReport};
+use crate::parser::{parse_since_date, UsageParser, UsageQueryDebugReport};
 use chrono::{Datelike, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -623,7 +624,7 @@ pub async fn get_usage_data(
                 UsageDebugReport {
                     request_kind: String::from("usage"),
                     requested_provider: provider,
-                    period: Some(period),
+                    period: Some(period.clone()),
                     offset: Some(offset),
                     year: None,
                     month: None,
@@ -631,7 +632,23 @@ pub async fn get_usage_data(
                 },
             )
             .await;
-            Ok(merge_payloads(claude, codex))
+            let mut merged = merge_payloads(claude, codex);
+
+            // Re-aggregate change stats from all providers' change events
+            let since_date = compute_since_date(&period, offset);
+            let (_entries, all_change_events, _reports) =
+                parser.load_entries("all", since_date);
+            merged.change_stats = aggregate_change_stats(
+                &all_change_events,
+                merged.total_cost,
+                merged.total_tokens,
+            );
+            for model in &mut merged.model_breakdown {
+                model.change_stats =
+                    aggregate_model_change_summary(&all_change_events, &model.model_key);
+            }
+
+            Ok(merged)
         }
         _ => Err(format!("Unknown provider: {}", provider)),
     }
@@ -690,6 +707,39 @@ fn filter_buckets_to_range(payload: &mut UsagePayload, start: NaiveDate, end: Na
 fn parse_bucket_start_date(sort_key: &str) -> Result<NaiveDate, chrono::ParseError> {
     NaiveDate::parse_from_str(sort_key, "%Y-%m-%d")
         .or_else(|_| NaiveDate::parse_from_str(&format!("{sort_key}-01"), "%Y-%m-%d"))
+}
+
+/// Compute the `since` NaiveDate for a given period and offset.
+fn compute_since_date(period: &str, offset: i32) -> Option<NaiveDate> {
+    let now = Local::now();
+    let today = now.date_naive();
+    match period {
+        "5h" => parse_since_date(&today.format("%Y%m%d").to_string()),
+        "day" => {
+            let target = today + chrono::Duration::days(offset as i64);
+            parse_since_date(&target.format("%Y%m%d").to_string())
+        }
+        "week" => {
+            let current_monday =
+                today - chrono::Duration::days(now.weekday().num_days_from_monday() as i64);
+            let target_monday = current_monday + chrono::Duration::days((offset * 7) as i64);
+            parse_since_date(&target_monday.format("%Y%m%d").to_string())
+        }
+        "month" => {
+            let mut ty = now.year();
+            let mut tm = now.month() as i32 + offset;
+            while tm <= 0 { ty -= 1; tm += 12; }
+            while tm > 12 { ty += 1; tm -= 12; }
+            let first = NaiveDate::from_ymd_opt(ty, tm as u32, 1).unwrap();
+            parse_since_date(&first.format("%Y%m%d").to_string())
+        }
+        "year" => {
+            let ty = now.year() + offset;
+            let first = NaiveDate::from_ymd_opt(ty, 1, 1).unwrap();
+            parse_since_date(&first.format("%Y%m%d").to_string())
+        }
+        _ => None,
+    }
 }
 
 fn get_provider_data(
@@ -769,6 +819,20 @@ fn get_provider_data(
     if period == "5h" {
         payload.period_label = String::new();
         payload.has_earlier_data = false;
+    }
+
+    // Load change events for this provider/period. The file cache is already
+    // warm from the aggregation call above, so this is cheap.
+    let since_date = compute_since_date(period, offset);
+    let (_entries, change_events, _reports) = parser.load_entries(provider, since_date);
+
+    // Attach change stats to the payload
+    payload.change_stats =
+        aggregate_change_stats(&change_events, payload.total_cost, payload.total_tokens);
+
+    // Attach per-model change stats
+    for model in &mut payload.model_breakdown {
+        model.change_stats = aggregate_model_change_summary(&change_events, &model.model_key);
     }
 
     Ok(payload)
@@ -1522,5 +1586,88 @@ mod tests {
             (day5.unwrap().cost - (claude_day5_cost + codex_day5_cost)).abs() < 0.001,
             "merged cost should equal sum of individual provider costs"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Change stats wiring
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn change_stats_populated_on_provider_payload() {
+        // Create a Claude session with an Edit tool_use
+        let dir = TempDir::new().unwrap();
+        let now = Local::now();
+        let ts = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let content = format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","requestId":"req_1","message":{{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{{"type":"tool_use","id":"tu_1","name":"Edit","input":{{"file_path":"src/main.rs","old_string":"fn old()","new_string":"fn new()\nfn extra()"}}}}],"usage":{{"input_tokens":100,"output_tokens":50}}}}}}"#,
+        );
+        write_file(&dir.path().join("session.jsonl"), &content);
+
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+        let payload = get_provider_data(&parser, "claude", "day", 0).unwrap();
+
+        assert!(
+            payload.change_stats.is_some(),
+            "change_stats should be populated when there are edit events"
+        );
+        let stats = payload.change_stats.unwrap();
+        assert_eq!(stats.added_lines, 2);
+        assert_eq!(stats.removed_lines, 1);
+        assert_eq!(stats.net_lines, 1);
+        assert_eq!(stats.files_touched, 1);
+        assert_eq!(stats.change_events, 1);
+    }
+
+    #[test]
+    fn change_stats_none_when_no_edits() {
+        let dir = TempDir::new().unwrap();
+        let now = Local::now();
+        let ts = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let content = format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"model":"claude-opus-4-6-20260301","usage":{{"input_tokens":100,"output_tokens":50}}}}}}"#,
+        );
+        write_file(&dir.path().join("session.jsonl"), &content);
+
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+        let payload = get_provider_data(&parser, "claude", "day", 0).unwrap();
+        assert!(
+            payload.change_stats.is_none(),
+            "change_stats should be None when there are no edit events"
+        );
+    }
+
+    #[test]
+    fn model_change_stats_populated_per_model() {
+        let dir = TempDir::new().unwrap();
+        // Use dynamic timestamps relative to "now" so the test works in any timezone
+        let now = Local::now();
+        let ts1 = (now - chrono::Duration::hours(2)).to_rfc3339();
+        let ts2 = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let content = format!(
+            r#"{{"type":"assistant","timestamp":"{ts1}","requestId":"req_1","message":{{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{{"type":"tool_use","id":"tu_1","name":"Edit","input":{{"file_path":"src/a.rs","old_string":"a","new_string":"b\nc"}}}}],"usage":{{"input_tokens":100,"output_tokens":50}}}}}}
+{{"type":"assistant","timestamp":"{ts2}","requestId":"req_2","message":{{"id":"msg_2","model":"claude-sonnet-4-6-20260301","role":"assistant","content":[{{"type":"tool_use","id":"tu_2","name":"Edit","input":{{"file_path":"src/b.rs","old_string":"x","new_string":"y"}}}}],"usage":{{"input_tokens":200,"output_tokens":100}}}}}}"#,
+        );
+        write_file(&dir.path().join("session.jsonl"), &content);
+
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+        let payload = get_provider_data(&parser, "claude", "day", 0).unwrap();
+
+        let opus = payload
+            .model_breakdown
+            .iter()
+            .find(|m| m.model_key == "opus-4-6");
+        assert!(opus.is_some(), "should have opus-4-6 in model breakdown");
+        let opus_stats = opus.unwrap().change_stats.as_ref().unwrap();
+        assert_eq!(opus_stats.added_lines, 2);
+        assert_eq!(opus_stats.removed_lines, 1);
+
+        let sonnet = payload
+            .model_breakdown
+            .iter()
+            .find(|m| m.model_key == "sonnet-4-6");
+        assert!(sonnet.is_some(), "should have sonnet-4-6 in model breakdown");
+        let sonnet_stats = sonnet.unwrap().change_stats.as_ref().unwrap();
+        assert_eq!(sonnet_stats.added_lines, 1);
+        assert_eq!(sonnet_stats.removed_lines, 1);
     }
 }
