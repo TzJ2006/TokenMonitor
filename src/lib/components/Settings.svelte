@@ -2,11 +2,21 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
-  import { settings, updateSetting, applyTheme, applyGlass, type Settings as SettingsType } from "../stores/settings.js";
+  import {
+    DEFAULT_HEADER_TABS,
+    MAX_HEADER_TAB_LABEL_LENGTH,
+    areHeaderTabsEqual,
+    applyGlass,
+    applyTheme,
+    getVisibleHeaderProviders,
+    settings,
+    updateSetting,
+    type Settings as SettingsType,
+  } from "../stores/settings.js";
   import { currencySymbol, modelColor } from "../utils/format.js";
   import { copyResizeDebugToClipboard, logResizeDebug } from "../resizeDebug.js";
   import { syncNativeWindowSurface } from "../windowAppearance.js";
-  import type { KnownModel, TrayConfig, RateLimitsPayload } from "../types/index.js";
+  import type { KnownModel, TrayConfig, RateLimitsPayload, UsageProvider } from "../types/index.js";
   import { rateLimitsData } from "../stores/rateLimits.js";
   import { syncTrayConfig } from "../traySync.js";
   import { formatTrayTitle } from "../trayTitle.js";
@@ -19,35 +29,24 @@
   }
 
   let { onBack }: Props = $props();
-
-  let current = $state<SettingsType>({
-    theme: "dark",
-    defaultProvider: "claude",
-    defaultPeriod: "day",
-    refreshInterval: 30,
-    costAlertThreshold: 50,
-    launchAtLogin: false,
-    currency: "USD",
-    hiddenModels: [],
-    brandTheming: true,
-    trayConfig: {
-      barDisplay: 'both',
-      barProvider: 'claude',
-      showPercentages: false,
-      percentageFormat: 'compact',
-      showCost: true,
-      costPrecision: 'full',
-    },
-    claudePlan: 0,
-    codexPlan: 0,
-    glassEffect: true,
-  });
+  let current = $derived($settings as SettingsType);
 
   let costInput = $state("50.00");
   let costEnabled = $state(true);
   let copiedDebug = $state(false);
   let appVersion = $state("");
   let availableModels = $state<KnownModel[]>([]);
+  let headerLabelInputs = $state<Record<UsageProvider, string>>({
+    all: DEFAULT_HEADER_TABS.all.label,
+    claude: DEFAULT_HEADER_TABS.claude.label,
+    codex: DEFAULT_HEADER_TABS.codex.label,
+  });
+
+  const HEADER_TAB_FIELDS: Array<{ provider: UsageProvider; title: string }> = [
+    { provider: "all", title: "All" },
+    { provider: "claude", title: "Claude" },
+    { provider: "codex", title: "Codex" },
+  ];
 
   const PREVIEW_RATE_LIMITS = {
     claude: { provider: 'claude', planTier: null, windows: [{ windowId: 'p', label: 'Primary', utilization: 72, resetsAt: null }], extraUsage: null, stale: false, error: null, cooldownUntil: null, retryAfterSeconds: null, fetchedAt: '' },
@@ -62,26 +61,53 @@
 
   let previewBarDisplay = $derived(current.trayConfig.barDisplay);
   let previewBarProvider = $derived(current.trayConfig.barProvider);
+  let defaultProviderOptions = $derived.by(() =>
+    getVisibleHeaderProviders(current.headerTabs).map((provider) => ({
+      value: provider,
+      label: current.headerTabs[provider].label,
+    })),
+  );
+
+  function syncHeaderLabelInputs(nextHeaderTabs: SettingsType["headerTabs"]) {
+    headerLabelInputs = {
+      all: nextHeaderTabs.all.label,
+      claude: nextHeaderTabs.claude.label,
+      codex: nextHeaderTabs.codex.label,
+    };
+  }
+
+  function describeActiveElement() {
+    if (typeof document === "undefined") return null;
+    const el = document.activeElement as HTMLElement | null;
+    if (!el) return null;
+    return {
+      tagName: el.tagName,
+      id: el.id || null,
+      className: el.className || null,
+      ariaLabel: el.getAttribute("aria-label"),
+      text: el.textContent?.trim().slice(0, 80) || null,
+    };
+  }
 
   $effect(() => {
-    const unsub = settings.subscribe((s) => {
-      current = s;
-      costEnabled = s.costAlertThreshold > 0;
-      costInput = s.costAlertThreshold > 0 ? s.costAlertThreshold.toFixed(2) : "50.00";
-    });
-    return unsub;
+    costEnabled = current.costAlertThreshold > 0;
+    costInput = current.costAlertThreshold > 0 ? current.costAlertThreshold.toFixed(2) : "50.00";
   });
 
-  // Check actual autostart state on mount
+  let syncedHeaderTabs = $state(DEFAULT_HEADER_TABS);
   $effect(() => {
-    isEnabled().then((enabled) => {
-      if (enabled !== current.launchAtLogin) {
-        updateSetting("launchAtLogin", enabled);
-      }
-    }).catch(() => {});
+    const nextHeaderTabs = current.headerTabs;
+    if (!areHeaderTabsEqual(syncedHeaderTabs, nextHeaderTabs)) {
+      syncHeaderLabelInputs(nextHeaderTabs);
+      syncedHeaderTabs = nextHeaderTabs;
+    }
   });
 
   onMount(() => {
+    logResizeDebug("settings:view-open", {
+      defaultProvider: current.defaultProvider,
+      activeElement: describeActiveElement(),
+    });
     getVersion().then((v) => { appVersion = v; }).catch(() => {});
     invoke<KnownModel[]>("get_known_models", { provider: "all" })
       .then((models) => {
@@ -92,6 +118,20 @@
       .catch((error) => {
         console.error("Failed to load known models:", error);
       });
+
+    isEnabled()
+      .then((enabled) => {
+        if (enabled !== current.launchAtLogin) {
+          updateSetting("launchAtLogin", enabled);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      logResizeDebug("settings:view-close", {
+        activeElement: describeActiveElement(),
+      });
+    };
   });
 
   function handleTheme(val: string) {
@@ -118,6 +158,40 @@
 
   function handleBrandTheming(checked: boolean) {
     updateSetting("brandTheming", checked);
+  }
+
+  function updateHeaderTab(
+    provider: UsageProvider,
+    patch: Partial<SettingsType["headerTabs"][UsageProvider]>,
+  ) {
+    updateSetting("headerTabs", {
+      ...current.headerTabs,
+      [provider]: {
+        ...current.headerTabs[provider],
+        ...patch,
+      },
+    });
+  }
+
+  function handleHeaderTabEnabled(provider: UsageProvider, enabled: boolean) {
+    updateHeaderTab(provider, { enabled });
+  }
+
+  function handleHeaderLabelInput(provider: UsageProvider, value: string) {
+    headerLabelInputs = {
+      ...headerLabelInputs,
+      [provider]: value,
+    };
+  }
+
+  function persistHeaderLabel(provider: UsageProvider) {
+    updateHeaderTab(provider, { label: headerLabelInputs[provider] });
+  }
+
+  function handleHeaderLabelKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      (e.target as HTMLInputElement).blur();
+    }
   }
 
   function handleClaudePlan(val: string) {
@@ -161,6 +235,15 @@
     }
   }
 
+  async function handleDockIcon(checked: boolean) {
+    updateSetting("showDockIcon", checked);
+    try {
+      await invoke("set_dock_icon_visible", { visible: checked });
+    } catch (e) {
+      console.error("Failed to toggle Dock icon visibility:", e);
+    }
+  }
+
   function handleCostBlur() {
     const val = parseFloat(costInput);
     if (!isNaN(val) && val >= 0) {
@@ -191,6 +274,12 @@
   async function copyDebugLog() {
     logResizeDebug("debug:copy-requested", {
       source: "settings",
+      activeElement: describeActiveElement(),
+      defaultProvider: current.defaultProvider,
+      defaultPeriod: current.defaultPeriod,
+      theme: current.theme,
+      showCostAlert: costEnabled,
+      headerTabs: current.headerTabs,
     });
     try {
       await copyResizeDebugToClipboard();
@@ -216,7 +305,7 @@
 <div class="settings">
   <!-- Header -->
   <div class="header">
-    <button class="back" onclick={onBack}>
+    <button class="back" type="button" onclick={onBack}>
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <polyline points="15 18 9 12 15 6"></polyline>
       </svg>
@@ -245,10 +334,7 @@
         <div class="row border">
           <span class="label">Default Provider</span>
           <SegmentedControl
-            options={[
-              { value: "claude", label: "Claude" },
-              { value: "codex", label: "Codex" },
-            ]}
+            options={defaultProviderOptions}
             value={current.defaultProvider}
             onChange={handleProvider}
           />
@@ -294,6 +380,32 @@
           />
         </div>
       </div>
+    </div>
+
+    <!-- Header -->
+    <div class="group">
+      <div class="group-label">Header</div>
+      <div class="card">
+        {#each HEADER_TAB_FIELDS as tab, index}
+          <div class="row header-tab-row" class:border={index < HEADER_TAB_FIELDS.length - 1}>
+            <span class="header-source">{tab.title}</span>
+            <input
+              class="text-input"
+              type="text"
+              maxlength={MAX_HEADER_TAB_LABEL_LENGTH}
+              value={headerLabelInputs[tab.provider]}
+              oninput={(e) => handleHeaderLabelInput(tab.provider, (e.target as HTMLInputElement).value)}
+              onblur={() => persistHeaderLabel(tab.provider)}
+              onkeydown={handleHeaderLabelKeydown}
+            />
+            <ToggleSwitch
+              checked={current.headerTabs[tab.provider].enabled}
+              onChange={(checked) => handleHeaderTabEnabled(tab.provider, checked)}
+            />
+          </div>
+        {/each}
+      </div>
+      <div class="setting-note">Labels are cosmetic. Usage data is still backed by All, Claude, and Codex.</div>
     </div>
 
     <!-- Menu Bar -->
@@ -465,6 +577,13 @@
             />
           </div>
         </div>
+        <div class="row border">
+          <span class="label">Model Change Stats</span>
+          <ToggleSwitch
+            checked={current.showModelChangeStats}
+            onChange={(checked) => updateSetting("showModelChangeStats", checked)}
+          />
+        </div>
         {#if availableModels.length > 0}
           <div class="model-grid">
             {#each availableModels as model}
@@ -494,6 +613,13 @@
           <ToggleSwitch
             checked={current.launchAtLogin}
             onChange={handleAutostart}
+          />
+        </div>
+        <div class="row border">
+          <span class="label">Show Dock Icon</span>
+          <ToggleSwitch
+            checked={current.showDockIcon}
+            onChange={handleDockIcon}
           />
         </div>
         <div class="row border">
@@ -612,6 +738,39 @@
   .label {
     font: 400 10px/1 'Inter', sans-serif;
     color: var(--t1);
+  }
+
+  .header-tab-row {
+    gap: 8px;
+  }
+
+  .header-source {
+    width: 46px;
+    flex-shrink: 0;
+    font: 500 9px/1 'Inter', sans-serif;
+    color: var(--t2);
+  }
+
+  .text-input {
+    min-width: 0;
+    flex: 1;
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    background: var(--surface-hover);
+    color: var(--t1);
+    font: 400 9px/1 'Inter', sans-serif;
+    padding: 5px 7px;
+  }
+
+  .text-input:focus {
+    outline: none;
+    border-color: var(--border);
+  }
+
+  .setting-note {
+    font: 400 8px/1.35 'Inter', sans-serif;
+    color: var(--t4);
+    padding: 4px 4px 0;
   }
 
   .model-grid {

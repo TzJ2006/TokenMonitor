@@ -1,8 +1,12 @@
+#[allow(dead_code)] // Used by later tasks in the change-stats feature
+mod change_stats;
 mod commands;
 mod models;
 mod parser;
 mod pricing;
 mod rate_limits;
+#[allow(dead_code)] // Used by later tasks in the subagent-stats feature
+mod subagent_stats;
 mod tray_render;
 
 #[cfg(target_os = "macos")]
@@ -114,6 +118,7 @@ pub fn run() {
             commands::get_last_usage_debug,
             commands::set_window_surface,
             commands::set_glass_effect,
+            commands::set_dock_icon_visible,
             commands::set_refresh_interval,
             commands::set_tray_config,
             commands::clear_cache,

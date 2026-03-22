@@ -12,8 +12,14 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     refreshInterval: 30,
     costAlertThreshold: 0,
     launchAtLogin: false,
+    showDockIcon: false,
     currency: "USD",
     hiddenModels: [],
+    headerTabs: {
+      all: { label: "All", enabled: true },
+      claude: { label: "Claude", enabled: true },
+      codex: { label: "Codex", enabled: true },
+    },
     brandTheming: true,
     trayConfig: {
       barDisplay: 'both',
@@ -26,6 +32,7 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     claudePlan: 0,
     codexPlan: 0,
     glassEffect: true,
+    showModelChangeStats: false,
     ...overrides,
   };
 }
@@ -58,6 +65,7 @@ describe("initializeRuntimeFromSettings", () => {
     expect(applyThemeFn).toHaveBeenCalledWith("system");
     expect(applyGlassFn).toHaveBeenCalledWith(true);
     expect(invokeFn).toHaveBeenCalledWith("set_glass_effect", { enabled: true });
+    expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: false });
     expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith(invokeFn, true);
     expect(invokeFn).toHaveBeenCalledWith("set_refresh_interval", { interval: 300 });
     expect(invokeFn).toHaveBeenCalledWith("set_tray_config", {
@@ -95,9 +103,32 @@ describe("initializeRuntimeFromSettings", () => {
 
     expect(applyThemeFn).toHaveBeenCalledWith("dark");
     expect(applyGlassFn).toHaveBeenCalledWith(true);
+    expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: false });
     expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith(invokeFn, true);
     expect(get(activeProvider)).toBe("codex");
     expect(get(activePeriod)).toBe("5h");
+  });
+
+  it("falls back to a visible provider when the saved default tab is hidden", async () => {
+    const invokeFn = vi.fn().mockResolvedValue(undefined);
+    const applyGlassFn = vi.fn();
+    const applyThemeFn = vi.fn();
+    const syncNativeWindowSurfaceFn = vi.fn().mockResolvedValue(undefined);
+
+    const runtime = await initializeRuntimeFromSettings(
+      makeSettings({
+        defaultProvider: "codex",
+        headerTabs: {
+          all: { label: "Overview", enabled: true },
+          claude: { label: "Claude", enabled: false },
+          codex: { label: "Codex", enabled: false },
+        },
+      }),
+      { invokeFn, applyThemeFn, applyGlassFn, syncNativeWindowSurfaceFn },
+    );
+
+    expect(get(activeProvider)).toBe("all");
+    expect(runtime).toEqual({ provider: "all", period: "day" });
   });
 
   it("applies glass effect on startup", async () => {
@@ -113,6 +144,7 @@ describe("initializeRuntimeFromSettings", () => {
 
     expect(applyGlassFn).toHaveBeenCalledWith(true);
     expect(invokeFn).toHaveBeenCalledWith("set_glass_effect", { enabled: true });
+    expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: false });
     expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith(invokeFn, true);
   });
 
@@ -129,6 +161,21 @@ describe("initializeRuntimeFromSettings", () => {
 
     expect(applyGlassFn).toHaveBeenCalledWith(false);
     expect(invokeFn).toHaveBeenCalledWith("set_glass_effect", { enabled: false });
+    expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: false });
     expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith(invokeFn, false);
+  });
+
+  it("applies dock icon visibility on startup", async () => {
+    const invokeFn = vi.fn().mockResolvedValue(undefined);
+    const applyGlassFn = vi.fn();
+    const applyThemeFn = vi.fn();
+    const syncNativeWindowSurfaceFn = vi.fn().mockResolvedValue(undefined);
+
+    await initializeRuntimeFromSettings(
+      makeSettings({ showDockIcon: true }),
+      { invokeFn, applyThemeFn, applyGlassFn, syncNativeWindowSurfaceFn },
+    );
+
+    expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: true });
   });
 });

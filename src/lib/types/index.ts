@@ -3,6 +3,13 @@ export type DefaultProvider = Exclude<UsageProvider, "all">;
 export type UsagePeriod = "5h" | "day" | "week" | "month" | "year";
 export type DefaultPeriod = Exclude<UsagePeriod, "year">;
 
+export interface HeaderTabConfig {
+  label: string;
+  enabled: boolean;
+}
+
+export type HeaderTabs = Record<UsageProvider, HeaderTabConfig>;
+
 export interface UsagePayload {
   total_cost: number;
   total_tokens: number;
@@ -17,6 +24,8 @@ export interface UsagePayload {
   from_cache: boolean;
   period_label: string;
   has_earlier_data: boolean;
+  change_stats: ChangeStats | null;
+  subagent_stats: SubagentStats | null;
 }
 
 export interface ChartBucket {
@@ -38,6 +47,7 @@ export interface ModelSummary {
   model_key: string;
   cost: number;
   tokens: number;
+  change_stats: ModelChangeSummary | null;
 }
 
 export interface KnownModel {
@@ -51,6 +61,68 @@ export interface ActiveBlock {
   projected_cost: number;
   is_active: boolean;
 }
+
+export interface ChangeStats {
+  added_lines: number;
+  removed_lines: number;
+  net_lines: number;  // Can be negative — only signed integer field
+  files_touched: number;
+  change_events: number;
+  write_events: number;
+  code_lines_changed: number;
+  docs_lines_changed: number;
+  config_lines_changed: number;
+  other_lines_changed: number;
+  avg_lines_per_event: number | null;
+  cost_per_100_net_lines: number | null;
+  tokens_per_net_line: number | null;
+  rewrite_ratio: number | null;
+  churn_ratio: number | null;
+  dominant_extension: string | null;
+}
+
+export interface ModelChangeSummary {
+  added_lines: number;
+  removed_lines: number;
+  net_lines: number;
+  files_touched: number;
+  change_events: number;
+}
+
+export interface ScopeModelUsage {
+  display_name: string;
+  model_key: string;
+  cost: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+}
+
+export interface ScopeUsageSummary {
+  cost: number;
+  tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  session_count: number;
+  pct_of_total_cost: number | null;
+  top_models: ScopeModelUsage[];
+  added_lines: number;
+  removed_lines: number;
+}
+
+export interface SubagentStats {
+  main: ScopeUsageSummary;
+  subagents: ScopeUsageSummary;
+}
+
+export type AccordionToggleDetail = {
+  durationMs: number;
+  expanding: boolean;
+  height: number;
+  scope: "main" | "subagents";
+};
 
 export interface CalendarDay {
   day: number;

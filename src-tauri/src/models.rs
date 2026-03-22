@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+use crate::change_stats::{ChangeStats, ModelChangeSummary};
+
 // ── Frontend payload (sent to Svelte via IPC) ──
 
 #[derive(Debug, Serialize, Clone)]
@@ -17,6 +19,8 @@ pub struct UsagePayload {
     pub from_cache: bool,
     pub period_label: String,
     pub has_earlier_data: bool,
+    pub change_stats: Option<ChangeStats>,
+    pub subagent_stats: Option<crate::subagent_stats::SubagentStats>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -41,6 +45,7 @@ pub struct ModelSummary {
     pub model_key: String,
     pub cost: f64,
     pub tokens: u64,
+    pub change_stats: Option<ModelChangeSummary>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -151,7 +156,7 @@ pub fn normalize_codex_model(raw: &str) -> (String, String) {
     (normalized_display_name, normalized_key)
 }
 
-fn is_codex_model_name(raw: &str) -> bool {
+pub(crate) fn is_codex_model_name(raw: &str) -> bool {
     raw.starts_with("gpt")
         || raw.starts_with("o1")
         || raw.starts_with("o3")

@@ -24,7 +24,15 @@
     hydrateRateLimits,
     fetchRateLimits,
   } from "./lib/stores/rateLimits.js";
-  import { loadSettings, settings, applyProvider } from "./lib/stores/settings.js";
+  import {
+    DEFAULT_HEADER_TABS,
+    areHeaderTabsEqual,
+    applyProvider,
+    getVisibleHeaderProviders,
+    loadSettings,
+    resolveVisibleProvider,
+    settings,
+  } from "./lib/stores/settings.js";
   import { initializeRuntimeFromSettings } from "./lib/bootstrap.js";
   import { syncTrayConfig } from "./lib/traySync.js";
   import {
@@ -51,14 +59,14 @@
   import MetricsRow from "./lib/components/MetricsRow.svelte";
   import Chart from "./lib/components/Chart.svelte";
   import UsageBars from "./lib/components/UsageBars.svelte";
-  import ModelList from "./lib/components/ModelList.svelte";
+  import Breakdown from "./lib/components/Breakdown.svelte";
   import Footer from "./lib/components/Footer.svelte";
   import SetupScreen from "./lib/components/SetupScreen.svelte";
   import SplashScreen from "./lib/components/SplashScreen.svelte";
   import Settings from "./lib/components/Settings.svelte";
   import Calendar from "./lib/components/Calendar.svelte";
   import DateNav from "./lib/components/DateNav.svelte";
-  import type { UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
+  import type { AccordionToggleDetail, HeaderTabs, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
 
   let showSplash = $state(true);
   let appReady = $state(false);
@@ -79,14 +87,27 @@
     deferredUntil: null as string | null,
   });
   let brandTheming = $state(true);
+  let headerTabs = $state<HeaderTabs>(DEFAULT_HEADER_TABS);
   let popEl: HTMLDivElement | null = null;
   let maxWindowH = DEFAULT_MAX_WINDOW_HEIGHT;
+
+  let headerToggleOptions = $derived.by(() =>
+    getVisibleHeaderProviders(headerTabs).map((value) => ({
+      value,
+      label: headerTabs[value].label,
+    })),
+  );
 
   // Subscribe to stores
   $effect(() => {
     const unsub1 = usageData.subscribe((v) => (data = v));
     const unsub2 = isLoading.subscribe((v) => (loading = v));
-    const unsub3 = settings.subscribe((s) => (brandTheming = s.brandTheming));
+    const unsub3 = settings.subscribe((s) => {
+      brandTheming = s.brandTheming;
+      if (!areHeaderTabsEqual(headerTabs, s.headerTabs)) {
+        headerTabs = s.headerTabs;
+      }
+    });
     const unsub4 = splitFiveHourData.subscribe((v) => (splitData = v));
     const unsub5 = rateLimitsData.subscribe((v) => (rateLimits = v));
     const unsub6 = rateLimitsRequestState.subscribe((v) => (rateLimitsRequest = v));
@@ -96,6 +117,13 @@
   // Apply/remove data-provider attribute reactively
   $effect(() => {
     applyProvider(provider, brandTheming);
+  });
+
+  $effect(() => {
+    const nextProvider = resolveVisibleProvider(provider, headerTabs);
+    if (nextProvider !== provider) {
+      void handleProviderChange(nextProvider);
+    }
   });
 
   // Only show refresh indicator after 300ms — hides it entirely for
@@ -121,18 +149,19 @@
   }
 
   async function handleProviderChange(p: UsageProvider) {
-    if (provider === p) return;
-    provider = p;
-    activeProvider.set(p);
-    await fetchData(p, period, offset);
-    if (provider !== p) return;
-    if (period === "5h") await fetchRateLimits(p);
-    if (provider !== p) return;
+    const nextProvider = resolveVisibleProvider(p, headerTabs);
+    if (provider === nextProvider) return;
+    provider = nextProvider;
+    activeProvider.set(nextProvider);
+    await fetchData(nextProvider, period, offset);
+    if (provider !== nextProvider) return;
+    if (period === "5h") await fetchRateLimits(nextProvider);
+    if (provider !== nextProvider) return;
     await tick();
     syncSizeAndVerify("provider-change");
-    warmAllPeriods(p, period);
-    if (p === "claude") warmCache("codex", period);
-    else if (p === "codex") warmCache("claude", period);
+    warmAllPeriods(nextProvider, period);
+    if (nextProvider === "claude") warmCache("codex", period);
+    else if (nextProvider === "codex") warmCache("claude", period);
   }
 
   async function handlePeriodChange(p: UsagePeriod) {
@@ -217,6 +246,9 @@
   let resizeRaf = 0;
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
   let lastWindowH = typeof window === "undefined" ? 0 : window.innerHeight;
+  let windowAnimationRaf = 0;
+  let windowAnimationToken = 0;
+  let isWindowHeightAnimating = false;
   const webviewWindow = getCurrentWebviewWindow();
   const tauriWindow = getCurrentWindow();
 
@@ -241,6 +273,15 @@
     resizeRaf = 0;
   }
 
+  function clearWindowHeightAnimation() {
+    if (windowAnimationRaf !== 0) {
+      cancelAnimationFrame(windowAnimationRaf);
+      windowAnimationRaf = 0;
+    }
+    windowAnimationToken += 1;
+    isWindowHeightAnimating = false;
+  }
+
   async function refreshWindowMetrics() {
     try {
       const monitor = await currentMonitor();
@@ -262,8 +303,8 @@
 
   function measureContentHeight(): number | null {
     if (!popEl) return null;
-    // .pop has overflow:hidden → scrollHeight reports the full content
-    // height including any overflow below the viewport.
+    // .pop can be clipped by the current native window height, so use the
+    // intrinsic scroll height rather than the rendered box height.
     return measureTargetWindowHeight(popEl.scrollHeight);
   }
 
@@ -312,6 +353,66 @@
     applyWindowHeight(nextHeight, source);
   }
 
+  function easeWindowHeight(progress: number): number {
+    const t = Math.max(0, Math.min(progress, 1));
+    const inverse = 1 - t;
+    return 1 - inverse * inverse * inverse;
+  }
+
+  function animateWindowHeight(
+    targetHeight: number,
+    durationMs: number,
+    source = "unknown",
+  ) {
+    const startHeight = typeof window === "undefined" ? lastWindowH : window.innerHeight;
+    const nextHeight = clampWindowHeight(targetHeight, maxWindowH, MIN_WINDOW_HEIGHT);
+    const disposition = classifyResize(nextHeight, startHeight, MIN_WINDOW_HEIGHT);
+    logResizeDebug("resize:animate-request", {
+      source,
+      durationMs,
+      startHeight,
+      targetHeight,
+      nextHeight,
+      disposition,
+      ...captureDebugSnapshot(`animate-${source}`),
+    });
+
+    if (disposition === "skip" || durationMs <= 0) {
+      clearWindowHeightAnimation();
+      applyWindowHeight(nextHeight, `${source}:immediate`);
+      syncSizeAndVerify(`${source}:verify`);
+      return;
+    }
+
+    clearPendingResize();
+    clearWindowHeightAnimation();
+
+    const animationToken = windowAnimationToken;
+    const startedAt = performance.now();
+    isWindowHeightAnimating = true;
+    lastWindowH = startHeight;
+
+    const step = (now: number) => {
+      if (animationToken !== windowAnimationToken) return;
+
+      const progress = Math.min((now - startedAt) / durationMs, 1);
+      const eased = easeWindowHeight(progress);
+      const interpolatedHeight = Math.round(startHeight + ((nextHeight - startHeight) * eased));
+      applyWindowHeight(interpolatedHeight, `${source}:frame`);
+
+      if (progress >= 1) {
+        windowAnimationRaf = 0;
+        isWindowHeightAnimating = false;
+        syncSizeAndVerify(`${source}:complete`);
+        return;
+      }
+
+      windowAnimationRaf = requestAnimationFrame(step);
+    };
+
+    windowAnimationRaf = requestAnimationFrame(step);
+  }
+
   /** syncSize + schedule a delayed re-measurement.
    *  Catches content whose layout settles a frame or two after the
    *  initial measurement (e.g. chart detail panel pushing footer down). */
@@ -344,6 +445,14 @@
   }
 
   function resizeToContent(source = "observer") {
+    if (isWindowHeightAnimating) {
+      logResizeDebug("resize:observer-skipped-animation", {
+        source,
+        ...captureDebugSnapshot(`observer-skipped-${source}`),
+      });
+      return;
+    }
+
     const measuredHeight = measureContentHeight();
     logResizeDebug("resize:observer-measure", {
       source,
@@ -368,6 +477,17 @@
       default:
         return;
     }
+  }
+
+  function handleBreakdownAccordionToggle(detail: AccordionToggleDetail) {
+    const direction = detail.expanding ? "expand" : "collapse";
+    const currentHeight = typeof window === "undefined" ? lastWindowH : window.innerHeight;
+    const targetHeight = currentHeight + (detail.expanding ? detail.height : -detail.height);
+    animateWindowHeight(
+      targetHeight,
+      detail.durationMs,
+      `breakdown-${detail.scope}-${direction}`,
+    );
   }
 
   onMount(() => {
@@ -400,6 +520,20 @@
         hidden: document.hidden,
         visibilityState: document.visibilityState,
         ...captureDebugSnapshot("document-visibility-change"),
+      });
+    };
+    const handleWindowError = (event: ErrorEvent) => {
+      logResizeDebug("window:error", {
+        message: event.message,
+        filename: event.filename || null,
+        lineno: event.lineno || null,
+        colno: event.colno || null,
+        error: formatDebugError(event.error),
+      });
+    };
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      logResizeDebug("window:unhandledrejection", {
+        reason: formatDebugError(event.reason),
       });
     };
     initResizeDebug();
@@ -436,7 +570,11 @@
         ...captureDebugSnapshot("data-ready"),
       });
 
-      await hydrateRateLimits();
+      if (period === "5h") {
+        await fetchRateLimits(provider);
+      } else {
+        await hydrateRateLimits();
+      }
       if (cancelled) return;
       await syncTrayConfig(get(settings).trayConfig, get(rateLimitsData)).catch(() => {});
       if (cancelled) return;
@@ -490,6 +628,8 @@
     window.addEventListener("resize", handleBrowserResize);
     window.addEventListener("focus", handleWindowFocus);
     window.addEventListener("blur", handleWindowBlur);
+    window.addEventListener("error", handleWindowError);
+    window.addEventListener("unhandledrejection", handleUnhandledRejection);
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
     if (typeof colorScheme.addEventListener === "function") {
@@ -505,9 +645,12 @@
       observer?.disconnect();
       if (resizeTimer) clearTimeout(resizeTimer);
       cancelAnimationFrame(resizeRaf);
+      clearWindowHeightAnimation();
       window.removeEventListener("resize", handleBrowserResize);
       window.removeEventListener("focus", handleWindowFocus);
       window.removeEventListener("blur", handleWindowBlur);
+      window.removeEventListener("error", handleWindowError);
+      window.removeEventListener("unhandledrejection", handleUnhandledRejection);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       if (typeof colorScheme.removeEventListener === "function") {
         colorScheme.removeEventListener("change", handleColorSchemeChange);
@@ -530,7 +673,12 @@
       <Calendar onBack={handleCalendarClose} />
     {:else if data}
       {#if showRefresh}<div class="refresh-bar"></div>{/if}
-      <Toggle active={provider} onChange={handleProviderChange} {brandTheming} />
+      <Toggle
+        active={provider}
+        options={headerToggleOptions}
+        onChange={handleProviderChange}
+        {brandTheming}
+      />
       <TimeTabs active={period} onChange={handlePeriodChange} />
       {#if period !== "5h" && data}
         <DateNav
@@ -578,9 +726,13 @@
         <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} />
       {/if}
 
-      {#if period !== "5h" && data.model_breakdown.length > 0}
+      {#if (period !== "5h" && data.model_breakdown.length > 0) || data.subagent_stats}
         <div class="hr"></div>
-        <ModelList models={data.model_breakdown} />
+        <Breakdown
+          models={period !== "5h" ? data.model_breakdown : []}
+          onAccordionToggle={handleBreakdownAccordionToggle}
+          subagentStats={data.subagent_stats}
+        />
       {/if}
       <Footer {data} {provider} {rateLimits} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} />
     {:else}
