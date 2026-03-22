@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { activePeriod, activeProvider } from "./stores/usage.js";
-import { applyGlass, applyTheme, type Settings } from "./stores/settings.js";
+import { applyGlass, applyTheme, resolveVisibleProvider, type Settings } from "./stores/settings.js";
 import { syncTrayConfig } from "./traySync.js";
 import { syncNativeWindowSurface } from "./windowAppearance.js";
 
@@ -20,14 +20,21 @@ export async function initializeRuntimeFromSettings(
   const applyGlassFn = deps.applyGlassFn ?? applyGlass;
   const syncNativeWindowSurfaceFn =
     deps.syncNativeWindowSurfaceFn ?? syncNativeWindowSurface;
+  const provider = resolveVisibleProvider(saved.defaultProvider, saved.headerTabs);
 
   applyThemeFn(saved.theme);
   applyGlassFn(saved.glassEffect);
-  activeProvider.set(saved.defaultProvider);
+  activeProvider.set(provider);
   activePeriod.set(saved.defaultPeriod);
 
   try {
     await invokeFn("set_glass_effect", { enabled: saved.glassEffect });
+  } catch {
+    // Keep startup resilient if the backend IPC is not ready yet.
+  }
+
+  try {
+    await invokeFn("set_dock_icon_visible", { visible: saved.showDockIcon });
   } catch {
     // Keep startup resilient if the backend IPC is not ready yet.
   }
@@ -46,7 +53,7 @@ export async function initializeRuntimeFromSettings(
   }
 
   return {
-    provider: saved.defaultProvider,
+    provider,
     period: saved.defaultPeriod,
   };
 }
