@@ -18,7 +18,7 @@ use objc2_app_kit::{
 #[cfg(target_os = "macos")]
 use objc2_quartz_core::CALayer;
 #[cfg(target_os = "macos")]
-use tauri::AppHandle;
+use tauri::{ActivationPolicy, AppHandle};
 #[cfg(target_os = "macos")]
 use tokio::sync::oneshot;
 
@@ -497,6 +497,25 @@ pub async fn set_refresh_interval(interval: u64, state: State<'_, AppState>) -> 
 }
 
 #[tauri::command]
+pub async fn set_dock_icon_visible(app: tauri::AppHandle, visible: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let policy = if visible {
+            ActivationPolicy::Regular
+        } else {
+            ActivationPolicy::Accessory
+        };
+        app.set_activation_policy(policy)
+            .map_err(|e| format!("Failed to set activation policy: {e}"))?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, visible);
+
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn set_tray_config(
     config: TrayConfig,
     claude_util: Option<f64>,
@@ -634,11 +653,12 @@ pub async fn get_usage_data(
                 },
             )
             .await;
-            let claude_sa = claude.subagent_stats.clone();
-            let codex_sa = codex.subagent_stats.clone();
             let mut merged = merge_payloads(claude, codex);
 
-            // Re-aggregate change stats from all providers' change events
+            // Re-aggregate change stats and subagent stats from all providers' entries.
+            // This is more correct than merging per-provider stats because when one
+            // provider returns None for subagent_stats, its cost would be missing from
+            // the attribution (denominator includes both providers but numerator only one).
             let all_change_events = load_change_events_for_period(parser, "all", &period, offset);
             merged.change_stats =
                 aggregate_change_stats(&all_change_events, merged.total_cost, merged.total_tokens);
@@ -647,9 +667,12 @@ pub async fn get_usage_data(
                     aggregate_model_change_summary(&all_change_events, &model.model_key);
             }
 
-            // Merge subagent stats
-            merged.subagent_stats =
-                crate::subagent_stats::merge_subagent_stats(claude_sa, codex_sa, merged.total_cost);
+            let all_entries = load_entries_for_period(parser, "all", &period, offset);
+            merged.subagent_stats = crate::subagent_stats::aggregate_subagent_stats(
+                &all_entries,
+                &all_change_events,
+                merged.total_cost,
+            );
 
             Ok(merged)
         }

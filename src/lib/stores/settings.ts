@@ -20,6 +20,7 @@ export interface Settings {
   refreshInterval: number; // seconds: 30, 60, 300, 0 = off
   costAlertThreshold: number;
   launchAtLogin: boolean;
+  showDockIcon: boolean;
   currency: string;
   hiddenModels: string[];
   headerTabs: HeaderTabs;
@@ -62,6 +63,7 @@ const DEFAULTS: Settings = {
   refreshInterval: 30,
   costAlertThreshold: 0,
   launchAtLogin: false,
+  showDockIcon: false,
   currency: SUPPORTED_CURRENCIES[0],
   hiddenModels: [],
   headerTabs: DEFAULT_HEADER_TABS,
@@ -236,6 +238,7 @@ export function normalizeSettings(saved?: Partial<Settings> | null): Settings {
     ),
     costAlertThreshold: normalizeCostAlertThreshold(saved?.costAlertThreshold),
     launchAtLogin: normalizeBoolean(saved?.launchAtLogin, DEFAULTS.launchAtLogin),
+    showDockIcon: normalizeBoolean(saved?.showDockIcon, DEFAULTS.showDockIcon),
     currency: normalizeCurrency(saved?.currency),
     hiddenModels: normalizeHiddenModels(saved?.hiddenModels),
     headerTabs,

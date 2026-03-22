@@ -101,8 +101,6 @@
     color: var(--t3); text-transform: uppercase;
     letter-spacing: .7px; margin-bottom: 8px;
   }
-  .sa-title { }
-
   .sa-bar {
     display: flex; height: 6px; border-radius: 3px;
     overflow: hidden; margin-bottom: 8px;

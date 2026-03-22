@@ -153,4 +153,5 @@ describe("syncNativeWindowSurface", () => {
       cornerRadius: WINDOW_CORNER_RADIUS,
     });
   });
+
 });

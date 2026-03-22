@@ -88,6 +88,7 @@ describe("loadSettings", () => {
       refreshInterval: 300,
       costAlertThreshold: 0,
       launchAtLogin: false,
+      showDockIcon: false,
       currency: "EUR",
       hiddenModels: ["haiku"],
       headerTabs: DEFAULT_HEADER_TABS,
@@ -132,6 +133,7 @@ describe("loadSettings", () => {
       refreshInterval: 30,
       costAlertThreshold: 0,
       launchAtLogin: false,
+      showDockIcon: false,
       currency: "USD",
       hiddenModels: [],
       headerTabs: DEFAULT_HEADER_TABS,
@@ -159,6 +161,13 @@ describe("loadSettings", () => {
     const { loadSettings, settings } = await loadSettingsModule();
     await loadSettings();
     expect(get(settings).showModelChangeStats).toBe(false);
+  });
+
+  it("defaults showDockIcon to false", async () => {
+    mockLoad.mockResolvedValueOnce(makePersistedStore({}));
+    const { loadSettings, settings } = await loadSettingsModule();
+    await loadSettings();
+    expect(get(settings).showDockIcon).toBe(false);
   });
 });
 

@@ -7,23 +7,23 @@
   inherits: true;
 }
 
-/* ── Model colors — Warm & Cool palette ── */
+/* ── Model colors — Warm (Claude) & Cool (Codex) families ── */
 :root {
-  --opus: #E0743E;
-  --opus-soft: rgba(224,116,62,0.14);
-  --sonnet: #EA9A66;
-  --sonnet-soft: rgba(234,154,102,0.14);
-  --haiku: #F2B888;
-  --haiku-soft: rgba(242,184,136,0.14);
-  --gpt54: #3D8FC0;
-  --gpt53: #5AAAD6;
-  --gpt52: #7BBFE6;
-  --o3: #4A8B75;
-  --o3mini: #6BAD96;
-  --o4mini: #7878A0;
-  --o1: #5A7089;
-  --o1mini: #7C90A5;
-  --codex: #5AAAD6;
+  --opus: #D0724A;
+  --opus-soft: rgba(208,114,74,0.14);
+  --sonnet: #D9956E;
+  --sonnet-soft: rgba(217,149,110,0.14);
+  --haiku: #E0B48E;
+  --haiku-soft: rgba(224,180,142,0.14);
+  --gpt54: #4A8DB8;
+  --gpt53: #68A4C8;
+  --gpt52: #88B8D4;
+  --o3: #5A8878;
+  --o3mini: #6A9888;
+  --o4mini: #7A8898;
+  --o1: #6A8898;
+  --o1mini: #7A9098;
+  --codex: #4A8DB8;
 }
 
 /* ── Dark theme (default) ── */
@@ -36,24 +36,24 @@
   --border: rgba(255,255,255,0.055);
   --border-subtle: rgba(255,255,255,0.035);
 
-  --t1: rgba(255,255,255,0.92);
-  --t2: rgba(255,255,255,0.68);
-  --t3: rgba(255,255,255,0.46);
-  --t4: rgba(255,255,255,0.34);
+  --t1: rgba(255,255,255,0.88);
+  --t2: rgba(255,255,255,0.58);
+  --t3: rgba(255,255,255,0.38);
+  --t4: rgba(255,255,255,0.28);
 
   --splash-disc: rgba(255,255,255,0.93);
   --splash-eye: #111113;
 
   --comp-code: #60a5fa;
   --comp-docs: #a78bfa;
-  --comp-config: #fbbf24;
+  --comp-config: #e0a832;
   --comp-other: rgba(255,255,255,0.15);
 
-  --ch-plus: #4ade80;
-  --ch-minus: #f87171;
+  --ch-plus: #5cb87a;
+  --ch-minus: #d06868;
 
-  --scope-main: #6b8afd;
-  --scope-sub: #b07aff;
+  --scope-main: rgba(255,255,255,0.35);
+  --scope-sub: rgba(255,255,255,0.18);
 }
 
 /* ── Light theme ── */
@@ -65,24 +65,24 @@
   --border: rgba(0,0,0,0.11);
   --border-subtle: rgba(0,0,0,0.07);
 
-  --t1: rgba(0,0,0,0.90);
-  --t2: rgba(0,0,0,0.62);
-  --t3: rgba(0,0,0,0.46);
-  --t4: rgba(0,0,0,0.32);
+  --t1: rgba(0,0,0,0.82);
+  --t2: rgba(0,0,0,0.55);
+  --t3: rgba(0,0,0,0.38);
+  --t4: rgba(0,0,0,0.28);
 
   --splash-disc: rgba(0,0,0,0.85);
   --splash-eye: #F5F5F7;
 
   --comp-code: #3b82f6;
   --comp-docs: #8b5cf6;
-  --comp-config: #d97706;
+  --comp-config: #c89520;
   --comp-other: rgba(0,0,0,0.10);
 
-  --ch-plus: #16a34a;
-  --ch-minus: #dc2626;
+  --ch-plus: #1a8a42;
+  --ch-minus: #c03030;
 
-  --scope-main: #6b8afd;
-  --scope-sub: #b07aff;
+  --scope-main: rgba(0,0,0,0.30);
+  --scope-sub: rgba(0,0,0,0.15);
 }
 
 /* ── Accent defaults (neutral — no provider selected) ── */
@@ -134,10 +134,10 @@
     --border: rgba(0,0,0,0.11);
     --border-subtle: rgba(0,0,0,0.07);
 
-    --t1: rgba(0,0,0,0.90);
-    --t2: rgba(0,0,0,0.62);
-    --t3: rgba(0,0,0,0.46);
-    --t4: rgba(0,0,0,0.32);
+    --t1: rgba(0,0,0,0.82);
+    --t2: rgba(0,0,0,0.55);
+    --t3: rgba(0,0,0,0.38);
+    --t4: rgba(0,0,0,0.28);
 
     --accent-soft: rgba(0,0,0,0.04);
 
@@ -146,14 +146,14 @@
 
     --comp-code: #3b82f6;
     --comp-docs: #8b5cf6;
-    --comp-config: #d97706;
+    --comp-config: #c89520;
     --comp-other: rgba(0,0,0,0.10);
 
-    --ch-plus: #16a34a;
-    --ch-minus: #dc2626;
+    --ch-plus: #1a8a42;
+    --ch-minus: #c03030;
 
-    --scope-main: #6b8afd;
-    --scope-sub: #b07aff;
+    --scope-main: rgba(0,0,0,0.30);
+    --scope-sub: rgba(0,0,0,0.15);
   }
   :root:not([data-theme])[data-provider="claude"] {
     --accent: #C85E2A;
@@ -173,6 +173,15 @@
 :root[data-glass="true"][data-theme="dark"],
 :root[data-glass="true"]:not([data-theme]) {
   --surface: rgba(20, 20, 22, 0.65);
+  /* Boost text contrast to compensate for translucent surface */
+  --t1: rgba(255,255,255,0.92);
+  --t2: rgba(255,255,255,0.62);
+  --t3: rgba(255,255,255,0.42);
+  --t4: rgba(255,255,255,0.30);
+  --ch-plus: #5cb87a;
+  --ch-minus: #d06868;
+  --scope-main: rgba(255,255,255,0.38);
+  --scope-sub: rgba(255,255,255,0.20);
 }
 :root[data-glass="true"][data-theme="light"] {
   --surface: rgba(255, 255, 255, 0.45);
@@ -225,24 +234,24 @@
 
 html, body {
   width: 100%;
+  background: transparent;
 }
 
-/* html owns the surface background so that it fills the viewport
-   immediately on resize — the native content-view layer clips it to
-   rounded corners.  This prevents the 1-2 frame gap where the
-   NSVisualEffectView blur would show untinted at the bottom edge. */
+/* Prevent scrollbars without capping descendant measurements.
+   overflow:hidden (not clip) — clip causes WebKit/WKWebView to cap
+   offsetHeight on descendants to the viewport height. */
 html {
   overflow: hidden;
-  background: var(--surface);
-  background-image: linear-gradient(var(--provider-bg), var(--provider-bg));
 }
 
-/* #app provides shape (rounded corners, inset border) but no background
-   of its own — html is the single surface owner. */
+/* Paint the single app surface on the root container so the transparent
+   native window and the web content stay visually unified. */
 #app {
   width: 100%;
   height: auto;
   min-height: 100%;
+  background: var(--surface);
+  background-image: linear-gradient(var(--provider-bg), var(--provider-bg));
   border-radius: 14px;
   overflow: hidden;
   box-shadow: inset 0 0 0 1px var(--border);

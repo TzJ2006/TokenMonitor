@@ -17,6 +17,9 @@ pub struct ScopeModelUsage {
     pub display_name: String,
     pub model_key: String,
     pub cost: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +43,14 @@ pub struct SubagentStats {
     pub subagents: ScopeUsageSummary,
 }
 
+#[derive(Default)]
+struct ModelAccum {
+    cost: f64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+}
+
 // ── Internal builder ────────────────────────────────────────────────────────
 
 struct ScopeSummaryBuilder {
@@ -49,7 +60,7 @@ struct ScopeSummaryBuilder {
     cache_write_tokens: u64,
     cache_read_tokens: u64,
     sessions: HashSet<String>,
-    model_costs: HashMap<String, f64>,
+    model_stats: HashMap<String, ModelAccum>,
     added_lines: u64,
     removed_lines: u64,
 }
@@ -63,7 +74,7 @@ impl ScopeSummaryBuilder {
             cache_write_tokens: 0,
             cache_read_tokens: 0,
             sessions: HashSet::new(),
-            model_costs: HashMap::new(),
+            model_stats: HashMap::new(),
             added_lines: 0,
             removed_lines: 0,
         }
@@ -88,7 +99,11 @@ impl ScopeSummaryBuilder {
             self.sessions.insert(entry.session_key.clone());
         }
 
-        *self.model_costs.entry(entry.model.clone()).or_insert(0.0) += entry_cost;
+        let ma = self.model_stats.entry(entry.model.clone()).or_default();
+        ma.cost += entry_cost;
+        ma.input_tokens += entry.input_tokens;
+        ma.output_tokens += entry.output_tokens;
+        ma.cache_read_tokens += entry.cache_read_tokens;
     }
 
     fn add_change(&mut self, event: &crate::change_stats::ParsedChangeEvent) {
@@ -96,24 +111,29 @@ impl ScopeSummaryBuilder {
         self.removed_lines += event.removed_lines;
     }
 
+    fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_write_tokens + self.cache_read_tokens
+    }
+
     fn build(self, total_cost: f64) -> ScopeUsageSummary {
-        let tokens = self.input_tokens
-            + self.output_tokens
-            + self.cache_write_tokens
-            + self.cache_read_tokens;
+        let tokens = self.total_tokens();
         let pct_of_total_cost = if total_cost > 0.0 {
-            self.cost / total_cost
+            (self.cost / total_cost) * 100.0
         } else {
             0.0
         };
 
         // Build top models: sort by cost desc, take top 2
-        let mut model_list: Vec<(String, f64)> = self.model_costs.into_iter().collect();
-        model_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut model_list: Vec<(String, ModelAccum)> = self.model_stats.into_iter().collect();
+        model_list.sort_by(|a, b| {
+            b.1.cost
+                .partial_cmp(&a.1.cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let top_models: Vec<ScopeModelUsage> = model_list
             .into_iter()
             .take(2)
-            .map(|(raw_model, cost)| {
+            .map(|(raw_model, accum)| {
                 let (display_name, model_key) = if crate::models::is_codex_model_name(&raw_model) {
                     crate::models::normalize_codex_model(&raw_model)
                 } else {
@@ -123,7 +143,10 @@ impl ScopeSummaryBuilder {
                 ScopeModelUsage {
                     display_name,
                     model_key,
-                    cost,
+                    cost: accum.cost,
+                    input_tokens: accum.input_tokens,
+                    output_tokens: accum.output_tokens,
+                    cache_read_tokens: accum.cache_read_tokens,
                 }
             })
             .collect();
@@ -169,11 +192,7 @@ pub fn aggregate_subagent_stats(
     }
 
     // Return None if subagent scope has zero cost AND zero tokens
-    let sub_tokens = sub_builder.input_tokens
-        + sub_builder.output_tokens
-        + sub_builder.cache_write_tokens
-        + sub_builder.cache_read_tokens;
-    if sub_builder.cost == 0.0 && sub_tokens == 0 {
+    if sub_builder.cost == 0.0 && sub_builder.total_tokens() == 0 {
         return None;
     }
 
@@ -213,7 +232,7 @@ pub fn merge_subagent_stats(
 
 fn recompute_pct(mut summary: ScopeUsageSummary, total_cost: f64) -> ScopeUsageSummary {
     summary.pct_of_total_cost = if total_cost > 0.0 {
-        summary.cost / total_cost
+        (summary.cost / total_cost) * 100.0
     } else {
         0.0
     };
@@ -235,7 +254,7 @@ fn merge_summaries(
     let added_lines = a.added_lines + b.added_lines;
     let removed_lines = a.removed_lines + b.removed_lines;
     let pct_of_total_cost = if total_cost > 0.0 {
-        cost / total_cost
+        (cost / total_cost) * 100.0
     } else {
         0.0
     };
@@ -249,8 +268,14 @@ fn merge_summaries(
                 display_name: m.display_name.clone(),
                 model_key: m.model_key.clone(),
                 cost: 0.0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
             });
         entry.cost += m.cost;
+        entry.input_tokens += m.input_tokens;
+        entry.output_tokens += m.output_tokens;
+        entry.cache_read_tokens += m.cache_read_tokens;
     }
     let mut merged_models: Vec<ScopeModelUsage> = model_map.into_values().collect();
     merged_models.sort_by(|a, b| {

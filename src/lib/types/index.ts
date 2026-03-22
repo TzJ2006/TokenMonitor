@@ -93,6 +93,9 @@ export interface ScopeModelUsage {
   display_name: string;
   model_key: string;
   cost: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
 }
 
 export interface ScopeUsageSummary {
@@ -113,6 +116,13 @@ export interface SubagentStats {
   main: ScopeUsageSummary;
   subagents: ScopeUsageSummary;
 }
+
+export type AccordionToggleDetail = {
+  durationMs: number;
+  expanding: boolean;
+  height: number;
+  scope: "main" | "subagents";
+};
 
 export interface CalendarDay {
   day: number;

@@ -59,15 +59,14 @@
   import MetricsRow from "./lib/components/MetricsRow.svelte";
   import Chart from "./lib/components/Chart.svelte";
   import UsageBars from "./lib/components/UsageBars.svelte";
-  import ModelList from "./lib/components/ModelList.svelte";
-  import SubagentList from "./lib/components/SubagentList.svelte";
+  import Breakdown from "./lib/components/Breakdown.svelte";
   import Footer from "./lib/components/Footer.svelte";
   import SetupScreen from "./lib/components/SetupScreen.svelte";
   import SplashScreen from "./lib/components/SplashScreen.svelte";
   import Settings from "./lib/components/Settings.svelte";
   import Calendar from "./lib/components/Calendar.svelte";
   import DateNav from "./lib/components/DateNav.svelte";
-  import type { HeaderTabs, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
+  import type { AccordionToggleDetail, HeaderTabs, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
 
   let showSplash = $state(true);
   let appReady = $state(false);
@@ -247,6 +246,9 @@
   let resizeRaf = 0;
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
   let lastWindowH = typeof window === "undefined" ? 0 : window.innerHeight;
+  let windowAnimationRaf = 0;
+  let windowAnimationToken = 0;
+  let isWindowHeightAnimating = false;
   const webviewWindow = getCurrentWebviewWindow();
   const tauriWindow = getCurrentWindow();
 
@@ -271,6 +273,15 @@
     resizeRaf = 0;
   }
 
+  function clearWindowHeightAnimation() {
+    if (windowAnimationRaf !== 0) {
+      cancelAnimationFrame(windowAnimationRaf);
+      windowAnimationRaf = 0;
+    }
+    windowAnimationToken += 1;
+    isWindowHeightAnimating = false;
+  }
+
   async function refreshWindowMetrics() {
     try {
       const monitor = await currentMonitor();
@@ -292,8 +303,8 @@
 
   function measureContentHeight(): number | null {
     if (!popEl) return null;
-    // .pop has overflow:hidden → scrollHeight reports the full content
-    // height including any overflow below the viewport.
+    // .pop can be clipped by the current native window height, so use the
+    // intrinsic scroll height rather than the rendered box height.
     return measureTargetWindowHeight(popEl.scrollHeight);
   }
 
@@ -342,6 +353,66 @@
     applyWindowHeight(nextHeight, source);
   }
 
+  function easeWindowHeight(progress: number): number {
+    const t = Math.max(0, Math.min(progress, 1));
+    const inverse = 1 - t;
+    return 1 - inverse * inverse * inverse;
+  }
+
+  function animateWindowHeight(
+    targetHeight: number,
+    durationMs: number,
+    source = "unknown",
+  ) {
+    const startHeight = typeof window === "undefined" ? lastWindowH : window.innerHeight;
+    const nextHeight = clampWindowHeight(targetHeight, maxWindowH, MIN_WINDOW_HEIGHT);
+    const disposition = classifyResize(nextHeight, startHeight, MIN_WINDOW_HEIGHT);
+    logResizeDebug("resize:animate-request", {
+      source,
+      durationMs,
+      startHeight,
+      targetHeight,
+      nextHeight,
+      disposition,
+      ...captureDebugSnapshot(`animate-${source}`),
+    });
+
+    if (disposition === "skip" || durationMs <= 0) {
+      clearWindowHeightAnimation();
+      applyWindowHeight(nextHeight, `${source}:immediate`);
+      syncSizeAndVerify(`${source}:verify`);
+      return;
+    }
+
+    clearPendingResize();
+    clearWindowHeightAnimation();
+
+    const animationToken = windowAnimationToken;
+    const startedAt = performance.now();
+    isWindowHeightAnimating = true;
+    lastWindowH = startHeight;
+
+    const step = (now: number) => {
+      if (animationToken !== windowAnimationToken) return;
+
+      const progress = Math.min((now - startedAt) / durationMs, 1);
+      const eased = easeWindowHeight(progress);
+      const interpolatedHeight = Math.round(startHeight + ((nextHeight - startHeight) * eased));
+      applyWindowHeight(interpolatedHeight, `${source}:frame`);
+
+      if (progress >= 1) {
+        windowAnimationRaf = 0;
+        isWindowHeightAnimating = false;
+        syncSizeAndVerify(`${source}:complete`);
+        return;
+      }
+
+      windowAnimationRaf = requestAnimationFrame(step);
+    };
+
+    windowAnimationRaf = requestAnimationFrame(step);
+  }
+
   /** syncSize + schedule a delayed re-measurement.
    *  Catches content whose layout settles a frame or two after the
    *  initial measurement (e.g. chart detail panel pushing footer down). */
@@ -374,6 +445,14 @@
   }
 
   function resizeToContent(source = "observer") {
+    if (isWindowHeightAnimating) {
+      logResizeDebug("resize:observer-skipped-animation", {
+        source,
+        ...captureDebugSnapshot(`observer-skipped-${source}`),
+      });
+      return;
+    }
+
     const measuredHeight = measureContentHeight();
     logResizeDebug("resize:observer-measure", {
       source,
@@ -398,6 +477,17 @@
       default:
         return;
     }
+  }
+
+  function handleBreakdownAccordionToggle(detail: AccordionToggleDetail) {
+    const direction = detail.expanding ? "expand" : "collapse";
+    const currentHeight = typeof window === "undefined" ? lastWindowH : window.innerHeight;
+    const targetHeight = currentHeight + (detail.expanding ? detail.height : -detail.height);
+    animateWindowHeight(
+      targetHeight,
+      detail.durationMs,
+      `breakdown-${detail.scope}-${direction}`,
+    );
   }
 
   onMount(() => {
@@ -555,6 +645,7 @@
       observer?.disconnect();
       if (resizeTimer) clearTimeout(resizeTimer);
       cancelAnimationFrame(resizeRaf);
+      clearWindowHeightAnimation();
       window.removeEventListener("resize", handleBrowserResize);
       window.removeEventListener("focus", handleWindowFocus);
       window.removeEventListener("blur", handleWindowBlur);
@@ -635,13 +726,13 @@
         <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} />
       {/if}
 
-      {#if period !== "5h" && data.model_breakdown.length > 0}
+      {#if (period !== "5h" && data.model_breakdown.length > 0) || data.subagent_stats}
         <div class="hr"></div>
-        <ModelList models={data.model_breakdown} />
-      {/if}
-      {#if data.subagent_stats}
-        <div class="hr"></div>
-        <SubagentList stats={data.subagent_stats} />
+        <Breakdown
+          models={period !== "5h" ? data.model_breakdown : []}
+          onAccordionToggle={handleBreakdownAccordionToggle}
+          subagentStats={data.subagent_stats}
+        />
       {/if}
       <Footer {data} {provider} {rateLimits} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} />
     {:else}
