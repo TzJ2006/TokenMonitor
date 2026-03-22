@@ -235,6 +235,15 @@
     }
   }
 
+  async function handleDockIcon(checked: boolean) {
+    updateSetting("showDockIcon", checked);
+    try {
+      await invoke("set_dock_icon_visible", { visible: checked });
+    } catch (e) {
+      console.error("Failed to toggle Dock icon visibility:", e);
+    }
+  }
+
   function handleCostBlur() {
     const val = parseFloat(costInput);
     if (!isNaN(val) && val >= 0) {
@@ -604,6 +613,13 @@
           <ToggleSwitch
             checked={current.launchAtLogin}
             onChange={handleAutostart}
+          />
+        </div>
+        <div class="row border">
+          <span class="label">Show Dock Icon</span>
+          <ToggleSwitch
+            checked={current.showDockIcon}
+            onChange={handleDockIcon}
           />
         </div>
         <div class="row border">
