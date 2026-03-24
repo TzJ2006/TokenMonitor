@@ -1,16 +1,16 @@
 #[cfg(test)]
 use crate::change_stats::FileCategory;
 use crate::change_stats::{classify_file, ChangeEventKind, ParsedChangeEvent};
+use crate::integrations::{UsageIntegrationId, UsageIntegrationSelection};
 use crate::models::{ActiveBlock, ChartBucket, ChartSegment, ModelSummary, UsagePayload};
 use chrono::{DateTime, Local, NaiveDate, Timelike};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -41,6 +41,7 @@ pub struct ProviderReadDebug {
     pub root_exists: bool,
     pub since: Option<String>,
     pub strategy: String,
+    pub listing_cache_hit: bool,
     pub discovered_paths: usize,
     pub attempted_paths: usize,
     pub opened_paths: usize,
@@ -76,11 +77,25 @@ struct FileStamp {
 }
 
 #[derive(Clone)]
+struct DirectoryStamp {
+    path: PathBuf,
+    modified: SystemTime,
+}
+
+#[derive(Clone)]
+struct CachedRootFileList {
+    files: Arc<[PathBuf]>,
+    directories: Arc<[DirectoryStamp]>,
+    last_accessed_at: Instant,
+}
+
+#[derive(Clone)]
 struct CachedFileEntries {
     stamp: FileStamp,
-    entries: Vec<ParsedEntry>,
-    change_events: Vec<ParsedChangeEvent>,
+    entries: Arc<[ParsedEntry]>,
+    change_events: Arc<[ParsedChangeEvent]>,
     earliest_date: Option<NaiveDate>,
+    last_accessed_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -89,13 +104,57 @@ enum ProviderFileKind {
     Codex,
 }
 
+#[derive(Clone)]
+struct UsageIntegrationConfig {
+    id: UsageIntegrationId,
+    roots: Vec<PathBuf>,
+}
+
+impl UsageIntegrationConfig {
+    fn new(id: UsageIntegrationId, roots: Vec<PathBuf>) -> Self {
+        Self { id, roots }
+    }
+
+    fn file_kind(&self) -> ProviderFileKind {
+        match self.id {
+            UsageIntegrationId::Claude => ProviderFileKind::Claude,
+            UsageIntegrationId::Codex => ProviderFileKind::Codex,
+        }
+    }
+
+    fn scan_strategy(&self) -> &'static str {
+        match self.id {
+            UsageIntegrationId::Claude => {
+                "recursive-jsonl-glob+root-file-list-cache+parsed-file-cache+dedupe"
+            }
+            UsageIntegrationId::Codex => {
+                "recursive-jsonl-glob+root-file-list-cache+parsed-file-cache+token-delta"
+            }
+        }
+    }
+
+    fn dedupe_entry_hashes(&self) -> bool {
+        matches!(self.id, UsageIntegrationId::Claude)
+    }
+
+    fn dedupe_change_events(&self) -> bool {
+        matches!(self.id, UsageIntegrationId::Claude)
+    }
+}
+
 struct CachedFileLoad {
-    entries: Vec<ParsedEntry>,
-    change_events: Vec<ParsedChangeEvent>,
+    entries: Arc<[ParsedEntry]>,
+    change_events: Arc<[ParsedChangeEvent]>,
     earliest_date: Option<NaiveDate>,
     lines_read: usize,
     opened: bool,
     from_cache: bool,
+}
+
+struct PayloadCacheEntry {
+    payload: UsagePayload,
+    stored_at: Instant,
+    last_accessed_at: Instant,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -261,6 +320,49 @@ fn push_sample_path(sample_paths: &mut Vec<String>, path: &Path) {
     }
 }
 
+fn scan_jsonl_tree_into(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    directories: &mut Vec<DirectoryStamp>,
+) {
+    let metadata = match fs::metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(_) => return,
+    };
+    let modified = match metadata.modified() {
+        Ok(modified) => modified,
+        Err(_) => return,
+    };
+    directories.push(DirectoryStamp {
+        path: dir.to_path_buf(),
+        modified,
+    });
+
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_jsonl_tree_into(&path, files, directories);
+        } else if path.extension().is_some_and(|e| e == "jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn scan_jsonl_tree(dir: &Path) -> (Vec<PathBuf>, Vec<DirectoryStamp>) {
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    if !dir.exists() {
+        return (files, directories);
+    }
+    scan_jsonl_tree_into(dir, &mut files, &mut directories);
+    files.sort();
+    (files, directories)
+}
+
 fn file_stamp(path: &Path) -> Option<FileStamp> {
     let metadata = fs::metadata(path).ok()?;
     Some(FileStamp {
@@ -274,72 +376,6 @@ fn earliest_entry_date(entries: &[ParsedEntry]) -> Option<NaiveDate> {
         .iter()
         .map(|entry| entry.timestamp.date_naive())
         .min()
-}
-
-fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-
-    for path in paths {
-        let key = path_to_string(&path);
-        if seen.insert(key) {
-            out.push(path);
-        }
-    }
-
-    out
-}
-
-fn normalize_claude_projects_dir(path: PathBuf) -> PathBuf {
-    if path.file_name().is_some_and(|name| name == "projects") {
-        path
-    } else {
-        path.join("projects")
-    }
-}
-
-fn normalize_codex_sessions_dir(path: PathBuf) -> PathBuf {
-    if path.file_name().is_some_and(|name| name == "sessions") {
-        path
-    } else {
-        path.join("sessions")
-    }
-}
-
-fn detect_claude_project_dirs() -> Vec<PathBuf> {
-    if let Ok(raw) = env::var("CLAUDE_CONFIG_DIR") {
-        let explicit = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .map(normalize_claude_projects_dir)
-            .collect::<Vec<_>>();
-
-        if !explicit.is_empty() {
-            return dedupe_paths(explicit);
-        }
-    }
-
-    let home = dirs::home_dir().unwrap_or_default();
-    let config_dir = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
-
-    dedupe_paths(vec![
-        config_dir.join("claude").join("projects"),
-        home.join(".claude").join("projects"),
-    ])
-}
-
-fn detect_codex_sessions_dir() -> PathBuf {
-    if let Ok(raw) = env::var("CODEX_HOME") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return normalize_codex_sessions_dir(PathBuf::from(trimmed));
-        }
-    }
-
-    let home = dirs::home_dir().unwrap_or_default();
-    home.join(".codex").join("sessions")
 }
 
 fn create_claude_unique_hash(entry: &ClaudeJsonlEntry) -> Option<String> {
@@ -474,7 +510,7 @@ fn assign_pending_codex_models(
     pending_change_indices: &mut Vec<usize>,
 ) {
     let model_raw = model_raw.to_string();
-    let model_key = crate::models::normalize_codex_model(&model_raw).1;
+    let model_key = crate::models::normalized_model_key(&model_raw);
 
     for idx in pending_entry_indices.drain(..) {
         if let Some(entry) = entries.get_mut(idx) {
@@ -662,7 +698,7 @@ fn parse_claude_session_file(path: &Path) -> ClaudeParseResult {
                     _ => format!("claude:file:{}", path_to_string(path)),
                 };
 
-                let model_key = crate::models::normalize_claude_model(&model).1.to_string();
+                let model_key = crate::models::normalized_model_key(&model);
                 let unique_hash = create_claude_unique_hash(&entry);
                 for (block_index, block) in msg.content.iter().enumerate() {
                     let pending = match block {
@@ -1121,7 +1157,7 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
                         let ts = ts.with_timezone(&Local);
                         let model_key = model_raw
                             .as_deref()
-                            .map(|raw| crate::models::normalize_codex_model(raw).1);
+                            .map(crate::models::normalized_model_key);
                         let paths = extract_diff_paths(&patch);
                         let (total_added, total_removed) = count_diff_lines(&patch);
 
@@ -1390,79 +1426,168 @@ fn segment_map_to_model_summaries(map: &HashMap<String, (String, f64, u64)>) -> 
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CACHE_TTL_SECS: u64 = 120;
+const MAX_PAYLOAD_CACHE_ENTRIES: usize = 256;
+const MAX_FILE_CACHE_ENTRIES: usize = 4096;
 
 pub struct UsageParser {
-    claude_dirs: Vec<PathBuf>,
-    codex_dir: PathBuf,
-    cache: Mutex<HashMap<String, (UsagePayload, Instant)>>,
+    integrations: Vec<UsageIntegrationConfig>,
+    cache: Mutex<HashMap<String, PayloadCacheEntry>>,
     file_cache: Mutex<HashMap<String, CachedFileEntries>>,
+    root_file_lists: Mutex<HashMap<String, CachedRootFileList>>,
     last_query_debug: Mutex<Option<UsageQueryDebugReport>>,
 }
 
+fn prune_payload_cache(cache: &mut HashMap<String, PayloadCacheEntry>) {
+    let now = Instant::now();
+    cache.retain(|_, entry| now.duration_since(entry.stored_at).as_secs() < CACHE_TTL_SECS);
+
+    if cache.len() <= MAX_PAYLOAD_CACHE_ENTRIES {
+        return;
+    }
+
+    let mut oldest_keys: Vec<(String, Instant)> = cache
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.last_accessed_at))
+        .collect();
+    oldest_keys.sort_by_key(|(_, last_accessed_at)| *last_accessed_at);
+
+    for (key, _) in oldest_keys
+        .into_iter()
+        .take(cache.len().saturating_sub(MAX_PAYLOAD_CACHE_ENTRIES))
+    {
+        cache.remove(&key);
+    }
+}
+
+fn prune_file_cache(cache: &mut HashMap<String, CachedFileEntries>) {
+    if cache.len() <= MAX_FILE_CACHE_ENTRIES {
+        return;
+    }
+
+    let mut oldest_keys: Vec<(String, Instant)> = cache
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.last_accessed_at))
+        .collect();
+    oldest_keys.sort_by_key(|(_, last_accessed_at)| *last_accessed_at);
+
+    for (key, _) in oldest_keys
+        .into_iter()
+        .take(cache.len().saturating_sub(MAX_FILE_CACHE_ENTRIES))
+    {
+        cache.remove(&key);
+    }
+}
+
+const MAX_ROOT_FILE_LIST_CACHE_ENTRIES: usize = 32;
+
+fn prune_root_file_list_cache(cache: &mut HashMap<String, CachedRootFileList>) {
+    if cache.len() <= MAX_ROOT_FILE_LIST_CACHE_ENTRIES {
+        return;
+    }
+
+    let mut oldest_keys: Vec<(String, Instant)> = cache
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.last_accessed_at))
+        .collect();
+    oldest_keys.sort_by_key(|(_, last_accessed_at)| *last_accessed_at);
+
+    for (key, _) in oldest_keys
+        .into_iter()
+        .take(cache.len().saturating_sub(MAX_ROOT_FILE_LIST_CACHE_ENTRIES))
+    {
+        cache.remove(&key);
+    }
+}
+
+fn default_usage_integration_configs() -> Vec<UsageIntegrationConfig> {
+    vec![
+        UsageIntegrationConfig::new(
+            UsageIntegrationId::Claude,
+            UsageIntegrationId::Claude.detect_roots(),
+        ),
+        UsageIntegrationConfig::new(
+            UsageIntegrationId::Codex,
+            UsageIntegrationId::Codex.detect_roots(),
+        ),
+    ]
+}
+
+fn usage_integration_configs_with_overrides(
+    claude_roots: Option<Vec<PathBuf>>,
+    codex_roots: Option<Vec<PathBuf>>,
+) -> Vec<UsageIntegrationConfig> {
+    vec![
+        UsageIntegrationConfig::new(
+            UsageIntegrationId::Claude,
+            claude_roots.unwrap_or_else(|| UsageIntegrationId::Claude.detect_roots()),
+        ),
+        UsageIntegrationConfig::new(
+            UsageIntegrationId::Codex,
+            codex_roots.unwrap_or_else(|| UsageIntegrationId::Codex.detect_roots()),
+        ),
+    ]
+}
+
 impl UsageParser {
+    fn from_integrations(integrations: Vec<UsageIntegrationConfig>) -> Self {
+        Self {
+            integrations,
+            cache: Mutex::new(HashMap::new()),
+            file_cache: Mutex::new(HashMap::new()),
+            root_file_lists: Mutex::new(HashMap::new()),
+            last_query_debug: Mutex::new(None),
+        }
+    }
+
     /// Create with default home-directory paths.
     #[allow(dead_code)]
     pub fn new() -> Self {
-        Self {
-            claude_dirs: detect_claude_project_dirs(),
-            codex_dir: detect_codex_sessions_dir(),
-            cache: Mutex::new(HashMap::new()),
-            file_cache: Mutex::new(HashMap::new()),
-            last_query_debug: Mutex::new(None),
-        }
+        Self::from_integrations(default_usage_integration_configs())
     }
 
     /// Create with an explicit Claude projects directory (for testing).
     #[allow(dead_code)]
     pub fn with_claude_dir(claude_dir: PathBuf) -> Self {
-        Self {
-            claude_dirs: vec![claude_dir],
-            codex_dir: detect_codex_sessions_dir(),
-            cache: Mutex::new(HashMap::new()),
-            file_cache: Mutex::new(HashMap::new()),
-            last_query_debug: Mutex::new(None),
-        }
+        Self::with_claude_dirs(vec![claude_dir])
     }
 
     /// Create with explicit Claude projects directories (for testing).
     #[allow(dead_code)]
     pub fn with_claude_dirs(claude_dirs: Vec<PathBuf>) -> Self {
-        Self {
-            claude_dirs,
-            codex_dir: detect_codex_sessions_dir(),
-            cache: Mutex::new(HashMap::new()),
-            file_cache: Mutex::new(HashMap::new()),
-            last_query_debug: Mutex::new(None),
-        }
+        Self::from_integrations(usage_integration_configs_with_overrides(
+            Some(claude_dirs),
+            None,
+        ))
     }
 
     /// Create with an explicit Codex sessions directory (for testing).
     #[allow(dead_code)]
     pub fn with_codex_dir(codex_dir: PathBuf) -> Self {
-        Self {
-            claude_dirs: detect_claude_project_dirs(),
-            codex_dir,
-            cache: Mutex::new(HashMap::new()),
-            file_cache: Mutex::new(HashMap::new()),
-            last_query_debug: Mutex::new(None),
-        }
+        Self::from_integrations(usage_integration_configs_with_overrides(
+            None,
+            Some(vec![codex_dir]),
+        ))
+    }
+
+    fn integration_config(&self, id: UsageIntegrationId) -> Option<&UsageIntegrationConfig> {
+        self.integrations.iter().find(|config| config.id == id)
     }
 
     /// Return the Codex sessions directory path.
     pub fn codex_dir(&self) -> &Path {
-        &self.codex_dir
+        self.integration_config(UsageIntegrationId::Codex)
+            .and_then(|config| config.roots.first())
+            .map(PathBuf::as_path)
+            .expect("codex integration should always have a primary root")
     }
 
     /// Create with explicit directories for both providers (for testing).
     #[allow(dead_code)]
     pub fn with_dirs(claude_dir: PathBuf, codex_dir: PathBuf) -> Self {
-        Self {
-            claude_dirs: vec![claude_dir],
-            codex_dir,
-            cache: Mutex::new(HashMap::new()),
-            file_cache: Mutex::new(HashMap::new()),
-            last_query_debug: Mutex::new(None),
-        }
+        Self::from_integrations(usage_integration_configs_with_overrides(
+            Some(vec![claude_dir]),
+            Some(vec![codex_dir]),
+        ))
     }
 
     // ── Cache helpers ──
@@ -1471,6 +1596,9 @@ impl UsageParser {
     pub fn clear_cache(&self) {
         self.clear_payload_cache();
         if let Ok(mut c) = self.file_cache.lock() {
+            c.clear();
+        }
+        if let Ok(mut c) = self.root_file_lists.lock() {
             c.clear();
         }
         if let Ok(mut current) = self.last_query_debug.lock() {
@@ -1485,20 +1613,31 @@ impl UsageParser {
     }
 
     pub fn check_cache(&self, key: &str) -> Option<UsagePayload> {
-        let c = self.cache.lock().ok()?;
-        if let Some((payload, ts)) = c.get(key) {
-            if ts.elapsed().as_secs() < CACHE_TTL_SECS {
-                let mut p = payload.clone();
-                p.from_cache = true;
-                return Some(p);
-            }
+        let mut c = self.cache.lock().ok()?;
+        prune_payload_cache(&mut c);
+
+        if let Some(entry) = c.get_mut(key) {
+            entry.last_accessed_at = Instant::now();
+            let mut payload = entry.payload.clone();
+            payload.from_cache = true;
+            return Some(payload);
         }
+
         None
     }
 
     pub fn store_cache(&self, key: &str, payload: UsagePayload) {
         if let Ok(mut c) = self.cache.lock() {
-            c.insert(key.to_string(), (payload, Instant::now()));
+            let now = Instant::now();
+            c.insert(
+                key.to_string(),
+                PayloadCacheEntry {
+                    payload,
+                    stored_at: now,
+                    last_accessed_at: now,
+                },
+            );
+            prune_payload_cache(&mut c);
         }
     }
 
@@ -1512,14 +1651,63 @@ impl UsageParser {
         self.last_query_debug.lock().ok()?.clone()
     }
 
+    fn root_listing_is_fresh(entry: &CachedRootFileList) -> bool {
+        !entry.directories.is_empty()
+            && entry.directories.iter().all(|directory| {
+                fs::metadata(&directory.path)
+                    .and_then(|metadata| metadata.modified())
+                    .map(|modified| modified == directory.modified)
+                    .unwrap_or(false)
+            })
+    }
+
+    fn cached_jsonl_files(&self, dir: &Path) -> (Arc<[PathBuf]>, bool) {
+        if !dir.exists() {
+            return (Arc::from(Vec::<PathBuf>::new()), false);
+        }
+
+        let cache_key = path_to_string(dir);
+        if let Ok(mut cache) = self.root_file_lists.lock() {
+            if let Some(entry) = cache.get_mut(&cache_key) {
+                if Self::root_listing_is_fresh(entry) {
+                    entry.last_accessed_at = Instant::now();
+                    return (entry.files.clone(), true);
+                }
+                cache.remove(&cache_key);
+            }
+        }
+
+        let (files, directories) = scan_jsonl_tree(dir);
+        let files: Arc<[PathBuf]> = files.into();
+        let directories: Arc<[DirectoryStamp]> = directories.into();
+
+        if !directories.is_empty() {
+            if let Ok(mut cache) = self.root_file_lists.lock() {
+                let now = Instant::now();
+                cache.insert(
+                    cache_key,
+                    CachedRootFileList {
+                        files: files.clone(),
+                        directories,
+                        last_accessed_at: now,
+                    },
+                );
+                prune_root_file_list_cache(&mut cache);
+            }
+        }
+
+        (files, false)
+    }
+
     fn load_cached_file(&self, path: &Path, kind: ProviderFileKind) -> CachedFileLoad {
         let cache_key = path_to_string(path);
         let stamp = file_stamp(path);
 
         if let Some(stamp) = stamp.as_ref() {
-            if let Ok(cache) = self.file_cache.lock() {
-                if let Some(cached) = cache.get(&cache_key) {
+            if let Ok(mut cache) = self.file_cache.lock() {
+                if let Some(cached) = cache.get_mut(&cache_key) {
                     if &cached.stamp == stamp {
+                        cached.last_accessed_at = Instant::now();
                         return CachedFileLoad {
                             entries: cached.entries.clone(),
                             change_events: cached.change_events.clone(),
@@ -1541,10 +1729,13 @@ impl UsageParser {
             }
         };
         let earliest_date = earliest_entry_date(&entries);
+        let entries: Arc<[ParsedEntry]> = entries.into();
+        let change_events: Arc<[ParsedChangeEvent]> = change_events.into();
 
         if let Ok(mut cache) = self.file_cache.lock() {
             if opened {
                 if let Some(stamp) = stamp {
+                    let now = Instant::now();
                     cache.insert(
                         cache_key,
                         CachedFileEntries {
@@ -1552,8 +1743,10 @@ impl UsageParser {
                             entries: entries.clone(),
                             change_events: change_events.clone(),
                             earliest_date,
+                            last_accessed_at: now,
                         },
                     );
+                    prune_file_cache(&mut cache);
                 } else {
                     cache.remove(&cache_key);
                 }
@@ -1572,8 +1765,9 @@ impl UsageParser {
         }
     }
 
-    fn load_claude_entries_with_debug(
+    fn load_integration_entries_with_debug(
         &self,
+        config: &UsageIntegrationConfig,
         since: Option<NaiveDate>,
     ) -> (
         Vec<ParsedEntry>,
@@ -1586,32 +1780,33 @@ impl UsageParser {
         let mut processed_hashes = HashSet::new();
         let mut processed_change_keys = HashSet::new();
 
-        for claude_dir in &self.claude_dirs {
-            let files = glob_jsonl_files(claude_dir);
+        for root_dir in &config.roots {
+            let (files, listing_cache_hit) = self.cached_jsonl_files(root_dir);
             let mut report = ProviderReadDebug {
-                provider: String::from("claude"),
-                root_dir: path_to_string(claude_dir),
-                root_exists: claude_dir.exists(),
+                provider: String::from(config.id.as_str()),
+                root_dir: path_to_string(root_dir),
+                root_exists: root_dir.exists(),
                 since: since.map(|date| date.format("%Y-%m-%d").to_string()),
-                strategy: String::from("recursive-jsonl-glob+parsed-file-cache+dedupe"),
+                strategy: String::from(config.scan_strategy()),
+                listing_cache_hit,
                 discovered_paths: files.len(),
                 ..ProviderReadDebug::default()
             };
 
-            for path in files {
+            for path in files.iter() {
                 if let Some(since_date) = since {
-                    if !modified_since(&path, since_date) {
+                    if !modified_since(path, since_date) {
                         report.skipped_paths += 1;
                         report.skipped_by_mtime += 1;
-                        push_sample_path(&mut report.sample_skipped_paths, &path);
+                        push_sample_path(&mut report.sample_skipped_paths, path);
                         continue;
                     }
                 }
 
                 report.attempted_paths += 1;
-                push_sample_path(&mut report.sample_paths, &path);
+                push_sample_path(&mut report.sample_paths, path);
 
-                let loaded = self.load_cached_file(&path, ProviderFileKind::Claude);
+                let loaded = self.load_cached_file(path, config.file_kind());
                 report.lines_read += loaded.lines_read;
                 if loaded.from_cache {
                     report.cache_hits += 1;
@@ -1626,29 +1821,38 @@ impl UsageParser {
                 }
 
                 // Collect change events (filtered by since date)
-                for cev in loaded.change_events {
+                for cev in loaded.change_events.iter() {
                     if since.is_some_and(|since_date| cev.timestamp.date_naive() < since_date) {
                         continue;
                     }
-                    if let Some(dedupe_key) = cev.dedupe_key.as_ref() {
+                    if config.dedupe_change_events() {
+                        let Some(dedupe_key) = cev.dedupe_key.as_ref() else {
+                            change_events.push(cev.clone());
+                            continue;
+                        };
                         if !processed_change_keys.insert(dedupe_key.clone()) {
                             continue;
                         }
                     }
-                    change_events.push(cev);
+                    change_events.push(cev.clone());
                 }
 
-                for entry in loaded.entries {
+                for entry in loaded.entries.iter() {
                     if since.is_some_and(|since_date| entry.timestamp.date_naive() < since_date) {
                         continue;
                     }
-                    if let Some(unique_hash) = entry.unique_hash.as_ref() {
+                    if config.dedupe_entry_hashes() {
+                        let Some(unique_hash) = entry.unique_hash.as_ref() else {
+                            report.emitted_entries += 1;
+                            entries.push(entry.clone());
+                            continue;
+                        };
                         if !processed_hashes.insert(unique_hash.clone()) {
                             continue;
                         }
                     }
                     report.emitted_entries += 1;
-                    entries.push(entry);
+                    entries.push(entry.clone());
                 }
             }
 
@@ -1658,67 +1862,30 @@ impl UsageParser {
         (entries, change_events, reports)
     }
 
+    fn load_claude_entries_with_debug(
+        &self,
+        since: Option<NaiveDate>,
+    ) -> (
+        Vec<ParsedEntry>,
+        Vec<ParsedChangeEvent>,
+        Vec<ProviderReadDebug>,
+    ) {
+        let config = self
+            .integration_config(UsageIntegrationId::Claude)
+            .expect("claude integration should be configured");
+        self.load_integration_entries_with_debug(config, since)
+    }
+
     fn load_codex_entries_with_debug(
         &self,
         since: Option<NaiveDate>,
     ) -> (Vec<ParsedEntry>, Vec<ParsedChangeEvent>, ProviderReadDebug) {
-        let mut entries = Vec::new();
-        let mut change_events = Vec::new();
-        let files = glob_jsonl_files(&self.codex_dir);
-        let mut report = ProviderReadDebug {
-            provider: String::from("codex"),
-            root_dir: path_to_string(&self.codex_dir),
-            root_exists: self.codex_dir.exists(),
-            since: since.map(|date| date.format("%Y-%m-%d").to_string()),
-            strategy: String::from("recursive-jsonl-glob+parsed-file-cache+token-delta"),
-            discovered_paths: files.len(),
-            ..ProviderReadDebug::default()
-        };
-
-        for path in files {
-            if let Some(since_date) = since {
-                if !modified_since(&path, since_date) {
-                    report.skipped_paths += 1;
-                    report.skipped_by_mtime += 1;
-                    push_sample_path(&mut report.sample_skipped_paths, &path);
-                    continue;
-                }
-            }
-
-            report.attempted_paths += 1;
-            push_sample_path(&mut report.sample_paths, &path);
-
-            let loaded = self.load_cached_file(&path, ProviderFileKind::Codex);
-            report.lines_read += loaded.lines_read;
-            if loaded.from_cache {
-                report.cache_hits += 1;
-            } else {
-                report.cache_misses += 1;
-                if loaded.opened {
-                    report.opened_paths += 1;
-                } else {
-                    report.failed_paths += 1;
-                    continue;
-                }
-            }
-
-            // Collect change events (filtered by since date)
-            for cev in loaded.change_events {
-                if since.is_some_and(|since_date| cev.timestamp.date_naive() < since_date) {
-                    continue;
-                }
-                change_events.push(cev);
-            }
-
-            for parsed in loaded.entries {
-                if since.is_some_and(|since_date| parsed.timestamp.date_naive() < since_date) {
-                    continue;
-                }
-                report.emitted_entries += 1;
-                entries.push(parsed);
-            }
-        }
-
+        let config = self
+            .integration_config(UsageIntegrationId::Codex)
+            .expect("codex integration should be configured");
+        let (entries, change_events, mut reports) =
+            self.load_integration_entries_with_debug(config, since);
+        let report = reports.pop().unwrap_or_default();
         (entries, change_events, report)
     }
 
@@ -1733,41 +1900,61 @@ impl UsageParser {
         Vec<ParsedChangeEvent>,
         Vec<ProviderReadDebug>,
     ) {
-        match provider {
-            "claude" => self.load_claude_entries_with_debug(since),
-            "codex" => {
-                let (entries, change_events, report) = self.load_codex_entries_with_debug(since);
-                (entries, change_events, vec![report])
-            }
-            _ => {
-                let (mut claude_entries, mut change_events, mut claude_reports) =
-                    self.load_claude_entries_with_debug(since);
-                let (codex_entries, codex_change_events, codex_report) =
-                    self.load_codex_entries_with_debug(since);
-                claude_entries.extend(codex_entries);
-                change_events.extend(codex_change_events);
-                claude_reports.push(codex_report);
-                (claude_entries, change_events, claude_reports)
+        let Some(selection) = UsageIntegrationSelection::parse(provider) else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+
+        let mut entries = Vec::new();
+        let mut change_events = Vec::new();
+        let mut reports = Vec::new();
+
+        for integration_id in selection.integration_ids() {
+            match integration_id {
+                UsageIntegrationId::Claude => {
+                    let (next_entries, next_change_events, next_reports) =
+                        self.load_claude_entries_with_debug(since);
+                    entries.extend(next_entries);
+                    change_events.extend(next_change_events);
+                    reports.extend(next_reports);
+                }
+                UsageIntegrationId::Codex => {
+                    let (next_entries, next_change_events, next_report) =
+                        self.load_codex_entries_with_debug(since);
+                    entries.extend(next_entries);
+                    change_events.extend(next_change_events);
+                    reports.push(next_report);
+                }
             }
         }
+
+        (entries, change_events, reports)
     }
 
     // ── has_entries_before: check if data exists before a given date ──
 
     pub fn has_entries_before(&self, provider: &str, before_date: NaiveDate) -> bool {
-        match provider {
-            "claude" => self.has_claude_entries_before(before_date),
-            "codex" => self.has_codex_entries_before(before_date),
-            _ => {
-                self.has_claude_entries_before(before_date)
-                    || self.has_codex_entries_before(before_date)
-            }
-        }
+        let Some(selection) = UsageIntegrationSelection::parse(provider) else {
+            return false;
+        };
+
+        selection
+            .integration_ids()
+            .iter()
+            .copied()
+            .any(|integration_id| match integration_id {
+                UsageIntegrationId::Claude => self.has_claude_entries_before(before_date),
+                UsageIntegrationId::Codex => self.has_codex_entries_before(before_date),
+            })
     }
 
-    fn has_claude_entries_before(&self, before_date: NaiveDate) -> bool {
-        for claude_dir in &self.claude_dirs {
-            let mut files = glob_jsonl_files(claude_dir);
+    fn has_integration_entries_before(
+        &self,
+        config: &UsageIntegrationConfig,
+        before_date: NaiveDate,
+    ) -> bool {
+        for root_dir in &config.roots {
+            let (files, _) = self.cached_jsonl_files(root_dir);
+            let mut files: Vec<PathBuf> = files.iter().cloned().collect();
             files.sort_by_key(|path| {
                 fs::metadata(path)
                     .and_then(|meta| meta.modified())
@@ -1781,7 +1968,7 @@ impl UsageParser {
             });
 
             for path in files {
-                let loaded = self.load_cached_file(&path, ProviderFileKind::Claude);
+                let loaded = self.load_cached_file(&path, config.file_kind());
                 if loaded
                     .earliest_date
                     .is_some_and(|entry_date| entry_date < before_date)
@@ -1790,33 +1977,22 @@ impl UsageParser {
                 }
             }
         }
+
         false
     }
 
-    fn has_codex_entries_before(&self, before_date: NaiveDate) -> bool {
-        let mut files = glob_jsonl_files(&self.codex_dir);
-        files.sort_by_key(|path| {
-            fs::metadata(path)
-                .and_then(|meta| meta.modified())
-                .ok()
-                .map(|modified| {
-                    let modified: chrono::DateTime<Local> = modified.into();
-                    let modified_date = modified.date_naive();
-                    (modified_date >= before_date, modified_date)
-                })
-                .unwrap_or((true, Local::now().date_naive()))
-        });
+    fn has_claude_entries_before(&self, before_date: NaiveDate) -> bool {
+        let config = self
+            .integration_config(UsageIntegrationId::Claude)
+            .expect("claude integration should be configured");
+        self.has_integration_entries_before(config, before_date)
+    }
 
-        for path in files {
-            let loaded = self.load_cached_file(&path, ProviderFileKind::Codex);
-            if loaded
-                .earliest_date
-                .is_some_and(|entry_date| entry_date < before_date)
-            {
-                return true;
-            }
-        }
-        false
+    fn has_codex_entries_before(&self, before_date: NaiveDate) -> bool {
+        let config = self
+            .integration_config(UsageIntegrationId::Codex)
+            .expect("codex integration should be configured");
+        self.has_integration_entries_before(config, before_date)
     }
 
     // ── Internal: build model_breakdown across all entries ──
@@ -1832,19 +2008,6 @@ impl UsageParser {
 
     pub fn get_daily(&self, provider: &str, since: &str) -> UsagePayload {
         let cache_key = format!("daily:{}:{}", provider, since);
-        if let Some(cached) = self.check_cache(&cache_key) {
-            self.set_last_query_debug(UsageQueryDebugReport {
-                provider: provider.to_string(),
-                aggregation: String::from("daily"),
-                since: since.to_string(),
-                cache_key: cache_key.clone(),
-                from_cache: true,
-                entry_count: 0,
-                sources: vec![],
-            });
-            return cached;
-        }
-
         let since_date = parse_since_date(since);
         let (entries, _change_events, sources) = self.load_entries(provider, since_date);
         self.set_last_query_debug(UsageQueryDebugReport {
@@ -1905,7 +2068,7 @@ impl UsageParser {
         let model_breakdown = segment_map_to_model_summaries(&global_model_map);
         let session_count = day_map.len() as u32;
 
-        let payload = UsagePayload {
+        UsagePayload {
             total_cost,
             total_tokens,
             session_count,
@@ -1921,29 +2084,13 @@ impl UsageParser {
             has_earlier_data: false,
             change_stats: None,
             subagent_stats: None,
-        };
-
-        self.store_cache(&cache_key, payload.clone());
-        payload
+        }
     }
 
     // ── Aggregation: monthly ──
 
     pub fn get_monthly(&self, provider: &str, since: &str) -> UsagePayload {
         let cache_key = format!("monthly:{}:{}", provider, since);
-        if let Some(cached) = self.check_cache(&cache_key) {
-            self.set_last_query_debug(UsageQueryDebugReport {
-                provider: provider.to_string(),
-                aggregation: String::from("monthly"),
-                since: since.to_string(),
-                cache_key: cache_key.clone(),
-                from_cache: true,
-                entry_count: 0,
-                sources: vec![],
-            });
-            return cached;
-        }
-
         let since_date = parse_since_date(since);
         let (entries, _change_events, sources) = self.load_entries(provider, since_date);
         self.set_last_query_debug(UsageQueryDebugReport {
@@ -2008,7 +2155,7 @@ impl UsageParser {
         let model_breakdown = segment_map_to_model_summaries(&global_model_map);
         let session_count = month_map.len() as u32;
 
-        let payload = UsagePayload {
+        UsagePayload {
             total_cost,
             total_tokens,
             session_count,
@@ -2024,29 +2171,13 @@ impl UsageParser {
             has_earlier_data: false,
             change_stats: None,
             subagent_stats: None,
-        };
-
-        self.store_cache(&cache_key, payload.clone());
-        payload
+        }
     }
 
     // ── Aggregation: hourly ──
 
     pub fn get_hourly(&self, provider: &str, since: &str) -> UsagePayload {
         let cache_key = format!("hourly:{}:{}", provider, since);
-        if let Some(cached) = self.check_cache(&cache_key) {
-            self.set_last_query_debug(UsageQueryDebugReport {
-                provider: provider.to_string(),
-                aggregation: String::from("hourly"),
-                since: since.to_string(),
-                cache_key: cache_key.clone(),
-                from_cache: true,
-                entry_count: 0,
-                sources: vec![],
-            });
-            return cached;
-        }
-
         let since_date = parse_since_date(since);
         let end_date = since_date.map(|date| date + chrono::Duration::days(1));
         let (entries, _change_events, sources) = self.load_entries(provider, since_date);
@@ -2124,7 +2255,7 @@ impl UsageParser {
         let model_breakdown = segment_map_to_model_summaries(&global_model_map);
         let session_count = chart_buckets.iter().filter(|b| b.total > 0.0).count() as u32;
 
-        let payload = UsagePayload {
+        UsagePayload {
             total_cost,
             total_tokens,
             session_count,
@@ -2140,29 +2271,13 @@ impl UsageParser {
             has_earlier_data: false,
             change_stats: None,
             subagent_stats: None,
-        };
-
-        self.store_cache(&cache_key, payload.clone());
-        payload
+        }
     }
 
     // ── Aggregation: blocks ──
 
     pub fn get_blocks(&self, provider: &str, since: &str) -> UsagePayload {
         let cache_key = format!("blocks:{}:{}", provider, since);
-        if let Some(cached) = self.check_cache(&cache_key) {
-            self.set_last_query_debug(UsageQueryDebugReport {
-                provider: provider.to_string(),
-                aggregation: String::from("blocks"),
-                since: since.to_string(),
-                cache_key: cache_key.clone(),
-                from_cache: true,
-                entry_count: 0,
-                sources: vec![],
-            });
-            return cached;
-        }
-
         let since_date = parse_since_date(since);
         let (mut entries, _change_events, sources) = self.load_entries(provider, since_date);
         self.set_last_query_debug(UsageQueryDebugReport {
@@ -2277,7 +2392,7 @@ impl UsageParser {
         let model_breakdown = segment_map_to_model_summaries(&global_model_map);
         let session_count = blocks.len() as u32;
 
-        let payload = UsagePayload {
+        UsagePayload {
             total_cost,
             total_tokens,
             session_count,
@@ -2293,10 +2408,7 @@ impl UsageParser {
             has_earlier_data: false,
             change_stats: None,
             subagent_stats: None,
-        };
-
-        self.store_cache(&cache_key, payload.clone());
-        payload
+        }
     }
 }
 
@@ -2675,18 +2787,24 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn cache_returns_same_payload_within_ttl() {
+    fn parser_aggregations_use_file_cache_without_payload_cache() {
         let content = r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":500}}}"#;
         let (_dir, parser) = make_parser_with_claude_data(content);
 
         let first = parser.get_daily("claude", "20260315");
         assert!(!first.from_cache, "first call should NOT be from cache");
+        let first_debug = parser.last_query_debug().unwrap();
+        assert_eq!(first_debug.sources[0].cache_hits, 0);
+        assert_eq!(first_debug.sources[0].cache_misses, 1);
 
         let second = parser.get_daily("claude", "20260315");
         assert!(
-            second.from_cache,
-            "second call within TTL should be from cache"
+            !second.from_cache,
+            "parser aggregations should not use the payload cache"
         );
+        let second_debug = parser.last_query_debug().unwrap();
+        assert_eq!(second_debug.sources[0].cache_hits, 1);
+        assert_eq!(second_debug.sources[0].cache_misses, 0);
     }
 
     #[test]
@@ -2762,6 +2880,47 @@ mod tests {
         assert_eq!(second_debug.sources[0].lines_read, 0);
     }
 
+    #[test]
+    fn root_file_list_cache_reuses_scan_when_tree_is_unchanged() {
+        let content = r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":500}}}"#;
+        let (_dir, parser) = make_parser_with_claude_data(content);
+
+        parser.get_daily("claude", "20260101");
+        let first_debug = parser.last_query_debug().unwrap();
+        assert!(!first_debug.sources[0].listing_cache_hit);
+
+        parser.get_monthly("claude", "20260101");
+        let second_debug = parser.last_query_debug().unwrap();
+        assert!(second_debug.sources[0].listing_cache_hit);
+    }
+
+    #[test]
+    fn root_file_list_cache_invalidates_when_tree_changes() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir.path().join("session-a.jsonl"),
+            r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+        );
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+
+        let first = parser.get_daily("claude", "20260101");
+        assert_eq!(first.input_tokens, 100);
+        let first_debug = parser.last_query_debug().unwrap();
+        assert_eq!(first_debug.sources[0].discovered_paths, 1);
+        assert!(!first_debug.sources[0].listing_cache_hit);
+
+        write_file(
+            &dir.path().join("session-b.jsonl"),
+            r#"{"type":"assistant","timestamp":"2026-03-16T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":200,"output_tokens":75}}}"#,
+        );
+
+        let second = parser.get_daily("claude", "20260101");
+        assert_eq!(second.input_tokens, 300);
+        let second_debug = parser.last_query_debug().unwrap();
+        assert_eq!(second_debug.sources[0].discovered_paths, 2);
+        assert!(!second_debug.sources[0].listing_cache_hit);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Monthly aggregation
     // ─────────────────────────────────────────────────────────────────────────
@@ -2795,11 +2954,19 @@ mod tests {
 
     #[test]
     fn hourly_aggregation_groups_by_hour() {
-        // Use local timestamps at past hours so hour values are guaranteed to be
-        // <= current_hour regardless of the system timezone.
-        let now = Local::now();
-        let ts1 = (now - chrono::Duration::hours(2)).to_rfc3339();
-        let ts2 = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let target_date = Local::now().date_naive() - chrono::Duration::days(1);
+        let ts1 = target_date
+            .and_hms_opt(9, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .unwrap()
+            .to_rfc3339();
+        let ts2 = target_date
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .unwrap()
+            .to_rfc3339();
         let content = format!(
             r#"{{"type":"assistant","timestamp":"{ts1}","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":1000,"output_tokens":500}}}}}}
 {{"type":"assistant","timestamp":"{ts2}","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":2000,"output_tokens":1000}}}}}}"#,
@@ -2809,16 +2976,15 @@ mod tests {
         write_file(&dir.path().join("session.jsonl"), &content);
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
 
-        let today_str = now.format("%Y%m%d").to_string();
-        let payload = parser.get_hourly("claude", &today_str);
+        let target_day = target_date.format("%Y%m%d").to_string();
+        let payload = parser.get_hourly("claude", &target_day);
 
         // Should have buckets covering from min_hour to current_hour
         assert!(
             !payload.chart_buckets.is_empty(),
             "should produce chart buckets"
         );
-        // The entry 2 hours ago should appear in the buckets
-        let two_hours_ago_label = format_hour((now - chrono::Duration::hours(2)).hour());
+        let two_hours_ago_label = format_hour(9);
         let has_bucket = payload
             .chart_buckets
             .iter()

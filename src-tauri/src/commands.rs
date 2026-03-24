@@ -1,5 +1,8 @@
-use crate::change_stats::{
-    aggregate_change_stats, aggregate_model_change_summary, ParsedChangeEvent,
+#[cfg(test)]
+use crate::change_stats::ParsedChangeEvent;
+use crate::change_stats::{aggregate_change_stats, aggregate_model_change_summary};
+use crate::integrations::{
+    all_usage_integrations, UsageIntegrationSelection, ALL_USAGE_INTEGRATIONS_ID,
 };
 use crate::models::*;
 use crate::parser::{UsageParser, UsageQueryDebugReport};
@@ -337,10 +340,14 @@ fn merge_tray_utilization(current: TrayUtilization, patch: TrayUtilization) -> T
 }
 
 fn current_daily_total_cost(state: &AppState) -> f64 {
-    let today = Local::now().format("%Y%m%d").to_string();
-    let claude = state.parser.get_daily("claude", &today);
-    let codex = state.parser.get_daily("codex", &today);
-    claude.total_cost + codex.total_cost
+    all_usage_integrations()
+        .iter()
+        .map(|integration_id| {
+            get_provider_data(&state.parser, integration_id.as_str(), "day", 0)
+                .map(|payload| payload.total_cost)
+                .unwrap_or(0.0)
+        })
+        .sum()
 }
 
 fn should_update_tray_icon(config: &TrayConfig, utilization: TrayUtilization) -> bool {
@@ -410,6 +417,17 @@ fn capture_query_debug(parser: &UsageParser) -> Result<UsageQueryDebugReport, St
     parser
         .last_query_debug()
         .ok_or_else(|| String::from("Usage debug report was not available"))
+}
+
+fn maybe_capture_query_debug(
+    parser: &UsageParser,
+    payload: &UsagePayload,
+) -> Result<Option<UsageQueryDebugReport>, String> {
+    if payload.from_cache {
+        Ok(None)
+    } else {
+        capture_query_debug(parser).map(Some)
+    }
 }
 
 #[tauri::command]
@@ -549,6 +567,8 @@ pub async fn set_tray_config(
 #[tauri::command]
 pub async fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.parser.clear_cache();
+    *state.cached_rate_limits.write().await = None;
+    *state.last_usage_debug.write().await = None;
     Ok(())
 }
 
@@ -588,23 +608,25 @@ pub async fn get_last_usage_debug(
     Ok(state.last_usage_debug.read().await.clone())
 }
 
+fn parse_usage_selection(provider: &str) -> Result<UsageIntegrationSelection, String> {
+    UsageIntegrationSelection::parse(provider)
+        .ok_or_else(|| format!("Unknown usage integration: {provider}"))
+}
+
 #[tauri::command]
 pub async fn get_known_models(
     provider: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<KnownModel>, String> {
-    match provider.as_str() {
-        "claude" | "codex" | "all" => {
-            let (entries, _, _) = state.parser.load_entries(&provider, None);
-            let mut models = BTreeMap::<String, KnownModel>::new();
-            for entry in entries {
-                let model = crate::models::known_model_from_raw(&entry.model);
-                models.entry(model.model_key.clone()).or_insert(model);
-            }
-            Ok(models.into_values().collect())
-        }
-        _ => Err(format!("Unknown provider: {}", provider)),
+    parse_usage_selection(&provider)?;
+
+    let (entries, _, _) = state.parser.load_entries(&provider, None);
+    let mut models = BTreeMap::<String, KnownModel>::new();
+    for entry in entries {
+        let model = crate::models::known_model_from_raw(&entry.model);
+        models.entry(model.model_key.clone()).or_insert(model);
     }
+    Ok(models.into_values().collect())
 }
 
 #[tauri::command]
@@ -616,67 +638,131 @@ pub async fn get_usage_data(
 ) -> Result<UsagePayload, String> {
     let parser = &state.parser;
 
-    match provider.as_str() {
-        "claude" | "codex" => {
+    match parse_usage_selection(&provider)? {
+        UsageIntegrationSelection::Single(integration_id) => {
             let payload = get_provider_data(parser, &provider, &period, offset)?;
-            let query = capture_query_debug(parser)?;
             set_last_usage_debug(
                 &state,
                 UsageDebugReport {
                     request_kind: String::from("usage"),
-                    requested_provider: provider,
+                    requested_provider: integration_id.as_str().to_string(),
                     period: Some(period),
                     offset: Some(offset),
                     year: None,
                     month: None,
-                    queries: vec![query],
+                    queries: maybe_capture_query_debug(parser, &payload)?
+                        .into_iter()
+                        .collect(),
                 },
             )
             .await;
             Ok(payload)
         }
-        "all" => {
-            let claude = get_provider_data(parser, "claude", &period, offset)?;
-            let claude_query = capture_query_debug(parser)?;
-            let codex = get_provider_data(parser, "codex", &period, offset)?;
-            let codex_query = capture_query_debug(parser)?;
+        UsageIntegrationSelection::All => {
+            // Check for a complete cached "all providers" payload.
+            let all_cache_key = format!("full-all:{}:{}", period, offset);
+            if let Some(cached) = parser.check_cache(&all_cache_key) {
+                set_last_usage_debug(
+                    &state,
+                    UsageDebugReport {
+                        request_kind: String::from("usage"),
+                        requested_provider: String::from(ALL_USAGE_INTEGRATIONS_ID),
+                        period: Some(period),
+                        offset: Some(offset),
+                        year: None,
+                        month: None,
+                        queries: vec![],
+                    },
+                )
+                .await;
+                return Ok(cached);
+            }
+
+            let mut merged: Option<UsagePayload> = None;
+            let mut queries = Vec::new();
+
+            for integration_id in all_usage_integrations() {
+                let payload = get_provider_data(parser, integration_id.as_str(), &period, offset)?;
+                if let Some(query) = maybe_capture_query_debug(parser, &payload)? {
+                    queries.push(query);
+                }
+                merged = Some(match merged {
+                    Some(current) => merge_payloads(current, payload),
+                    None => payload,
+                });
+            }
+
+            let mut merged = merged.unwrap_or_else(|| UsagePayload {
+                total_cost: 0.0,
+                total_tokens: 0,
+                session_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                chart_buckets: Vec::new(),
+                model_breakdown: Vec::new(),
+                active_block: None,
+                five_hour_cost: 0.0,
+                last_updated: Local::now().to_rfc3339(),
+                from_cache: false,
+                period_label: String::new(),
+                has_earlier_data: false,
+                change_stats: None,
+                subagent_stats: None,
+            });
+
             set_last_usage_debug(
                 &state,
                 UsageDebugReport {
                     request_kind: String::from("usage"),
-                    requested_provider: provider,
+                    requested_provider: String::from(ALL_USAGE_INTEGRATIONS_ID),
                     period: Some(period.clone()),
                     offset: Some(offset),
                     year: None,
                     month: None,
-                    queries: vec![claude_query, codex_query],
+                    queries,
                 },
             )
             .await;
-            let mut merged = merge_payloads(claude, codex);
 
-            // Re-aggregate change stats and subagent stats from all providers' entries.
+            // Re-aggregate change stats and subagent stats from all providers' entries
+            // in a single load_entries call instead of two separate calls.
             // This is more correct than merging per-provider stats because when one
             // provider returns None for subagent_stats, its cost would be missing from
             // the attribution (denominator includes both providers but numerator only one).
-            let all_change_events = load_change_events_for_period(parser, "all", &period, offset);
-            merged.change_stats =
-                aggregate_change_stats(&all_change_events, merged.total_cost, merged.total_tokens);
-            for model in &mut merged.model_breakdown {
-                model.change_stats =
-                    aggregate_model_change_summary(&all_change_events, &model.model_key);
+            if let Some((start_date, end_date)) = compute_date_bounds(&period, offset) {
+                let (mut all_entries, mut all_change_events, _) =
+                    parser.load_entries(ALL_USAGE_INTEGRATIONS_ID, Some(start_date));
+
+                all_change_events.retain(|event| {
+                    let date = event.timestamp.date_naive();
+                    date >= start_date && date < end_date
+                });
+                all_entries.retain(|entry| {
+                    let date = entry.timestamp.date_naive();
+                    date >= start_date && date < end_date
+                });
+
+                merged.change_stats = aggregate_change_stats(
+                    &all_change_events,
+                    merged.total_cost,
+                    merged.total_tokens,
+                );
+                for model in &mut merged.model_breakdown {
+                    model.change_stats =
+                        aggregate_model_change_summary(&all_change_events, &model.model_key);
+                }
+                merged.subagent_stats = crate::subagent_stats::aggregate_subagent_stats(
+                    &all_entries,
+                    &all_change_events,
+                    merged.total_cost,
+                );
             }
 
-            let all_entries = load_entries_for_period(parser, "all", &period, offset);
-            merged.subagent_stats = crate::subagent_stats::aggregate_subagent_stats(
-                &all_entries,
-                &all_change_events,
-                merged.total_cost,
-            );
+            // Store complete merged payload so future hits skip all recomputation.
+            parser.store_cache(&all_cache_key, merged.clone());
 
             Ok(merged)
         }
-        _ => Err(format!("Unknown provider: {}", provider)),
     }
 }
 
@@ -730,6 +816,7 @@ fn filter_buckets_to_range(payload: &mut UsagePayload, start: NaiveDate, end: Na
     payload.output_tokens = 0;
 }
 
+#[cfg(test)]
 fn load_change_events_for_period(
     parser: &UsageParser,
     provider: &str,
@@ -746,24 +833,6 @@ fn load_change_events_for_period(
         date >= start_date && date < end_date
     });
     change_events
-}
-
-fn load_entries_for_period(
-    parser: &UsageParser,
-    provider: &str,
-    period: &str,
-    offset: i32,
-) -> Vec<crate::parser::ParsedEntry> {
-    let Some((start_date, end_date)) = compute_date_bounds(period, offset) else {
-        return Vec::new();
-    };
-
-    let (mut entries, _change_events, _reports) = parser.load_entries(provider, Some(start_date));
-    entries.retain(|entry| {
-        let date = entry.timestamp.date_naive();
-        date >= start_date && date < end_date
-    });
-    entries
 }
 
 fn parse_bucket_start_date(sort_key: &str) -> Result<NaiveDate, chrono::ParseError> {
@@ -820,6 +889,12 @@ fn get_provider_data(
     period: &str,
     offset: i32,
 ) -> Result<UsagePayload, String> {
+    // Single cache layer: stores the complete payload including stats.
+    let cache_key = format!("full:{}:{}:{}", provider, period, offset);
+    if let Some(cached) = parser.check_cache(&cache_key) {
+        return Ok(cached);
+    }
+
     let now = Local::now();
     let today = now.date_naive();
 
@@ -893,32 +968,45 @@ fn get_provider_data(
         payload.has_earlier_data = false;
     }
 
-    // Load change events for this provider/period. The file cache is already
-    // warm from the aggregation call above, so this is cheap.
-    let change_events = load_change_events_for_period(parser, provider, period, offset);
+    // Load entries and change events in a single load_entries call instead of
+    // two separate calls (load_change_events_for_period + load_entries_for_period),
+    // each of which was cloning the full entries/events vectors independently.
+    if let Some((start_date, end_date)) = compute_date_bounds(period, offset) {
+        let (mut entries, mut change_events, _reports) =
+            parser.load_entries(provider, Some(start_date));
 
-    // Attach change stats to the payload
-    payload.change_stats =
-        aggregate_change_stats(&change_events, payload.total_cost, payload.total_tokens);
+        change_events.retain(|event| {
+            let date = event.timestamp.date_naive();
+            date >= start_date && date < end_date
+        });
+        entries.retain(|entry| {
+            let date = entry.timestamp.date_naive();
+            date >= start_date && date < end_date
+        });
 
-    // Attach per-model change stats
-    for model in &mut payload.model_breakdown {
-        model.change_stats = aggregate_model_change_summary(&change_events, &model.model_key);
+        // Attach change stats
+        payload.change_stats =
+            aggregate_change_stats(&change_events, payload.total_cost, payload.total_tokens);
+        for model in &mut payload.model_breakdown {
+            model.change_stats = aggregate_model_change_summary(&change_events, &model.model_key);
+        }
+
+        // Attach input/output token breakdown
+        if period != "5h" {
+            payload.input_tokens = entries.iter().map(|entry| entry.input_tokens).sum();
+            payload.output_tokens = entries.iter().map(|entry| entry.output_tokens).sum();
+        }
+
+        // Attach subagent stats
+        payload.subagent_stats = crate::subagent_stats::aggregate_subagent_stats(
+            &entries,
+            &change_events,
+            payload.total_cost,
+        );
     }
 
-    let period_entries = load_entries_for_period(parser, provider, period, offset);
-
-    if period != "5h" {
-        payload.input_tokens = period_entries.iter().map(|entry| entry.input_tokens).sum();
-        payload.output_tokens = period_entries.iter().map(|entry| entry.output_tokens).sum();
-    }
-
-    // Attach subagent stats
-    payload.subagent_stats = crate::subagent_stats::aggregate_subagent_stats(
-        &period_entries,
-        &change_events,
-        payload.total_cost,
-    );
+    // Store the complete payload so cache hits skip everything above.
+    parser.store_cache(&cache_key, payload.clone());
 
     Ok(payload)
 }
@@ -1022,16 +1110,20 @@ fn format_year_label(year: i32) -> String {
     year.to_string()
 }
 
+fn month_offset_from_now(year: i32, month: u32) -> i32 {
+    let now = Local::now();
+    (year - now.year()) * 12 + month as i32 - now.month() as i32
+}
+
 fn get_monthly_usage_with_debug_sync(
     state: &AppState,
     provider: &str,
     year: i32,
     month: u32,
 ) -> Result<(MonthlyUsagePayload, Vec<UsageQueryDebugReport>), String> {
-    let month_start = NaiveDate::from_ymd_opt(year, month, 1)
-        .unwrap()
-        .format("%Y%m%d")
-        .to_string();
+    let selection = parse_usage_selection(provider)?;
+    let month_offset = month_offset_from_now(year, month);
+    let month_start = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
 
     let end_date = if month == 12 {
         NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
@@ -1040,15 +1132,15 @@ fn get_monthly_usage_with_debug_sync(
     };
 
     let fetch_for_provider =
-        |prov: &str| -> Result<(Vec<CalendarDay>, UsageQueryDebugReport), String> {
-            let usage = state.parser.get_daily(prov, &month_start);
-            let query = capture_query_debug(&state.parser)?;
+        |prov: &str| -> Result<(Vec<CalendarDay>, Option<UsageQueryDebugReport>), String> {
+            let usage = get_provider_data(&state.parser, prov, "month", month_offset)?;
+            let query = maybe_capture_query_debug(&state.parser, &usage)?;
             let days = usage
                 .chart_buckets
                 .iter()
                 .filter_map(|bucket| {
                     let date = NaiveDate::parse_from_str(&bucket.sort_key, "%Y-%m-%d").ok()?;
-                    if date >= NaiveDate::from_ymd_opt(year, month, 1).unwrap() && date < end_date {
+                    if date >= month_start && date < end_date {
                         Some(CalendarDay {
                             day: date.day(),
                             cost: bucket.total,
@@ -1061,24 +1153,31 @@ fn get_monthly_usage_with_debug_sync(
             Ok((days, query))
         };
 
-    let (days, queries) = match provider {
-        "all" => {
-            let (claude_days, claude_query) = fetch_for_provider("claude")?;
-            let (codex_days, codex_query) = fetch_for_provider("codex")?;
+    let (days, queries) = match selection {
+        UsageIntegrationSelection::All => {
             let mut day_map: HashMap<u32, f64> = HashMap::new();
-            for d in claude_days.iter().chain(codex_days.iter()) {
-                *day_map.entry(d.day).or_insert(0.0) += d.cost;
+            let mut queries = Vec::new();
+
+            for integration_id in all_usage_integrations() {
+                let (integration_days, query) = fetch_for_provider(integration_id.as_str())?;
+                if let Some(query) = query {
+                    queries.push(query);
+                }
+                for day in integration_days {
+                    *day_map.entry(day.day).or_insert(0.0) += day.cost;
+                }
             }
+
             let mut merged: Vec<CalendarDay> = day_map
                 .into_iter()
                 .map(|(day, cost)| CalendarDay { day, cost })
                 .collect();
             merged.sort_by_key(|d| d.day);
-            (merged, vec![claude_query, codex_query])
+            (merged, queries)
         }
-        prov => {
-            let (days, query) = fetch_for_provider(prov)?;
-            (days, vec![query])
+        UsageIntegrationSelection::Single(integration_id) => {
+            let (days, query) = fetch_for_provider(integration_id.as_str())?;
+            (days, query.into_iter().collect())
         }
     };
 
@@ -1514,6 +1613,205 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_provider_data_uses_full_request_cache() {
+        let dir = TempDir::new().unwrap();
+        let now = Local::now();
+        let ts = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let content = format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"model":"claude-sonnet-4-6-20260301","usage":{{"input_tokens":1000,"output_tokens":500}},"stop_reason":"end_turn"}}}}"#,
+        );
+        write_file(&dir.path().join("session.jsonl"), &content);
+
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+
+        let first = get_provider_data(&parser, "claude", "day", 0).unwrap();
+        assert!(!first.from_cache, "first request should be computed");
+
+        let second = get_provider_data(&parser, "claude", "day", 0).unwrap();
+        assert!(
+            second.from_cache,
+            "second request should hit the full cache"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual benchmark against local Claude/Codex logs"]
+    fn benchmark_real_log_cache_paths() {
+        fn elapsed_ms(started_at: std::time::Instant) -> f64 {
+            started_at.elapsed().as_secs_f64() * 1000.0
+        }
+
+        fn average_ms<T>(iterations: usize, mut f: impl FnMut() -> T) -> f64 {
+            let started_at = std::time::Instant::now();
+            for _ in 0..iterations {
+                let _ = f();
+            }
+            elapsed_ms(started_at) / iterations as f64
+        }
+
+        fn load_all_usage(state: &AppState, period: &str, offset: i32) -> UsagePayload {
+            let parser = &state.parser;
+            let all_cache_key = format!("full-all:{}:{}", period, offset);
+            if let Some(cached) = parser.check_cache(&all_cache_key) {
+                return cached;
+            }
+
+            let mut merged: Option<UsagePayload> = None;
+            for integration_id in all_usage_integrations() {
+                let payload = get_provider_data(parser, integration_id.as_str(), period, offset)
+                    .expect("provider data should load");
+                merged = Some(match merged {
+                    Some(current) => merge_payloads(current, payload),
+                    None => payload,
+                });
+            }
+
+            let mut merged = merged.unwrap_or_else(|| UsagePayload {
+                total_cost: 0.0,
+                total_tokens: 0,
+                session_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                chart_buckets: Vec::new(),
+                model_breakdown: Vec::new(),
+                active_block: None,
+                five_hour_cost: 0.0,
+                last_updated: Local::now().to_rfc3339(),
+                from_cache: false,
+                period_label: String::new(),
+                has_earlier_data: false,
+                change_stats: None,
+                subagent_stats: None,
+            });
+
+            if let Some((start_date, end_date)) = compute_date_bounds(period, offset) {
+                let (mut all_entries, mut all_change_events, _) =
+                    parser.load_entries(ALL_USAGE_INTEGRATIONS_ID, Some(start_date));
+
+                all_change_events.retain(|event| {
+                    let date = event.timestamp.date_naive();
+                    date >= start_date && date < end_date
+                });
+                all_entries.retain(|entry| {
+                    let date = entry.timestamp.date_naive();
+                    date >= start_date && date < end_date
+                });
+
+                merged.change_stats = aggregate_change_stats(
+                    &all_change_events,
+                    merged.total_cost,
+                    merged.total_tokens,
+                );
+                for model in &mut merged.model_breakdown {
+                    model.change_stats =
+                        aggregate_model_change_summary(&all_change_events, &model.model_key);
+                }
+                merged.subagent_stats = crate::subagent_stats::aggregate_subagent_stats(
+                    &all_entries,
+                    &all_change_events,
+                    merged.total_cost,
+                );
+            }
+
+            parser.store_cache(&all_cache_key, merged.clone());
+            merged
+        }
+
+        let state = AppState::new();
+        let now = Local::now();
+        let current_year = now.year();
+        let current_month = now.month();
+
+        state.parser.clear_cache();
+        let started_at = std::time::Instant::now();
+        let claude_month_cold =
+            get_provider_data(&state.parser, "claude", "month", 0).expect("claude month cold");
+        let claude_month_cold_ms = elapsed_ms(started_at);
+        let claude_month_hit_ms = average_ms(200, || {
+            get_provider_data(&state.parser, "claude", "month", 0).expect("claude month cache hit")
+        });
+        state.parser.clear_payload_cache();
+        let started_at = std::time::Instant::now();
+        let claude_month_warm =
+            get_provider_data(&state.parser, "claude", "month", 0).expect("claude month warm");
+        let claude_month_warm_ms = elapsed_ms(started_at);
+
+        state.parser.clear_cache();
+        let started_at = std::time::Instant::now();
+        let all_month_cold = load_all_usage(&state, "month", 0);
+        let all_month_cold_ms = elapsed_ms(started_at);
+        let all_month_hit_ms = average_ms(200, || load_all_usage(&state, "month", 0));
+        state.parser.clear_payload_cache();
+        let started_at = std::time::Instant::now();
+        let all_month_warm = load_all_usage(&state, "month", 0);
+        let all_month_warm_ms = elapsed_ms(started_at);
+
+        state.parser.clear_cache();
+        let started_at = std::time::Instant::now();
+        let (calendar_cold, _) =
+            get_monthly_usage_with_debug_sync(&state, "all", current_year, current_month)
+                .expect("calendar cold");
+        let calendar_cold_ms = elapsed_ms(started_at);
+        let calendar_hit_ms = average_ms(200, || {
+            get_monthly_usage_with_debug_sync(&state, "all", current_year, current_month)
+                .expect("calendar cache hit")
+        });
+        state.parser.clear_payload_cache();
+        let started_at = std::time::Instant::now();
+        let (calendar_warm, _) =
+            get_monthly_usage_with_debug_sync(&state, "all", current_year, current_month)
+                .expect("calendar warm");
+        let calendar_warm_ms = elapsed_ms(started_at);
+
+        state.parser.clear_cache();
+        let started_at = std::time::Instant::now();
+        let tray_cold_total = current_daily_total_cost(&state);
+        let tray_cold_ms = elapsed_ms(started_at);
+        let tray_hit_ms = average_ms(500, || current_daily_total_cost(&state));
+        state.parser.clear_payload_cache();
+        let started_at = std::time::Instant::now();
+        let tray_warm_total = current_daily_total_cost(&state);
+        let tray_warm_ms = elapsed_ms(started_at);
+
+        println!(
+            "BENCH claude/month total={:.2} cold_ms={:.2} full_hit_avg_ms={:.4} warm_lower_cache_ms={:.2}",
+            claude_month_cold.total_cost,
+            claude_month_cold_ms,
+            claude_month_hit_ms,
+            claude_month_warm_ms
+        );
+        println!(
+            "BENCH all/month total={:.2} cold_ms={:.2} full_hit_avg_ms={:.4} warm_lower_cache_ms={:.2}",
+            all_month_cold.total_cost,
+            all_month_cold_ms,
+            all_month_hit_ms,
+            all_month_warm_ms
+        );
+        println!(
+            "BENCH calendar/all/{:04}-{:02} total={:.2} cold_ms={:.2} full_hit_avg_ms={:.4} warm_lower_cache_ms={:.2}",
+            current_year,
+            current_month,
+            calendar_cold.total_cost,
+            calendar_cold_ms,
+            calendar_hit_ms,
+            calendar_warm_ms
+        );
+        println!(
+            "BENCH tray/day total={:.2} cold_ms={:.2} full_hit_avg_ms={:.4} warm_lower_cache_ms={:.2}",
+            tray_cold_total,
+            tray_cold_ms,
+            tray_hit_ms,
+            tray_warm_ms
+        );
+
+        assert!(claude_month_cold.total_cost >= 0.0);
+        assert!(claude_month_warm.total_cost >= 0.0);
+        assert!(all_month_warm.total_cost >= 0.0);
+        assert!(calendar_warm.total_cost >= 0.0);
+        assert!(tray_warm_total >= 0.0);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Period label formatting
     // ─────────────────────────────────────────────────────────────────────────
@@ -1684,6 +1982,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_monthly_usage_skips_stale_query_debug_on_full_cache_hit() {
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let project_dir = claude_dir.path().join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let now = Local::now();
+        let current_month = NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap();
+        let content = format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"model":"claude-sonnet-4-6-20260301","usage":{{"input_tokens":1000,"output_tokens":500}},"stop_reason":"end_turn"}}}}"#,
+            local_timestamp(current_month, 10)
+        );
+        write_file(&project_dir.join("session.jsonl"), &content);
+
+        let parser = UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        );
+        let state = AppState {
+            parser: Arc::new(parser),
+            refresh_interval: Arc::new(RwLock::new(30)),
+            tray_config: Arc::new(RwLock::new(TrayConfig::default())),
+            tray_utilization: Arc::new(RwLock::new(TrayUtilization::default())),
+            last_usage_debug: Arc::new(RwLock::new(None)),
+            cached_rate_limits: Arc::new(RwLock::new(None)),
+            glass_enabled: Arc::new(RwLock::new(false)),
+        };
+
+        let (first_payload, first_queries) =
+            get_monthly_usage_with_debug_sync(&state, "claude", now.year(), now.month()).unwrap();
+        assert!(
+            !first_payload.days.is_empty(),
+            "expected in-range monthly usage"
+        );
+        assert_eq!(
+            first_queries.len(),
+            1,
+            "cold month request should capture debug"
+        );
+
+        let (_second_payload, second_queries) =
+            get_monthly_usage_with_debug_sync(&state, "claude", now.year(), now.month()).unwrap();
+        assert!(
+            second_queries.is_empty(),
+            "full-cache month hit should not reuse stale parser debug"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Change stats wiring
     // ─────────────────────────────────────────────────────────────────────────
@@ -1692,15 +2039,15 @@ mod tests {
     fn change_stats_populated_on_provider_payload() {
         // Create a Claude session with an Edit tool_use
         let dir = TempDir::new().unwrap();
-        let now = Local::now();
-        let ts = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let target_date = Local::now().date_naive() - chrono::Duration::days(1);
+        let ts = local_timestamp(target_date, 10);
         let content = format!(
             r#"{{"type":"assistant","timestamp":"{ts}","requestId":"req_1","message":{{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{{"type":"tool_use","id":"tu_1","name":"Edit","input":{{"file_path":"src/main.rs","old_string":"fn old()","new_string":"fn new()\nfn extra()"}}}}],"usage":{{"input_tokens":100,"output_tokens":50}}}}}}"#,
         );
         write_file(&dir.path().join("session.jsonl"), &content);
 
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
-        let payload = get_provider_data(&parser, "claude", "day", 0).unwrap();
+        let payload = get_provider_data(&parser, "claude", "day", -1).unwrap();
 
         assert!(
             payload.change_stats.is_some(),
@@ -1717,15 +2064,15 @@ mod tests {
     #[test]
     fn change_stats_none_when_no_edits() {
         let dir = TempDir::new().unwrap();
-        let now = Local::now();
-        let ts = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let target_date = Local::now().date_naive() - chrono::Duration::days(1);
+        let ts = local_timestamp(target_date, 10);
         let content = format!(
             r#"{{"type":"assistant","timestamp":"{ts}","message":{{"model":"claude-opus-4-6-20260301","usage":{{"input_tokens":100,"output_tokens":50}}}}}}"#,
         );
         write_file(&dir.path().join("session.jsonl"), &content);
 
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
-        let payload = get_provider_data(&parser, "claude", "day", 0).unwrap();
+        let payload = get_provider_data(&parser, "claude", "day", -1).unwrap();
         assert!(
             payload.change_stats.is_none(),
             "change_stats should be None when there are no edit events"
@@ -1735,10 +2082,9 @@ mod tests {
     #[test]
     fn model_change_stats_populated_per_model() {
         let dir = TempDir::new().unwrap();
-        // Use dynamic timestamps relative to "now" so the test works in any timezone
-        let now = Local::now();
-        let ts1 = (now - chrono::Duration::hours(2)).to_rfc3339();
-        let ts2 = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let target_date = Local::now().date_naive() - chrono::Duration::days(1);
+        let ts1 = local_timestamp(target_date, 10);
+        let ts2 = local_timestamp(target_date, 11);
         let content = format!(
             r#"{{"type":"assistant","timestamp":"{ts1}","requestId":"req_1","message":{{"id":"msg_1","model":"claude-opus-4-6-20260301","role":"assistant","content":[{{"type":"tool_use","id":"tu_1","name":"Edit","input":{{"file_path":"src/a.rs","old_string":"a","new_string":"b\nc"}}}}],"usage":{{"input_tokens":100,"output_tokens":50}}}}}}
 {{"type":"assistant","timestamp":"{ts2}","requestId":"req_2","message":{{"id":"msg_2","model":"claude-sonnet-4-6-20260301","role":"assistant","content":[{{"type":"tool_use","id":"tu_2","name":"Edit","input":{{"file_path":"src/b.rs","old_string":"x","new_string":"y"}}}}],"usage":{{"input_tokens":200,"output_tokens":100}}}}}}"#,
@@ -1746,7 +2092,7 @@ mod tests {
         write_file(&dir.path().join("session.jsonl"), &content);
 
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
-        let payload = get_provider_data(&parser, "claude", "day", 0).unwrap();
+        let payload = get_provider_data(&parser, "claude", "day", -1).unwrap();
 
         let opus = payload
             .model_breakdown

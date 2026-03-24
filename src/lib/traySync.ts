@@ -1,11 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DefaultProvider, RateLimitsPayload, TrayConfig } from "./types/index.js";
+import type { RateLimitProviderId, RateLimitsPayload, TrayConfig } from "./types/index.js";
 
 type InvokeFn = typeof invoke;
 
 export function primaryUtilization(
   rateLimits: RateLimitsPayload | null,
-  provider: DefaultProvider,
+  provider: RateLimitProviderId,
 ): number | null {
   const data = rateLimits?.[provider];
   if (!data || data.windows.length === 0) return null;

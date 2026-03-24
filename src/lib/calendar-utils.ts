@@ -1,3 +1,6 @@
+import { getUsageProviderBrandColor } from "./providerMetadata.js";
+import type { UsageProvider } from "./types/index.js";
+
 export const INTENSITY_OPACITY = [0, 0.15, 0.40, 0.65, 0.90];
 
 export function intensityLevel(cost: number, maxCost: number): number {
@@ -17,11 +20,11 @@ export function computeEarned(totalCost: number, planCost: number): number | nul
 export function heatmapColor(
   level: number,
   brandTheming: boolean,
-  provider: "claude" | "codex" | "all" | string,
+  provider: UsageProvider,
 ): string {
   if (level === 0) return "var(--surface-2)";
   const opacity = INTENSITY_OPACITY[level];
-  if (brandTheming && provider === "claude") return `rgba(196, 112, 75, ${opacity})`;
-  if (brandTheming && provider === "codex") return `rgba(74, 123, 157, ${opacity})`;
-  return `rgba(77, 175, 74, ${opacity})`;
+  return brandTheming
+    ? (getUsageProviderBrandColor(provider, opacity) ?? `rgba(77, 175, 74, ${opacity})`)
+    : `rgba(77, 175, 74, ${opacity})`;
 }

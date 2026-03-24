@@ -1,6 +1,8 @@
 #[cfg_attr(not(test), allow(dead_code))]
 pub const PRICING_VERSION: &str = "2026-03-15";
 
+use crate::models::{detect_model_family, ModelFamily};
+
 struct ModelRates {
     input: f64,
     output: f64,
@@ -49,7 +51,20 @@ const fn openai_rates(input: f64, output: f64, cache_write: f64, cache_read: f64
     }
 }
 
+const fn zero_rates() -> ModelRates {
+    ModelRates {
+        input: 0.0,
+        output: 0.0,
+        cache_write_5m: 0.0,
+        cache_write_1h: 0.0,
+        cache_read: 0.0,
+    }
+}
+
 fn get_rates(model: &str) -> ModelRates {
+    let normalized = model.trim().to_ascii_lowercase();
+    let model = normalized.as_str();
+
     // ── Claude models (most-specific first) ─────────────────────────────────
 
     if model.contains("opus-4-6") {
@@ -158,28 +173,40 @@ fn get_rates(model: &str) -> ModelRates {
 }
 
 fn get_fallback_rates(model: &str) -> ModelRates {
-    if model.contains("opus") {
-        return claude_rates(5.00, 25.00);
+    match detect_model_family(model) {
+        ModelFamily::Anthropic => {
+            if model.contains("opus") {
+                claude_rates(5.00, 25.00)
+            } else if model.contains("sonnet") {
+                claude_rates(3.00, 15.00)
+            } else if model.contains("haiku") {
+                claude_rates(1.00, 5.00)
+            } else {
+                claude_rates(3.00, 15.00)
+            }
+        }
+        ModelFamily::OpenAI => {
+            if model.contains("codex-mini") {
+                return openai_rates(0.25, 2.00, 0.25, 0.025);
+            }
+            if model.contains("codex") || model.contains("gpt-5") {
+                return openai_rates(1.25, 10.00, 1.25, 0.125);
+            }
+
+            let bytes = model.as_bytes();
+            if bytes.first() == Some(&b'o') && bytes.get(1).is_some_and(|b| b.is_ascii_digit()) {
+                return openai_rates(1.10, 4.40, 1.10, 0.275);
+            }
+
+            openai_rates(1.25, 10.00, 1.25, 0.125)
+        }
+        ModelFamily::Google
+        | ModelFamily::Moonshot
+        | ModelFamily::Qwen
+        | ModelFamily::Glm
+        | ModelFamily::DeepSeek
+        | ModelFamily::Unknown => zero_rates(),
     }
-    if model.contains("sonnet") {
-        return claude_rates(3.00, 15.00);
-    }
-    if model.contains("haiku") {
-        return claude_rates(1.00, 5.00);
-    }
-    if model.contains("codex-mini") {
-        return openai_rates(0.25, 2.00, 0.25, 0.025);
-    }
-    if model.contains("codex") || model.contains("gpt-5") {
-        return openai_rates(1.25, 10.00, 1.25, 0.125);
-    }
-    // Starts with o + ASCII digit
-    let bytes = model.as_bytes();
-    if bytes.first() == Some(&b'o') && bytes.get(1).is_some_and(|b| b.is_ascii_digit()) {
-        return openai_rates(1.10, 4.40, 1.10, 0.275);
-    }
-    // Completely unknown — default to Sonnet rates
-    claude_rates(3.00, 15.00)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -366,8 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn completely_unknown_falls_back_to_sonnet() {
-        assert!(approx_eq(cost("totally-unknown-model", M, M), 18.00));
+    fn unsupported_family_defaults_to_zero_until_priced() {
+        assert!(approx_eq(cost("gemini-2.5-pro", M, M), 0.00));
+        assert!(approx_eq(cost("totally-unknown-model", M, M), 0.00));
     }
 
     #[test]

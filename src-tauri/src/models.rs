@@ -119,21 +119,78 @@ pub struct RateLimitsPayload {
 
 // ── Helpers ──
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFamily {
+    Anthropic,
+    OpenAI,
+    Google,
+    Moonshot,
+    Qwen,
+    Glm,
+    DeepSeek,
+    Unknown,
+}
+
+pub fn detect_model_family(raw: &str) -> ModelFamily {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return ModelFamily::Unknown;
+    }
+
+    if normalized.contains("claude")
+        || normalized.contains("opus")
+        || normalized.contains("sonnet")
+        || normalized.contains("haiku")
+    {
+        return ModelFamily::Anthropic;
+    }
+
+    let bytes = normalized.as_bytes();
+    let looks_like_openai_o_series =
+        bytes.first() == Some(&b'o') && bytes.get(1).is_some_and(|b| b.is_ascii_digit());
+
+    if normalized.starts_with("gpt") || looks_like_openai_o_series || normalized.contains("codex") {
+        return ModelFamily::OpenAI;
+    }
+
+    if normalized.starts_with("gemini") {
+        return ModelFamily::Google;
+    }
+
+    if normalized.starts_with("kimi") || normalized.contains("moonshot") {
+        return ModelFamily::Moonshot;
+    }
+
+    if normalized.starts_with("qwen") {
+        return ModelFamily::Qwen;
+    }
+
+    if normalized.starts_with("glm") || normalized.contains("zhipu") {
+        return ModelFamily::Glm;
+    }
+
+    if normalized.starts_with("deepseek") {
+        return ModelFamily::DeepSeek;
+    }
+
+    ModelFamily::Unknown
+}
+
 pub fn normalize_claude_model(raw: &str) -> (&str, &str) {
-    // Returns (display_name, color_key)
-    if raw.contains("opus-4-6") {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.contains("opus-4-6") {
         ("Opus 4.6", "opus-4-6")
-    } else if raw.contains("opus-4-5") {
+    } else if normalized.contains("opus-4-5") {
         ("Opus 4.5", "opus-4-5")
-    } else if raw.contains("sonnet-4-6") {
+    } else if normalized.contains("sonnet-4-6") {
         ("Sonnet 4.6", "sonnet-4-6")
-    } else if raw.contains("sonnet-4-5") {
+    } else if normalized.contains("sonnet-4-5") {
         ("Sonnet 4.5", "sonnet-4-5")
-    } else if raw.contains("sonnet") {
+    } else if normalized.contains("sonnet") {
         ("Sonnet", "sonnet")
-    } else if raw.contains("haiku-4-5") {
+    } else if normalized.contains("haiku-4-5") {
         ("Haiku 4.5", "haiku-4-5")
-    } else if raw.contains("haiku") {
+    } else if normalized.contains("haiku") {
         ("Haiku", "haiku")
     } else {
         ("Unknown", "unknown")
@@ -156,27 +213,73 @@ pub fn normalize_codex_model(raw: &str) -> (String, String) {
     (normalized_display_name, normalized_key)
 }
 
+fn normalize_prefixed_model(
+    raw: &str,
+    prefix_lower: &str,
+    display_prefix: &str,
+) -> (String, String) {
+    let display_name = raw.trim();
+    if display_name.is_empty() {
+        return (String::from("Unknown"), String::from("unknown"));
+    }
+
+    let normalized_key = display_name.to_ascii_lowercase();
+    let normalized_display_name = if normalized_key.starts_with(prefix_lower) {
+        format!("{display_prefix}{}", &display_name[prefix_lower.len()..])
+    } else {
+        display_name.to_string()
+    };
+
+    (normalized_display_name, normalized_key)
+}
+
+pub fn normalize_generic_model(raw: &str) -> (String, String) {
+    match detect_model_family(raw) {
+        ModelFamily::Google => normalize_prefixed_model(raw, "gemini", "Gemini"),
+        ModelFamily::Moonshot => normalize_prefixed_model(raw, "kimi", "Kimi"),
+        ModelFamily::Qwen => normalize_prefixed_model(raw, "qwen", "Qwen"),
+        ModelFamily::Glm => normalize_prefixed_model(raw, "glm", "GLM"),
+        ModelFamily::DeepSeek => normalize_prefixed_model(raw, "deepseek", "DeepSeek"),
+        _ => {
+            let display_name = raw.trim();
+            if display_name.is_empty() {
+                return (String::from("Unknown"), String::from("unknown"));
+            }
+            (display_name.to_string(), display_name.to_ascii_lowercase())
+        }
+    }
+}
+
+pub fn normalize_model(raw: &str) -> (String, String) {
+    match detect_model_family(raw) {
+        ModelFamily::Anthropic => {
+            let (display_name, model_key) = normalize_claude_model(raw);
+            (display_name.to_string(), model_key.to_string())
+        }
+        ModelFamily::OpenAI => normalize_codex_model(raw),
+        ModelFamily::Google
+        | ModelFamily::Moonshot
+        | ModelFamily::Qwen
+        | ModelFamily::Glm
+        | ModelFamily::DeepSeek
+        | ModelFamily::Unknown => normalize_generic_model(raw),
+    }
+}
+
+pub fn normalized_model_key(raw: &str) -> String {
+    normalize_model(raw).1
+}
+
+#[allow(dead_code)]
 pub(crate) fn is_codex_model_name(raw: &str) -> bool {
-    raw.starts_with("gpt")
-        || raw.starts_with("o1")
-        || raw.starts_with("o3")
-        || raw.starts_with("o4")
-        || raw.contains("codex")
+    detect_model_family(raw) == ModelFamily::OpenAI
 }
 
 pub fn known_model_from_raw(raw: &str) -> KnownModel {
-    if is_codex_model_name(raw) {
-        let (display_name, model_key) = normalize_codex_model(raw);
-        KnownModel {
-            display_name,
-            model_key,
-        }
-    } else {
-        let (display_name, model_key) = normalize_claude_model(raw);
-        KnownModel {
-            display_name: display_name.to_string(),
-            model_key: model_key.to_string(),
-        }
+    let (display_name, model_key) = normalize_model(raw);
+    KnownModel {
+        display_name,
+        model_key,
     }
 }
 
@@ -384,6 +487,33 @@ mod tests {
             KnownModel {
                 display_name: String::from("GPT-5.3-codex"),
                 model_key: String::from("gpt-5.3-codex"),
+            }
+        );
+    }
+
+    #[test]
+    fn detects_non_openai_non_anthropic_model_families() {
+        assert_eq!(detect_model_family("gemini-2.5-pro"), ModelFamily::Google);
+        assert_eq!(detect_model_family("kimi-k2"), ModelFamily::Moonshot);
+        assert_eq!(detect_model_family("qwen3-coder"), ModelFamily::Qwen);
+        assert_eq!(detect_model_family("glm-4.5"), ModelFamily::Glm);
+        assert_eq!(detect_model_family("deepseek-chat"), ModelFamily::DeepSeek);
+    }
+
+    #[test]
+    fn generic_models_keep_identity_without_being_forced_into_claude_or_codex() {
+        assert_eq!(
+            known_model_from_raw("glm-4.5"),
+            KnownModel {
+                display_name: String::from("GLM-4.5"),
+                model_key: String::from("glm-4.5"),
+            }
+        );
+        assert_eq!(
+            known_model_from_raw("gemini-2.5-pro"),
+            KnownModel {
+                display_name: String::from("Gemini-2.5-pro"),
+                model_key: String::from("gemini-2.5-pro"),
             }
         );
     }

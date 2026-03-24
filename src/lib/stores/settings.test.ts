@@ -101,8 +101,6 @@ describe("loadSettings", () => {
         showCost: false,
         costPrecision: 'full',
       },
-      claudePlan: 0,
-      codexPlan: 0,
       glassEffect: true,
       showModelChangeStats: false,
     });
@@ -146,8 +144,6 @@ describe("loadSettings", () => {
         showCost: true,
         costPrecision: 'full',
       },
-      claudePlan: 0,
-      codexPlan: 0,
       glassEffect: true,
       showModelChangeStats: false,
     });
@@ -242,8 +238,6 @@ describe("loadSettings migration", () => {
         showCost: "no" as unknown as Settings["trayConfig"]["showCost"],
         costPrecision: "many" as Settings["trayConfig"]["costPrecision"],
       },
-      claudePlan: "100" as unknown as Settings["claudePlan"],
-      codexPlan: 999,
       glassEffect: "no" as unknown as Settings["glassEffect"],
     });
     mockLoad.mockResolvedValueOnce(store);
@@ -269,8 +263,6 @@ describe("loadSettings migration", () => {
         showCost: true,
         costPrecision: "full",
       },
-      claudePlan: 100,
-      codexPlan: 0,
       glassEffect: true,
     });
     expect(loaded.headerTabs).toEqual({

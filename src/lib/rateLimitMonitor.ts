@@ -1,6 +1,14 @@
 import { providerHasActiveCooldown } from "./rateLimitsView.js";
+import {
+  getRateLimitCacheFile,
+  getRateLimitMinFetchIntervalMs,
+  isRateLimitProvider,
+  RATE_LIMIT_PROVIDER_ORDER as SUPPORTED_RATE_LIMIT_PROVIDER_ORDER,
+  shouldPreservePeakRateLimitUtilization,
+} from "./providerMetadata.js";
 import type {
   ProviderRateLimits,
+  RateLimitProviderId,
   RateLimitWindow,
   RateLimitProviderMonitorState,
   RateLimitRequestState,
@@ -9,28 +17,26 @@ import type {
   UsageProvider,
 } from "./types/index.js";
 
-export type RateLimitProvider = Exclude<UsageProvider, "all">;
+export type RateLimitProvider = RateLimitProviderId;
 export type RateLimitScope = UsageProvider;
 
 interface RateLimitProviderPolicy {
   cacheFile: string;
   minFetchIntervalMs: number;
+  preservePeakUtilization: boolean;
 }
 
-const CLAUDE_MIN_FETCH_INTERVAL_MS = 300_000;
+export const RATE_LIMIT_PROVIDER_ORDER: RateLimitProvider[] = [...SUPPORTED_RATE_LIMIT_PROVIDER_ORDER];
 
-export const RATE_LIMIT_PROVIDER_ORDER: RateLimitProvider[] = ["claude", "codex"];
-
-export const RATE_LIMIT_PROVIDER_POLICIES: Record<RateLimitProvider, RateLimitProviderPolicy> = {
-  claude: {
-    cacheFile: "rate-limits-claude.json",
-    minFetchIntervalMs: CLAUDE_MIN_FETCH_INTERVAL_MS,
-  },
-  codex: {
-    cacheFile: "rate-limits-codex.json",
-    minFetchIntervalMs: 0,
-  },
-};
+export const RATE_LIMIT_PROVIDER_POLICIES: Record<RateLimitProvider, RateLimitProviderPolicy> =
+  RATE_LIMIT_PROVIDER_ORDER.reduce((policies, provider) => {
+    policies[provider] = {
+      cacheFile: getRateLimitCacheFile(provider),
+      minFetchIntervalMs: getRateLimitMinFetchIntervalMs(provider),
+      preservePeakUtilization: shouldPreservePeakRateLimitUtilization(provider),
+    };
+    return policies;
+  }, {} as Record<RateLimitProvider, RateLimitProviderPolicy>);
 
 export const DEFAULT_RATE_LIMIT_REQUEST_STATE: RateLimitRequestState = {
   loading: false,
@@ -47,21 +53,22 @@ export const DEFAULT_RATE_LIMIT_PROVIDER_MONITOR_STATE: RateLimitProviderMonitor
 };
 
 export function createRateLimitsPayload(): RateLimitsPayload {
-  return {
-    claude: null,
-    codex: null,
-  };
+  return RATE_LIMIT_PROVIDER_ORDER.reduce((payload, provider) => {
+    payload[provider] = null;
+    return payload;
+  }, {} as RateLimitsPayload);
 }
 
 export function createRateLimitsMonitorState(): RateLimitsMonitorState {
-  return {
-    claude: { ...DEFAULT_RATE_LIMIT_PROVIDER_MONITOR_STATE },
-    codex: { ...DEFAULT_RATE_LIMIT_PROVIDER_MONITOR_STATE },
-  };
+  return RATE_LIMIT_PROVIDER_ORDER.reduce((state, provider) => {
+    state[provider] = { ...DEFAULT_RATE_LIMIT_PROVIDER_MONITOR_STATE };
+    return state;
+  }, {} as RateLimitsMonitorState);
 }
 
 export function requestedProviders(scope: RateLimitScope): RateLimitProvider[] {
-  return scope === "all" ? [...RATE_LIMIT_PROVIDER_ORDER] : [scope];
+  if (scope === "all") return [...RATE_LIMIT_PROVIDER_ORDER];
+  return isRateLimitProvider(scope) ? [scope] : [];
 }
 
 export function providerPayload(
@@ -69,7 +76,7 @@ export function providerPayload(
   provider: RateLimitProvider,
 ): ProviderRateLimits | null {
   if (!payload) return null;
-  return provider === "claude" ? payload.claude : payload.codex;
+  return payload[provider];
 }
 
 export function replaceProviderPayload(
@@ -78,9 +85,10 @@ export function replaceProviderPayload(
   next: ProviderRateLimits | null,
 ): RateLimitsPayload {
   const current = payload ?? createRateLimitsPayload();
-  return provider === "claude"
-    ? { ...current, claude: next }
-    : { ...current, codex: next };
+  return {
+    ...current,
+    [provider]: next,
+  };
 }
 
 export function hasUsableRateLimitWindows(
@@ -96,7 +104,7 @@ export function inferLastSuccessfulAt(
   return hasUsableRateLimitWindows(rateLimits) ? rateLimits.fetchedAt : null;
 }
 
-function stabilizedCodexWindow(
+function stabilizedPeakWindow(
   freshWindow: RateLimitWindow,
   cachedWindows: RateLimitWindow[],
 ): RateLimitWindow {
@@ -113,15 +121,17 @@ function stabilizedCodexWindow(
   };
 }
 
-function stabilizeCodexRateLimits(
+function stabilizeProviderRateLimits(
   fresh: ProviderRateLimits,
   cached: ProviderRateLimits,
 ): ProviderRateLimits {
-  if (fresh.provider !== "codex" || cached.provider !== "codex") return fresh;
+  if (!isRateLimitProvider(fresh.provider) || !isRateLimitProvider(cached.provider)) return fresh;
+  if (fresh.provider !== cached.provider) return fresh;
+  if (!RATE_LIMIT_PROVIDER_POLICIES[fresh.provider].preservePeakUtilization) return fresh;
 
   return {
     ...fresh,
-    windows: fresh.windows.map((window) => stabilizedCodexWindow(window, cached.windows)),
+    windows: fresh.windows.map((window) => stabilizedPeakWindow(window, cached.windows)),
   };
 }
 
@@ -141,7 +151,7 @@ export function mergeProviderRateLimits(
   }
 
   if (fresh && cached) {
-    return stabilizeCodexRateLimits(fresh, cached);
+    return stabilizeProviderRateLimits(fresh, cached);
   }
 
   return fresh ?? cached ?? null;

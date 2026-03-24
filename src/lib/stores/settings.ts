@@ -1,10 +1,18 @@
 import { get, writable } from "svelte/store";
 import { load } from "@tauri-apps/plugin-store";
+import {
+  ALL_USAGE_PROVIDER_ID,
+  createDefaultHeaderTabs,
+  DEFAULT_RATE_LIMIT_PROVIDER,
+  DEFAULT_USAGE_PROVIDER,
+  isUsageProvider,
+  RATE_LIMIT_PROVIDER_ORDER,
+  USAGE_PROVIDER_ORDER,
+} from "../providerMetadata.js";
 import type {
   BarDisplay,
   CostPrecision,
   DefaultPeriod,
-  DefaultProvider,
   HeaderTabs,
   PercentageFormat,
   TrayConfig,
@@ -26,39 +34,27 @@ export interface Settings {
   headerTabs: HeaderTabs;
   brandTheming: boolean;
   trayConfig: TrayConfig;
-  claudePlan: number;
-  codexPlan: number;
   glassEffect: boolean;
   showModelChangeStats: boolean;
 }
 
-export const HEADER_TAB_ORDER: UsageProvider[] = ["all", "claude", "codex"];
+export const HEADER_TAB_ORDER: UsageProvider[] = [...USAGE_PROVIDER_ORDER];
 export const MAX_HEADER_TAB_LABEL_LENGTH = 18;
 export const SUPPORTED_THEMES = ["light", "dark", "system"] as const;
 export const SUPPORTED_DEFAULT_PERIODS: DefaultPeriod[] = ["5h", "day", "week", "month"];
 export const SUPPORTED_REFRESH_INTERVALS = [30, 60, 300, 0] as const;
 export const SUPPORTED_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CNY"] as const;
-export const SUPPORTED_CLAUDE_PLANS = [0, 20, 100, 200] as const;
-export const SUPPORTED_CODEX_PLANS = [0, 20, 200] as const;
 
 const SUPPORTED_BAR_DISPLAYS: BarDisplay[] = ["off", "single", "both"];
-const SUPPORTED_BAR_PROVIDERS: DefaultProvider[] = ["claude", "codex"];
+const SUPPORTED_BAR_PROVIDERS = [...RATE_LIMIT_PROVIDER_ORDER];
 const SUPPORTED_PERCENTAGE_FORMATS: PercentageFormat[] = ["compact", "verbose"];
 const SUPPORTED_COST_PRECISIONS: CostPrecision[] = ["whole", "full"];
 
-export const DEFAULT_HEADER_TABS: HeaderTabs = {
-  all: { label: "All", enabled: true },
-  claude: { label: "Claude", enabled: true },
-  codex: { label: "Codex", enabled: true },
-};
-
-function isUsageProvider(value: unknown): value is UsageProvider {
-  return value === "all" || value === "claude" || value === "codex";
-}
+export const DEFAULT_HEADER_TABS: HeaderTabs = createDefaultHeaderTabs();
 
 const DEFAULTS: Settings = {
   theme: SUPPORTED_THEMES[2],
-  defaultProvider: "claude",
+  defaultProvider: DEFAULT_USAGE_PROVIDER,
   defaultPeriod: "day",
   refreshInterval: 30,
   costAlertThreshold: 0,
@@ -70,14 +66,12 @@ const DEFAULTS: Settings = {
   brandTheming: true,
   trayConfig: {
     barDisplay: 'both',
-    barProvider: 'claude',
+    barProvider: DEFAULT_RATE_LIMIT_PROVIDER,
     showPercentages: false,
     percentageFormat: 'compact',
     showCost: true,
     costPrecision: 'full',
   },
-  claudePlan: 0,
-  codexPlan: 0,
   glassEffect: true,
   showModelChangeStats: false,
 };
@@ -139,33 +133,30 @@ function normalizeHiddenModels(value: unknown): string[] {
 }
 
 function normalizeHeaderTabLabel(provider: UsageProvider, label: unknown): string {
-  if (typeof label !== "string") return DEFAULT_HEADER_TABS[provider].label;
+  const defaultLabel = DEFAULT_HEADER_TABS[provider]?.label ?? provider;
+  if (typeof label !== "string") return defaultLabel;
   const trimmed = label.trim().slice(0, MAX_HEADER_TAB_LABEL_LENGTH);
-  return trimmed || DEFAULT_HEADER_TABS[provider].label;
+  return trimmed || defaultLabel;
 }
 
 function normalizeHeaderTabEnabled(provider: UsageProvider, enabled: unknown): boolean {
-  return typeof enabled === "boolean" ? enabled : DEFAULT_HEADER_TABS[provider].enabled;
+  return typeof enabled === "boolean"
+    ? enabled
+    : (DEFAULT_HEADER_TABS[provider]?.enabled ?? true);
 }
 
 export function normalizeHeaderTabs(headerTabs?: Partial<HeaderTabs> | null): HeaderTabs {
-  const normalized: HeaderTabs = {
-    all: {
-      label: normalizeHeaderTabLabel("all", headerTabs?.all?.label),
-      enabled: normalizeHeaderTabEnabled("all", headerTabs?.all?.enabled),
-    },
-    claude: {
-      label: normalizeHeaderTabLabel("claude", headerTabs?.claude?.label),
-      enabled: normalizeHeaderTabEnabled("claude", headerTabs?.claude?.enabled),
-    },
-    codex: {
-      label: normalizeHeaderTabLabel("codex", headerTabs?.codex?.label),
-      enabled: normalizeHeaderTabEnabled("codex", headerTabs?.codex?.enabled),
-    },
-  };
+  const normalized = createDefaultHeaderTabs();
+
+  for (const provider of HEADER_TAB_ORDER) {
+    normalized[provider] = {
+      label: normalizeHeaderTabLabel(provider, headerTabs?.[provider]?.label),
+      enabled: normalizeHeaderTabEnabled(provider, headerTabs?.[provider]?.enabled),
+    };
+  }
 
   if (!HEADER_TAB_ORDER.some((provider) => normalized[provider].enabled)) {
-    normalized.all.enabled = true;
+    normalized[HEADER_TAB_ORDER[0] ?? DEFAULT_USAGE_PROVIDER].enabled = true;
   }
 
   return normalized;
@@ -188,7 +179,7 @@ export function resolveVisibleProvider(
 ): UsageProvider {
   const requested = isUsageProvider(provider) ? provider : DEFAULTS.defaultProvider;
   if (headerTabs[requested].enabled) return requested;
-  return getVisibleHeaderProviders(headerTabs)[0] ?? "all";
+  return getVisibleHeaderProviders(headerTabs)[0] ?? HEADER_TAB_ORDER[0] ?? DEFAULTS.defaultProvider;
 }
 
 function normalizeTrayConfig(trayConfig?: Partial<TrayConfig> | null): TrayConfig {
@@ -244,16 +235,6 @@ export function normalizeSettings(saved?: Partial<Settings> | null): Settings {
     headerTabs,
     brandTheming: normalizeBoolean(saved?.brandTheming, DEFAULTS.brandTheming),
     trayConfig: normalizeTrayConfig(saved?.trayConfig),
-    claudePlan: normalizeNumericChoice(
-      saved?.claudePlan,
-      SUPPORTED_CLAUDE_PLANS,
-      DEFAULTS.claudePlan,
-    ),
-    codexPlan: normalizeNumericChoice(
-      saved?.codexPlan,
-      SUPPORTED_CODEX_PLANS,
-      DEFAULTS.codexPlan,
-    ),
     glassEffect: normalizeBoolean(saved?.glassEffect, DEFAULTS.glassEffect),
     showModelChangeStats: normalizeBoolean(saved?.showModelChangeStats, DEFAULTS.showModelChangeStats),
   };
@@ -353,7 +334,7 @@ export function applyGlass(enabled: boolean) {
 
 export function applyProvider(provider: UsageProvider, brandTheming: boolean) {
   const root = document.documentElement;
-  if (!brandTheming || provider === "all") {
+  if (!brandTheming || provider === ALL_USAGE_PROVIDER_ID) {
     root.removeAttribute("data-provider");
   } else {
     root.setAttribute("data-provider", provider);

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { modelColor, formatCost, currencySymbol, convertCost } from "../utils/format.js";
   import { settings } from "../stores/settings.js";
+  import { chartMode } from "../stores/usage.js";
   import type { ChartBucket, ChartSegment } from "../types/index.js";
 
   interface Props { buckets: ChartBucket[]; dataKey: string }
@@ -24,7 +25,6 @@
   const CHART_W = 280; // SVG viewbox width (y-axis labels sit outside)
   let maxCost = $derived(Math.max(...filteredBuckets.map((b) => b.total), 0.01));
   let hoveredIdx = $state(-1);
-  let chartMode = $state<"bar" | "line">("bar");
 
   // Debounced hover for smooth detail panel transitions
   let displayedIdx = $state(-1);
@@ -151,11 +151,11 @@
       <div class="mode-toggle">
         <button
           type="button"
-          class:on={chartMode === "bar"}
+          class:on={$chartMode === "bar"}
           aria-label="Show bar chart"
-          aria-pressed={chartMode === "bar"}
+          aria-pressed={$chartMode === "bar"}
           title="Show bar chart"
-          onclick={() => (chartMode = "bar")}
+          onclick={() => chartMode.set("bar")}
         >
           <svg width="10" height="10" viewBox="0 0 10 10">
             <rect x="1" y="4" width="2" height="6" rx=".5" fill="currentColor"/>
@@ -165,11 +165,11 @@
         </button>
         <button
           type="button"
-          class:on={chartMode === "line"}
+          class:on={$chartMode === "line"}
           aria-label="Show line chart"
-          aria-pressed={chartMode === "line"}
+          aria-pressed={$chartMode === "line"}
           title="Show line chart"
-          onclick={() => (chartMode = "line")}
+          onclick={() => chartMode.set("line")}
         >
           <svg width="10" height="10" viewBox="0 0 10 10">
             <path d="M1,7 C3,3 5,5 9,2" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
@@ -189,9 +189,9 @@
 
     <!-- Chart area -->
     <div class="chart-area">
-      {#key `${dataKey}-${chartMode}`}
+      {#key `${dataKey}-${$chartMode}`}
       <div class="chart-fade">
-        {#if chartMode === "bar"}
+        {#if $chartMode === "bar"}
           <!-- BAR CHART -->
           <svg viewBox="0 0 {CHART_W} {CHART_H}" preserveAspectRatio="none" class="chart-svg">
             <!-- Grid lines -->

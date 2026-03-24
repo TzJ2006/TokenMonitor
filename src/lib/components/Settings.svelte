@@ -13,13 +13,29 @@
     updateSetting,
     type Settings as SettingsType,
   } from "../stores/settings.js";
+  import { clearUsageCache } from "../stores/usage.js";
   import { currencySymbol, modelColor } from "../utils/format.js";
   import { copyResizeDebugToClipboard, logResizeDebug } from "../resizeDebug.js";
   import { syncNativeWindowSurface } from "../windowAppearance.js";
-  import type { KnownModel, TrayConfig, RateLimitsPayload, UsageProvider } from "../types/index.js";
+  import type {
+    HeaderTabConfig,
+    KnownModel,
+    RateLimitProviderId,
+    TrayConfig,
+    RateLimitsPayload,
+    UsageProvider,
+  } from "../types/index.js";
   import { rateLimitsData } from "../stores/rateLimits.js";
   import { syncTrayConfig } from "../traySync.js";
   import { formatTrayTitle } from "../trayTitle.js";
+  import {
+    getRateLimitPrimaryWindowId,
+    getUsageProviderBrandColor,
+    getUsageProviderLabel,
+    getUsageProviderTitle,
+    RATE_LIMIT_PROVIDER_ORDER,
+    USAGE_PROVIDER_ORDER,
+  } from "../providerMetadata.js";
   import SegmentedControl from "./SegmentedControl.svelte";
   import ToggleSwitch from "./ToggleSwitch.svelte";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
@@ -36,22 +52,35 @@
   let copiedDebug = $state(false);
   let appVersion = $state("");
   let availableModels = $state<KnownModel[]>([]);
-  let headerLabelInputs = $state<Record<UsageProvider, string>>({
-    all: DEFAULT_HEADER_TABS.all.label,
-    claude: DEFAULT_HEADER_TABS.claude.label,
-    codex: DEFAULT_HEADER_TABS.codex.label,
-  });
+  let headerLabelInputs = $state<Record<string, string>>(createHeaderLabelInputs(DEFAULT_HEADER_TABS));
 
-  const HEADER_TAB_FIELDS: Array<{ provider: UsageProvider; title: string }> = [
-    { provider: "all", title: "All" },
-    { provider: "claude", title: "Claude" },
-    { provider: "codex", title: "Codex" },
-  ];
+  const HEADER_TAB_FIELDS: Array<{ provider: UsageProvider; title: string }> = USAGE_PROVIDER_ORDER.map(
+    (provider) => ({
+      provider,
+      title: getUsageProviderTitle(provider),
+    }),
+  );
+  const PREVIEW_UTILIZATIONS = [72, 35, 58, 24];
 
-  const PREVIEW_RATE_LIMITS = {
-    claude: { provider: 'claude', planTier: null, windows: [{ windowId: 'p', label: 'Primary', utilization: 72, resetsAt: null }], extraUsage: null, stale: false, error: null, cooldownUntil: null, retryAfterSeconds: null, fetchedAt: '' },
-    codex: { provider: 'codex', planTier: null, windows: [{ windowId: 'p', label: 'Primary', utilization: 35, resetsAt: null }], extraUsage: null, stale: false, error: null, cooldownUntil: null, retryAfterSeconds: null, fetchedAt: '' },
-  } as RateLimitsPayload;
+  const PREVIEW_RATE_LIMITS: RateLimitsPayload = RATE_LIMIT_PROVIDER_ORDER.reduce((payload, provider, index) => {
+    payload[provider] = {
+      provider,
+      planTier: null,
+      windows: [{
+        windowId: getRateLimitPrimaryWindowId(provider),
+        label: "Primary",
+        utilization: PREVIEW_UTILIZATIONS[index % PREVIEW_UTILIZATIONS.length] ?? 50,
+        resetsAt: null,
+      }],
+      extraUsage: null,
+      stale: false,
+      error: null,
+      cooldownUntil: null,
+      retryAfterSeconds: null,
+      fetchedAt: "",
+    };
+    return payload;
+  }, {} as RateLimitsPayload);
 
   // Use a function call to ensure Svelte tracks all trayConfig fields
   let titlePreview = $derived.by(() => {
@@ -61,6 +90,11 @@
 
   let previewBarDisplay = $derived(current.trayConfig.barDisplay);
   let previewBarProvider = $derived(current.trayConfig.barProvider);
+  let verbosePercentagePreview = $derived.by(() =>
+    RATE_LIMIT_PROVIDER_ORDER
+      .map((provider) => `${getUsageProviderTitle(provider)} ${previewUtilization(provider)}%`)
+      .join(" "),
+  );
   let defaultProviderOptions = $derived.by(() =>
     getVisibleHeaderProviders(current.headerTabs).map((provider) => ({
       value: provider,
@@ -68,12 +102,16 @@
     })),
   );
 
+  function createHeaderLabelInputs(nextHeaderTabs: SettingsType["headerTabs"]): Record<string, string> {
+    const inputs: Record<string, string> = {};
+    for (const provider of USAGE_PROVIDER_ORDER) {
+      inputs[provider] = nextHeaderTabs[provider]?.label ?? DEFAULT_HEADER_TABS[provider]?.label ?? provider;
+    }
+    return inputs;
+  }
+
   function syncHeaderLabelInputs(nextHeaderTabs: SettingsType["headerTabs"]) {
-    headerLabelInputs = {
-      all: nextHeaderTabs.all.label,
-      claude: nextHeaderTabs.claude.label,
-      codex: nextHeaderTabs.codex.label,
-    };
+    headerLabelInputs = createHeaderLabelInputs(nextHeaderTabs);
   }
 
   function describeActiveElement() {
@@ -162,7 +200,7 @@
 
   function updateHeaderTab(
     provider: UsageProvider,
-    patch: Partial<SettingsType["headerTabs"][UsageProvider]>,
+    patch: Partial<HeaderTabConfig>,
   ) {
     updateSetting("headerTabs", {
       ...current.headerTabs,
@@ -188,18 +226,20 @@
     updateHeaderTab(provider, { label: headerLabelInputs[provider] });
   }
 
+  function previewUtilization(provider: RateLimitProviderId): number {
+    return PREVIEW_RATE_LIMITS[provider]?.windows[0]?.utilization ?? 0;
+  }
+
+  function previewFillStyle(provider: RateLimitProviderId): string {
+    const utilization = previewUtilization(provider);
+    const color = getUsageProviderBrandColor(provider, 1) ?? "var(--accent)";
+    return `width:${Math.max(0, Math.min(utilization, 100))}%; background:${color}`;
+  }
+
   function handleHeaderLabelKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") {
       (e.target as HTMLInputElement).blur();
     }
-  }
-
-  function handleClaudePlan(val: string) {
-    updateSetting("claudePlan", parseInt(val, 10) || 0);
-  }
-
-  function handleCodexPlan(val: string) {
-    updateSetting("codexPlan", parseInt(val, 10) || 0);
   }
 
   function handleTrayConfig<K extends keyof TrayConfig>(key: K, value: TrayConfig[K]) {
@@ -267,8 +307,13 @@
     updateSetting("hiddenModels", hidden);
   }
 
-  function resetCache() {
-    invoke("clear_cache").catch(() => {});
+  async function resetCache() {
+    clearUsageCache();
+    try {
+      await invoke("clear_cache");
+    } catch (error) {
+      console.error("Failed to clear backend cache:", error);
+    }
   }
 
   async function copyDebugLog() {
@@ -405,7 +450,7 @@
           </div>
         {/each}
       </div>
-      <div class="setting-note">Labels are cosmetic. Usage data is still backed by All, Claude, and Codex.</div>
+      <div class="setting-note">Labels are cosmetic. Usage data is still backed by the registered usage integrations.</div>
     </div>
 
     <!-- Menu Bar -->
@@ -423,13 +468,14 @@
           <!-- Bars -->
           {#if previewBarDisplay === 'both'}
             <div class="tp-bars">
-              <div class="tp-track"><div class="tp-fill claude" style="width:72%"></div></div>
-              <div class="tp-track"><div class="tp-fill codex" style="width:35%"></div></div>
+              {#each RATE_LIMIT_PROVIDER_ORDER as provider}
+                <div class="tp-track"><div class="tp-fill" style={previewFillStyle(provider)}></div></div>
+              {/each}
             </div>
           {:else if previewBarDisplay === 'single'}
             <div class="tp-bars">
               <div class="tp-track single">
-                <div class="tp-fill {previewBarProvider}" style="width:72%"></div>
+                <div class="tp-fill" style={previewFillStyle(previewBarProvider)}></div>
               </div>
             </div>
           {/if}
@@ -457,10 +503,10 @@
         <div class="row" class:dim={current.trayConfig.barDisplay !== 'single'}>
           <span class="label">Provider</span>
           <SegmentedControl
-            options={[
-              { value: "claude", label: "Claude" },
-              { value: "codex", label: "Codex" },
-            ]}
+            options={RATE_LIMIT_PROVIDER_ORDER.map((provider) => ({
+              value: provider,
+              label: getUsageProviderLabel(provider),
+            }))}
             value={current.trayConfig.barProvider}
             onChange={(v) => handleTrayConfig("barProvider", v as TrayConfig["barProvider"])}
           />
@@ -481,7 +527,7 @@
           <SegmentedControl
             options={[
               { value: "compact", label: "72 · 35" },
-              { value: "verbose", label: "Claude Code 72% Codex 35%" },
+              { value: "verbose", label: verbosePercentagePreview },
             ]}
             value={current.trayConfig.percentageFormat}
             onChange={(v) => handleTrayConfig("percentageFormat", v as TrayConfig["percentageFormat"])}
@@ -507,38 +553,6 @@
             ]}
             value={current.trayConfig.costPrecision}
             onChange={(v) => handleTrayConfig("costPrecision", v as TrayConfig["costPrecision"])}
-          />
-        </div>
-      </div>
-    </div>
-
-    <!-- Plan -->
-    <div class="group">
-      <div class="group-label">Plan</div>
-      <div class="card">
-        <div class="row border">
-          <span class="label">Claude Plan</span>
-          <SegmentedControl
-            options={[
-              { value: "0", label: "None" },
-              { value: "20", label: "$20" },
-              { value: "100", label: "$100" },
-              { value: "200", label: "$200" },
-            ]}
-            value={String(current.claudePlan)}
-            onChange={handleClaudePlan}
-          />
-        </div>
-        <div class="row">
-          <span class="label">Codex Plan</span>
-          <SegmentedControl
-            options={[
-              { value: "0", label: "None" },
-              { value: "20", label: "$20" },
-              { value: "200", label: "$200" },
-            ]}
-            value={String(current.codexPlan)}
-            onChange={handleCodexPlan}
           />
         </div>
       </div>
@@ -910,8 +924,6 @@
     height: 100%;
     border-radius: inherit;
   }
-  .tp-fill.claude { background: #d4a574; }
-  .tp-fill.codex { background: #7aafff; }
   .tp-text {
     font: 400 10px/1 'Inter', -apple-system, sans-serif;
     font-variant-numeric: tabular-nums;

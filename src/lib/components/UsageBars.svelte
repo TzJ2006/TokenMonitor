@@ -1,4 +1,9 @@
 <script lang="ts">
+  import {
+    formatRateLimitUtilizationLabel,
+    getRateLimitIdleSummary,
+    isRateLimitProvider,
+  } from "../providerMetadata.js";
   import { formatRetryIn } from "../utils/format.js";
   import {
     currentRateLimitWindows,
@@ -110,7 +115,9 @@
   }
 
   function utilizationLabel(pct: number): string {
-    if (rateLimits.provider === "codex") return `${pct}% used`;
+    if (isRateLimitProvider(rateLimits.provider)) {
+      return formatRateLimitUtilizationLabel(rateLimits.provider, pct);
+    }
     return `${pct}%`;
   }
 
@@ -122,7 +129,10 @@
       return retryLabel ? `${base} ${retryLabel}.` : base;
     }
     if (viewState === "idle") {
-      return "Usage is being recorded, but this Codex session has not emitted rate-limit metadata yet.";
+      if (isRateLimitProvider(rateLimits.provider)) {
+        return getRateLimitIdleSummary(rateLimits.provider);
+      }
+      return "Usage is being recorded, but this integration has not emitted rate-limit metadata yet.";
     }
     return "No active rate limit windows were returned for this provider.";
   }
