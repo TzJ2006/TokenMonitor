@@ -1,14 +1,13 @@
+import {
+  getRateLimitExpiredWindowGraceMs,
+  getRateLimitFallbackWindow,
+  isRateLimitMissingMetadataError,
+  isRateLimitProvider,
+} from "./providerMetadata.js";
 import { formatResetsIn, formatRetryIn } from "./utils/format.js";
 import type { ProviderRateLimits, RateLimitWindow } from "./types/index.js";
 
 export type ProviderRateLimitViewState = "ready" | "error" | "empty" | "idle";
-const RESETTING_GRACE_MS = 60_000;
-const CODEX_FIVE_HOUR_FALLBACK_WINDOW: RateLimitWindow = {
-  windowId: "primary",
-  label: "Session (5hr)",
-  utilization: 0,
-  resetsAt: null,
-};
 
 function resetAtMs(resetsAt: string | null): number | null {
   if (!resetsAt) return null;
@@ -16,38 +15,33 @@ function resetAtMs(resetsAt: string | null): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
-function isExpiredCodexWindow(
+function isExpiredProviderWindow(
   rateLimits: ProviderRateLimits | null | undefined,
   resetsAt: string | null,
   now: number,
 ): boolean {
-  if (rateLimits?.provider !== "codex") return false;
+  if (!rateLimits || !isRateLimitProvider(rateLimits.provider)) return false;
   if (providerHasActiveCooldown(rateLimits, now)) return false;
 
   const resetMs = resetAtMs(resetsAt);
   if (resetMs === null) return false;
 
-  return resetMs + RESETTING_GRACE_MS <= now;
+  const graceMs = getRateLimitExpiredWindowGraceMs(rateLimits.provider);
+  return graceMs > 0 && resetMs + graceMs <= now;
 }
 
-function isMissingCodexMetadataError(error: string | null): boolean {
-  if (!error) return true;
-
-  const normalized = error.toLowerCase();
-  return normalized.includes("no codex session files found")
-    || normalized.includes("no rate limit data in codex session files");
-}
-
-function fallbackCodexWindow(
+function fallbackProviderWindow(
   rateLimits: ProviderRateLimits | null | undefined,
   now: number,
 ): RateLimitWindow | null {
-  if (!rateLimits || rateLimits.provider !== "codex") return null;
+  if (!rateLimits || !isRateLimitProvider(rateLimits.provider)) return null;
+  const fallbackWindow = getRateLimitFallbackWindow(rateLimits.provider);
+  if (!fallbackWindow) return null;
   if (rateLimits.windows.length > 0) return null;
   if (providerHasActiveCooldown(rateLimits, now)) return null;
-  if (!isMissingCodexMetadataError(rateLimits.error)) return null;
+  if (!isRateLimitMissingMetadataError(rateLimits.provider, rateLimits.error)) return null;
 
-  return CODEX_FIVE_HOUR_FALLBACK_WINDOW;
+  return fallbackWindow;
 }
 
 export function currentRateLimitWindows(
@@ -56,12 +50,12 @@ export function currentRateLimitWindows(
 ): RateLimitWindow[] {
   if (!rateLimits) return [];
   const windows = rateLimits.windows.filter(
-    (window) => !isExpiredCodexWindow(rateLimits, window.resetsAt, now),
+    (window) => !isExpiredProviderWindow(rateLimits, window.resetsAt, now),
   );
 
   if (windows.length > 0) return windows;
 
-  const fallbackWindow = fallbackCodexWindow(rateLimits, now);
+  const fallbackWindow = fallbackProviderWindow(rateLimits, now);
   return fallbackWindow ? [fallbackWindow] : [];
 }
 
@@ -78,7 +72,14 @@ export function providerRateLimitViewState(
 ): ProviderRateLimitViewState {
   if (hasRateLimitWindows(rateLimits, now)) return "ready";
   if (rateLimits?.error) return "error";
-  if (rateLimits?.provider === "codex" && rateLimits.windows.length > 0) return "idle";
+  if (
+    rateLimits
+    && isRateLimitProvider(rateLimits.provider)
+    && getRateLimitExpiredWindowGraceMs(rateLimits.provider) > 0
+    && rateLimits.windows.length > 0
+  ) {
+    return "idle";
+  }
   return "empty";
 }
 
@@ -101,7 +102,7 @@ export function rateLimitWindowResetLabel(
   if (resetMs === null) return "";
 
   const shouldAwaitRefresh = resetMs <= now
-    && (rateLimits?.stale || isExpiredCodexWindow(rateLimits, resetsAt, now));
+    && (rateLimits?.stale || isExpiredProviderWindow(rateLimits, resetsAt, now));
 
   if (shouldAwaitRefresh) {
     if (providerHasActiveCooldown(rateLimits, now)) {

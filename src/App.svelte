@@ -14,9 +14,16 @@
     fetchData,
     warmCache,
     warmAllPeriods,
-    splitFiveHourData,
-    fetchSplitFiveHour,
   } from "./lib/stores/usage.js";
+  import {
+    ALL_USAGE_PROVIDER_ID,
+    DEFAULT_USAGE_PROVIDER,
+    getAdjacentWarmProviders,
+    getRateLimitIdleSummary,
+    getUsageProviderLabel,
+    isRateLimitProvider,
+    rateLimitProvidersForScope,
+  } from "./lib/providerMetadata.js";
 
   import {
     rateLimitsData,
@@ -24,6 +31,7 @@
     hydrateRateLimits,
     fetchRateLimits,
   } from "./lib/stores/rateLimits.js";
+  import { providerPayload } from "./lib/rateLimitMonitor.js";
   import {
     DEFAULT_HEADER_TABS,
     areHeaderTabsEqual,
@@ -72,13 +80,12 @@
   let appReady = $state(false);
   let showSettings = $state(false);
   let showCalendar = $state(false);
-  let provider = $state<UsageProvider>("claude");
+  let provider = $state<UsageProvider>(DEFAULT_USAGE_PROVIDER);
   let period = $state<UsagePeriod>("day");
   let offset = $state(0);
   let data = $state($usageData);
   let loading = $state(false);
   let showRefresh = $state(false);
-  let splitData = $state($splitFiveHourData);
   let rateLimits = $state<RateLimitsPayload | null>(null);
   let rateLimitsRequest = $state({
     loading: false,
@@ -97,6 +104,9 @@
       label: headerTabs[value].label,
     })),
   );
+  let visibleRateLimitProviders = $derived.by(() =>
+    rateLimitProvidersForScope(provider).filter((candidate) => Boolean(providerPayload(rateLimits, candidate))),
+  );
 
   // Subscribe to stores
   $effect(() => {
@@ -108,10 +118,9 @@
         headerTabs = s.headerTabs;
       }
     });
-    const unsub4 = splitFiveHourData.subscribe((v) => (splitData = v));
-    const unsub5 = rateLimitsData.subscribe((v) => (rateLimits = v));
-    const unsub6 = rateLimitsRequestState.subscribe((v) => (rateLimitsRequest = v));
-    return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5(); unsub6(); };
+    const unsub4 = rateLimitsData.subscribe((v) => (rateLimits = v));
+    const unsub5 = rateLimitsRequestState.subscribe((v) => (rateLimitsRequest = v));
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5(); };
   });
 
   // Apply/remove data-provider attribute reactively
@@ -160,8 +169,9 @@
     await tick();
     syncSizeAndVerify("provider-change");
     warmAllPeriods(nextProvider, period);
-    if (nextProvider === "claude") warmCache("codex", period);
-    else if (nextProvider === "codex") warmCache("claude", period);
+    for (const warmProvider of getAdjacentWarmProviders(nextProvider)) {
+      warmCache(warmProvider, period);
+    }
   }
 
   async function handlePeriodChange(p: UsagePeriod) {
@@ -561,8 +571,6 @@
 
       await fetchData(provider, period, offset);
       if (cancelled) return;
-      if (provider === "all" && period === "5h") await fetchSplitFiveHour();
-      if (cancelled) return;
       logResizeDebug("app:data-ready", {
         provider,
         period,
@@ -579,7 +587,9 @@
       await syncTrayConfig(get(settings).trayConfig, get(rateLimitsData)).catch(() => {});
       if (cancelled) return;
       warmAllPeriods(provider, period);
-      warmAllPeriods(provider === "claude" ? "codex" : "claude");
+      for (const warmProvider of getAdjacentWarmProviders(provider)) {
+        warmAllPeriods(warmProvider);
+      }
       appReady = true;
 
       if (popEl) {
@@ -604,7 +614,6 @@
           offset,
         });
         fetchData(provider, period, offset);
-        if (provider === "all" && period === "5h") fetchSplitFiveHour();
         if (period === "5h") fetchRateLimits(provider);
       });
 
@@ -693,28 +702,24 @@
       <MetricsRow {data} />
       <div class="hr"></div>
 
-      {#if period === "5h" && provider === "all" && (rateLimits?.claude || rateLimits?.codex)}
-        {#if rateLimits?.claude}
-          <UsageBars providerLabel="Claude" rateLimits={rateLimits.claude} />
-        {/if}
-        {#if rateLimits?.claude && rateLimits?.codex}
-          <div class="hr"></div>
-        {/if}
-        {#if rateLimits?.codex}
-          <UsageBars providerLabel="Codex" rateLimits={rateLimits.codex} />
-        {/if}
-      {:else if period === "5h" && provider === "claude" && rateLimits?.claude}
-        <UsageBars rateLimits={rateLimits.claude} />
-      {:else if period === "5h" && provider === "codex" && rateLimits?.codex}
-        <UsageBars rateLimits={rateLimits.codex} />
+      {#if period === "5h" && visibleRateLimitProviders.length > 0}
+        {#each visibleRateLimitProviders as rateLimitProvider, index}
+          <UsageBars
+            providerLabel={provider === ALL_USAGE_PROVIDER_ID ? getUsageProviderLabel(rateLimitProvider) : undefined}
+            rateLimits={providerPayload(rateLimits, rateLimitProvider)!}
+          />
+          {#if index < visibleRateLimitProviders.length - 1}
+            <div class="hr"></div>
+          {/if}
+        {/each}
       {:else if period === "5h" && rateLimitsRequest.loading}
         <div class="loading-bars"><div class="spinner"></div></div>
       {:else if period === "5h"}
         <div class="rate-limit-empty">
           <div class="rate-limit-empty-title">Rate limits unavailable</div>
           <div class="rate-limit-empty-text">
-            {#if provider === "codex" && (data.total_tokens > 0 || data.total_cost > 0)}
-              Codex usage is being recorded, but this session has not emitted rate-limit metadata yet.
+            {#if isRateLimitProvider(provider) && (data.total_tokens > 0 || data.total_cost > 0)}
+              {getRateLimitIdleSummary(provider)}
             {:else}
               {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
             {/if}

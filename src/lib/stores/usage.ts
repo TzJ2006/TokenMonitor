@@ -1,5 +1,6 @@
 import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
+import { DEFAULT_USAGE_PROVIDER } from "../providerMetadata.js";
 import type {
   UsagePayload,
   UsagePeriod,
@@ -7,17 +8,12 @@ import type {
 } from "../types/index.js";
 import { formatDebugError, isResizeDebugEnabled, logResizeDebug } from "../resizeDebug.js";
 
-export const activeProvider = writable<UsageProvider>("claude");
+export const activeProvider = writable<UsageProvider>(DEFAULT_USAGE_PROVIDER);
 export const activePeriod = writable<UsagePeriod>("day");
 export const activeOffset = writable<number>(0);
+export const chartMode = writable<"bar" | "line">("bar");
 export const usageData = writable<UsagePayload | null>(null);
 export const isLoading = writable(false);
-
-/** Per-provider 5h data, populated when provider="all" and period="5h". */
-export const splitFiveHourData = writable<{
-  claude: UsagePayload | null;
-  codex: UsagePayload | null;
-}>({ claude: null, codex: null });
 
 function emptyPayload(): UsagePayload {
   return {
@@ -60,8 +56,10 @@ function requestUsagePayload(
   return invoke<UsagePayload>("get_usage_data", { provider, period, offset });
 }
 
-function cachePayload(key: string, data: UsagePayload) {
+function cachePayload(key: string, data: UsagePayload, epoch: number = currentCacheEpoch) {
+  if (epoch !== currentCacheEpoch) return false;
   payloadCache.set(key, { data, at: Date.now() });
+  return true;
 }
 
 function applyUsageDataIfCurrent(requestId: number, data: UsagePayload): boolean {
@@ -75,6 +73,14 @@ function applyUsageDataIfCurrent(requestId: number, data: UsagePayload): boolean
 // Monotonically increasing request ID prevents stale responses from
 // overwriting fresh data when the user rapidly switches tabs.
 let currentRequestId = 0;
+let currentCacheEpoch = 0;
+
+export function clearUsageCache() {
+  payloadCache.clear();
+  currentCacheEpoch += 1;
+  currentRequestId += 1;
+  isLoading.set(false);
+}
 
 async function logUsageReadDebug(
   type: string,
@@ -110,6 +116,7 @@ export async function fetchData(
   offset: number = 0,
 ) {
   const requestId = ++currentRequestId;
+  const cacheEpoch = currentCacheEpoch;
   const key = cacheKey(provider, period, offset);
   logResizeDebug("usage:fetch-start", {
     provider,
@@ -138,7 +145,7 @@ export async function fetchData(
     // Silent background refresh — no loading indicator
     requestUsagePayload(provider, period, offset)
       .then((fresh: UsagePayload) => {
-        cachePayload(key, fresh);
+        cachePayload(key, fresh, cacheEpoch);
         const appliedToUi = applyUsageDataIfCurrent(requestId, fresh);
         void logUsageReadDebug("usage:background-refresh-resolved", {
           provider,
@@ -175,7 +182,7 @@ export async function fetchData(
   isLoading.set(true);
   try {
     const data = await requestUsagePayload(provider, period, offset);
-    cachePayload(key, data);
+    cachePayload(key, data, cacheEpoch);
     const appliedToUi = applyUsageDataIfCurrent(requestId, data);
     await logUsageReadDebug("usage:fetch-resolved", {
       provider,
@@ -216,9 +223,10 @@ export function warmCache(
   offset: number = 0,
 ) {
   const key = cacheKey(provider, period, offset);
+  const cacheEpoch = currentCacheEpoch;
   requestUsagePayload(provider, period, offset)
     .then((data: UsagePayload) => {
-      cachePayload(key, data);
+      cachePayload(key, data, cacheEpoch);
       void logUsageReadDebug("usage:warm-cache-resolved", {
         provider,
         period,
@@ -249,18 +257,4 @@ export function warmAllPeriods(provider: UsageProvider, skipPeriod?: UsagePeriod
   for (const p of WARM_PERIODS) {
     if (p !== skipPeriod) warmCache(provider, p);
   }
-}
-
-/**
- * Fetch per-provider 5h data for the split view (all provider, 5h period).
- * Fetches Claude and Codex independently and stores results in splitFiveHourData.
- */
-export async function fetchSplitFiveHour() {
-  const [claude, codex] = await Promise.all([
-    requestUsagePayload("claude", "5h", 0),
-    requestUsagePayload("codex", "5h", 0),
-  ]);
-  cachePayload(cacheKey("claude", "5h", 0), claude);
-  cachePayload(cacheKey("codex", "5h", 0), codex);
-  splitFiveHourData.set({ claude, codex });
 }

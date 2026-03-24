@@ -1,18 +1,14 @@
-import type { DefaultProvider, TrayConfig, RateLimitsPayload } from "./types/index.js";
+import { getUsageProviderTitle, RATE_LIMIT_PROVIDER_ORDER } from "./providerMetadata.js";
+import type { RateLimitProviderId, TrayConfig, RateLimitsPayload } from "./types/index.js";
 import { primaryUtilization as rawUtilization } from "./traySync.js";
 
 function primaryPct(
   rateLimits: RateLimitsPayload | null,
-  provider: DefaultProvider,
+  provider: RateLimitProviderId,
 ): number | null {
   const val = rawUtilization(rateLimits, provider);
   return val !== null ? Math.round(val) : null;
 }
-
-const PROVIDER_LABELS: Array<{ provider: DefaultProvider; label: string }> = [
-  { provider: 'claude', label: 'Claude Code' },
-  { provider: 'codex', label: 'Codex' },
-];
 
 function formatPercentages(
   config: TrayConfig,
@@ -20,8 +16,11 @@ function formatPercentages(
 ): string | null {
   if (!config.showPercentages) return null;
 
-  const entries = PROVIDER_LABELS
-    .map(({ provider, label }) => ({ label, pct: primaryPct(rateLimits, provider) }))
+  const entries = RATE_LIMIT_PROVIDER_ORDER
+    .map((provider) => ({
+      label: getUsageProviderTitle(provider),
+      pct: primaryPct(rateLimits, provider),
+    }))
     .filter((e): e is { label: string; pct: number } => e.pct !== null);
 
   if (entries.length === 0) return null;

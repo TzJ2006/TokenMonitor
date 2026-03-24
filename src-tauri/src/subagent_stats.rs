@@ -134,12 +134,7 @@ impl ScopeSummaryBuilder {
             .into_iter()
             .take(2)
             .map(|(raw_model, accum)| {
-                let (display_name, model_key) = if crate::models::is_codex_model_name(&raw_model) {
-                    crate::models::normalize_codex_model(&raw_model)
-                } else {
-                    let (d, k) = crate::models::normalize_claude_model(&raw_model);
-                    (d.to_string(), k.to_string())
-                };
+                let (display_name, model_key) = crate::models::normalize_model(&raw_model);
                 ScopeModelUsage {
                     display_name,
                     model_key,

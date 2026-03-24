@@ -2,6 +2,7 @@ import { derived, get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import {
+  createRateLimitsPayload,
   createRateLimitsMonitorState,
   eligibleProviders,
   hasUsableRateLimitWindows,
@@ -161,7 +162,7 @@ function scheduleScopeRetries(
 }
 
 function mergedPayloadOrNull(payload: RateLimitsPayload): RateLimitsPayload | null {
-  if (!payload.claude && !payload.codex) return null;
+  if (RATE_LIMIT_PROVIDER_ORDER.every((provider) => !payload[provider])) return null;
   return payload;
 }
 
@@ -271,35 +272,42 @@ export async function hydrateRateLimits(): Promise<void> {
 
   hydratePromise = (async () => {
     try {
-      const [legacyPayload, claudeRecord, codexRecord] = await Promise.all([
+      const [legacyPayload, ...providerRecords] = await Promise.all([
         readLegacyPayload(),
-        readPersistedProviderRecord("claude"),
-        readPersistedProviderRecord("codex"),
+        ...RATE_LIMIT_PROVIDER_ORDER.map((provider) => readPersistedProviderRecord(provider)),
       ]);
 
-      const payload: RateLimitsPayload = {
-        claude: claudeRecord.payload ?? legacyPayload?.claude ?? null,
-        codex: codexRecord.payload ?? legacyPayload?.codex ?? null,
-      };
+      const recordMap = RATE_LIMIT_PROVIDER_ORDER.reduce((map, provider, index) => {
+        map[provider] = providerRecords[index];
+        return map;
+      }, {} as Record<RateLimitProvider, PersistedProviderRateLimitRecord>);
+
+      const payload = RATE_LIMIT_PROVIDER_ORDER.reduce((nextPayload, provider) => {
+        nextPayload[provider] = recordMap[provider]?.payload ?? legacyPayload?.[provider] ?? null;
+        return nextPayload;
+      }, createRateLimitsPayload());
 
       const normalizedPayload = mergedPayloadOrNull(payload);
       if (normalizedPayload) {
         rateLimitsData.set(normalizedPayload);
       }
 
-      const claudeLastSuccess = claudeRecord.lastSuccessfulAt ?? inferLastSuccessfulAt(payload.claude);
-      const codexLastSuccess = codexRecord.lastSuccessfulAt ?? inferLastSuccessfulAt(payload.codex);
-
-      hydrateProviderMonitorState("claude", payload.claude, claudeLastSuccess);
-      hydrateProviderMonitorState("codex", payload.codex, codexLastSuccess);
+      for (const provider of RATE_LIMIT_PROVIDER_ORDER) {
+        const lastSuccessfulAt =
+          recordMap[provider]?.lastSuccessfulAt ?? inferLastSuccessfulAt(payload[provider]);
+        hydrateProviderMonitorState(provider, payload[provider], lastSuccessfulAt);
+      }
 
       if (legacyPayload) {
         const migrations: Promise<void>[] = [];
-        if (!claudeRecord.payload && payload.claude) {
-          migrations.push(persistProviderRecord("claude", payload.claude, claudeLastSuccess));
-        }
-        if (!codexRecord.payload && payload.codex) {
-          migrations.push(persistProviderRecord("codex", payload.codex, codexLastSuccess));
+        for (const provider of RATE_LIMIT_PROVIDER_ORDER) {
+          const record = recordMap[provider];
+          const providerPayload = payload[provider];
+          const lastSuccessfulAt =
+            record?.lastSuccessfulAt ?? inferLastSuccessfulAt(providerPayload);
+          if (!record?.payload && providerPayload) {
+            migrations.push(persistProviderRecord(provider, providerPayload, lastSuccessfulAt));
+          }
         }
         await Promise.all(migrations);
       }

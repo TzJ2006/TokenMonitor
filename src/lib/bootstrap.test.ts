@@ -29,8 +29,6 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
       showCost: true,
       costPrecision: 'full',
     },
-    claudePlan: 0,
-    codexPlan: 0,
     glassEffect: true,
     showModelChangeStats: false,
     ...overrides,

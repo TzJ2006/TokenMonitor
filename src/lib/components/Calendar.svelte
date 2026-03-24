@@ -7,6 +7,7 @@
   import { intensityLevel, computeEarned, heatmapColor } from "../calendar-utils.js";
   import { formatDebugError, isResizeDebugEnabled, logResizeDebug } from "../resizeDebug.js";
   import { rateLimitsData } from "../stores/rateLimits.js";
+  import { isRateLimitProvider } from "../providerMetadata.js";
   import type { MonthlyUsagePayload, RateLimitsPayload, UsageProvider } from "../types/index.js";
 
   interface Props {
@@ -163,8 +164,7 @@
   }
 
   let detectedPlanTier = $derived.by(() => {
-    if (provider === "claude") return rateLimits?.claude?.planTier ?? null;
-    if (provider === "codex") return rateLimits?.codex?.planTier ?? null;
+    if (isRateLimitProvider(provider)) return rateLimits?.[provider]?.planTier ?? null;
     return null;
   });
 

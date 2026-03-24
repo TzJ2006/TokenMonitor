@@ -1,5 +1,7 @@
-export type UsageProvider = "all" | "claude" | "codex";
-export type DefaultProvider = Exclude<UsageProvider, "all">;
+export const ALL_USAGE_PROVIDER_ID = "all";
+
+export type UsageProvider = string;
+export type RateLimitProviderId = string;
 export type UsagePeriod = "5h" | "day" | "week" | "month" | "year";
 export type DefaultPeriod = Exclude<UsagePeriod, "year">;
 
@@ -8,7 +10,7 @@ export interface HeaderTabConfig {
   enabled: boolean;
 }
 
-export type HeaderTabs = Record<UsageProvider, HeaderTabConfig>;
+export type HeaderTabs = Record<string, HeaderTabConfig>;
 
 export interface UsagePayload {
   total_cost: number;
@@ -164,10 +166,7 @@ export interface ProviderRateLimits {
   fetchedAt: string;
 }
 
-export interface RateLimitsPayload {
-  claude: ProviderRateLimits | null;
-  codex: ProviderRateLimits | null;
-}
+export type RateLimitsPayload = Record<RateLimitProviderId, ProviderRateLimits | null>;
 
 export type BarDisplay = 'off' | 'single' | 'both';
 export type PercentageFormat = 'compact' | 'verbose';
@@ -175,7 +174,7 @@ export type CostPrecision = 'whole' | 'full';
 
 export interface TrayConfig {
   barDisplay: BarDisplay;
-  barProvider: DefaultProvider;
+  barProvider: RateLimitProviderId;
   showPercentages: boolean;
   percentageFormat: PercentageFormat;
   showCost: boolean;
@@ -195,7 +194,4 @@ export interface RateLimitProviderMonitorState extends RateLimitRequestState {
   lastSuccessAt: string | null;
 }
 
-export interface RateLimitsMonitorState {
-  claude: RateLimitProviderMonitorState;
-  codex: RateLimitProviderMonitorState;
-}
+export type RateLimitsMonitorState = Record<RateLimitProviderId, RateLimitProviderMonitorState>;

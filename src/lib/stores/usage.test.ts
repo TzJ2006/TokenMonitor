@@ -300,6 +300,37 @@ describe("warmCache", () => {
       expect(get(usageData)).toEqual(fresh);
     });
   });
+
+  it("does not let a cleared cache be repopulated by an older in-flight warm request", async () => {
+    const { clearUsageCache, warmCache, fetchData, usageData, isLoading } = await loadUsageModule();
+    const warmRequest = deferred<UsagePayload>();
+    mockInvoke.mockReturnValueOnce(warmRequest.promise);
+
+    warmCache("claude", "month");
+    clearUsageCache();
+
+    warmRequest.resolve(makePayload({ total_cost: 6.4 }));
+    await Promise.resolve();
+
+    const coldRequest = deferred<UsagePayload>();
+    mockInvoke.mockReturnValueOnce(coldRequest.promise);
+
+    const fetchPromise = fetchData("claude", "month");
+
+    expect(get(isLoading)).toBe(true);
+    expect(get(usageData)).toEqual(
+      expect.objectContaining({
+        total_cost: 0,
+        total_tokens: 0,
+        session_count: 0,
+      }),
+    );
+
+    coldRequest.resolve(makePayload({ total_cost: 7.1 }));
+    await fetchPromise;
+
+    expect(get(usageData)).toEqual(expect.objectContaining({ total_cost: 7.1 }));
+  });
 });
 
 describe("warmAllPeriods", () => {
