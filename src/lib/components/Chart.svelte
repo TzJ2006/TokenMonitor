@@ -309,6 +309,7 @@
               {@const niceM = niceMax(maxCost)}
               {@const x = barX(i)}
               {@const isActive = hoveredIdx === i}
+              {@const segs = sortedSegments(bucket)}
               <g
                 class="bar-group"
                 role="img"
@@ -320,10 +321,10 @@
                 <!-- Invisible hit area -->
                 <rect x={x - 1} y="0" width={barWidth + 2} height={CHART_H} fill="transparent"/>
 
-                <!-- Stacked segments (bottom to top) -->
-                {#each bucket.segments as seg, si}
+                <!-- Stacked segments (bottom to top, sorted by cost desc) -->
+                {#each segs as seg, si}
                   {@const segH = (seg.cost / niceM) * CHART_H}
-                  {@const prevH = bucket.segments.slice(0, si).reduce((a, s) => a + (s.cost / niceM) * CHART_H, 0)}
+                  {@const prevH = segs.slice(0, si).reduce((a, s) => a + (s.cost / niceM) * CHART_H, 0)}
                   {@const segY = CHART_H - prevH - segH}
                   <rect
                     x={x}
