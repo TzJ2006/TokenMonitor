@@ -1,3 +1,4 @@
+use chrono::Timelike;
 use tauri::State;
 
 use crate::commands::AppState;
@@ -206,7 +207,7 @@ pub async fn get_device_usage(
 ) -> Result<DeviceUsagePayload, String> {
     use crate::commands::period::{compute_date_bounds, format_day_label};
 
-    let (since, _end) =
+    let (since, end) =
         compute_date_bounds(&period, offset).ok_or_else(|| format!("Invalid period: {period}"))?;
 
     let period_label = format_day_label(since);
@@ -214,7 +215,7 @@ pub async fn get_device_usage(
 
     // 1. Local device usage (all providers combined).
     let (local_entries, _, _) = parser.load_entries("all", Some(since));
-    let mut local_summary = build_device_summary_from_parsed("Local", &local_entries, since);
+    let mut local_summary = build_device_summary_from_parsed("Local", &local_entries, since, end);
     local_summary.is_local = true;
     local_summary.status = String::from("online");
 
@@ -229,7 +230,8 @@ pub async fn get_device_usage(
         let statuses = mgr.host_statuses(&configs);
         for cfg in configs.iter().filter(|c| c.enabled) {
             let records = mgr.load_cached_records(&cfg.alias);
-            let mut summary = build_device_summary_from_compact(&cfg.alias, &records, since);
+            let mut summary =
+                build_device_summary_from_compact(&cfg.alias, &records, since, end);
 
             // Enrich with status from cache manager.
             if let Some(host_status) = statuses.iter().find(|s| s.alias == cfg.alias) {
@@ -272,6 +274,7 @@ fn build_device_summary_from_parsed(
     device_name: &str,
     entries: &[crate::usage::parser::ParsedEntry],
     _since: chrono::NaiveDate,
+    end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
     use crate::usage::pricing::calculate_cost_for_key;
@@ -280,6 +283,10 @@ fn build_device_summary_from_parsed(
     let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
 
     for entry in entries {
+        if entry.timestamp.date_naive() >= end {
+            continue;
+        }
+
         let (display_name, model_key) = normalize_model(&entry.model);
         let cost = calculate_cost_for_key(
             &model_key,
@@ -306,6 +313,7 @@ fn build_device_summary_from_compact(
     device_name: &str,
     records: &[CompactUsageRecord],
     since: chrono::NaiveDate,
+    end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
     use crate::usage::pricing::calculate_cost_for_key;
@@ -319,13 +327,13 @@ fn build_device_summary_from_compact(
             continue;
         }
 
-        // Filter by date.
+        // Filter by date range [since, end).
         let record_date = chrono::DateTime::parse_from_rfc3339(&record.ts)
             .or_else(|_| chrono::DateTime::parse_from_str(&record.ts, "%Y-%m-%dT%H:%M:%S%.f%z"))
             .map(|dt| dt.date_naive())
             .unwrap_or(chrono::NaiveDate::MIN);
 
-        if record_date < since {
+        if record_date < since || record_date >= end {
             continue;
         }
 
@@ -415,11 +423,11 @@ pub(crate) async fn build_device_breakdown_for_payload(
         return None;
     }
 
-    let (since, _end) = compute_date_bounds(period, offset)?;
+    let (since, end) = compute_date_bounds(period, offset)?;
     let parser = &state.parser;
 
     let (local_entries, _, _) = parser.load_entries(provider, Some(since));
-    let mut local_summary = build_device_summary_from_parsed("Local", &local_entries, since);
+    let mut local_summary = build_device_summary_from_parsed("Local", &local_entries, since, end);
     local_summary.is_local = true;
     local_summary.status = String::from("online");
 
@@ -443,7 +451,8 @@ pub(crate) async fn build_device_breakdown_for_payload(
             if filtered.is_empty() {
                 continue;
             }
-            let mut summary = build_device_summary_from_compact(&cfg.alias, &filtered, since);
+            let mut summary =
+                build_device_summary_from_compact(&cfg.alias, &filtered, since, end);
 
             if let Some(host_status) = statuses.iter().find(|s| s.alias == cfg.alias) {
                 summary.last_synced = host_status.last_sync.clone();
@@ -608,8 +617,9 @@ pub(crate) async fn build_included_devices_payload(
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             let total: f64 = segments.iter().map(|s| s.cost).sum();
+            let label = bucket_label_for_key(&key, period);
             ChartBucket {
-                label: key.clone(),
+                label,
                 sort_key: key,
                 total,
                 segments,
@@ -748,8 +758,9 @@ pub(crate) async fn build_device_time_chart_buckets(
                     .partial_cmp(&a.cost)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+            let label = bucket_label_for_key(&key, period);
             ChartBucket {
-                label: key.clone(),
+                label,
                 sort_key: key,
                 total,
                 segments,
@@ -761,21 +772,52 @@ pub(crate) async fn build_device_time_chart_buckets(
     Some(buckets)
 }
 
-/// Map a date to a bucket key based on the period granularity.
 /// Map a timestamp to a bucket key matching the main chart's bucketing.
 ///
 /// - 5h: per-hour (`%Y-%m-%dT%H:00:00` with timezone offset)
-/// - day: per-day (`%Y-%m-%d`)
+/// - day: per-hour (`%H` → "00"–"23", matches `get_hourly` sort_key)
 /// - week/month: per-day (`%Y-%m-%d`)
 /// - year: per-month (`%Y-%m`)
 fn bucket_key_for_timestamp(ts: &chrono::DateTime<chrono::FixedOffset>, period: &str) -> String {
     let local = ts.with_timezone(&chrono::Local);
     match period {
         "5h" => local.format("%Y-%m-%dT%H:00:00%z").to_string(),
-        "day" | "week" | "month" => local.format("%Y-%m-%d").to_string(),
+        "day" => format!("{:02}", local.hour()),
+        "week" | "month" => local.format("%Y-%m-%d").to_string(),
         "year" => local.format("%Y-%m").to_string(),
         _ => local.format("%Y-%m-%d").to_string(),
     }
+}
+
+/// Convert a bucket sort_key back to a display label matching the main chart.
+///
+/// - `day`: sort_key `"00"`–`"23"` → `format_hour` ("12AM", "9AM", …)
+/// - `week`/`month`: sort_key `"2026-03-30"` → `"%b %-d"` ("Mar 30")
+/// - `year`: sort_key `"2026-03"` → `"%b"` ("Mar")
+/// - fallback: return sort_key as-is
+fn bucket_label_for_key(sort_key: &str, period: &str) -> String {
+    match period {
+        "day" => {
+            if let Ok(h) = sort_key.parse::<u32>() {
+                return crate::usage::parser::format_hour(h);
+            }
+        }
+        "week" | "month" => {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(sort_key, "%Y-%m-%d") {
+                return d.format("%b %-d").to_string();
+            }
+        }
+        "year" => {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(
+                &format!("{}-01", sort_key),
+                "%Y-%m-%d",
+            ) {
+                return d.format("%b").to_string();
+            }
+        }
+        _ => {}
+    }
+    sort_key.to_string()
 }
 
 /// Get usage data for a single device.

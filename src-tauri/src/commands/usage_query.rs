@@ -348,7 +348,7 @@ fn merge_payloads(mut c: UsagePayload, x: UsagePayload) -> UsagePayload {
     c.from_cache = c.from_cache && x.from_cache;
     c.usage_source = merge_usage_source(c.usage_source, x.usage_source);
     c.usage_warning = merge_usage_warning(c.usage_warning, x.usage_warning);
-    c.has_earlier_data = c.has_earlier_data && x.has_earlier_data;
+    c.has_earlier_data = c.has_earlier_data || x.has_earlier_data;
     c
 }
 
