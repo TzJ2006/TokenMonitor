@@ -24,6 +24,7 @@ use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_positioner::{Position, WindowExt};
 
 /// Extract (x, y) from a `tauri::Position` enum as physical-pixel f64.
+#[cfg(not(target_os = "windows"))]
 fn pos_xy(p: &tauri::Position) -> (f64, f64) {
     match p {
         tauri::Position::Physical(ph) => (ph.x as f64, ph.y as f64),
@@ -32,6 +33,7 @@ fn pos_xy(p: &tauri::Position) -> (f64, f64) {
 }
 
 /// Extract (w, h) from a `tauri::Size` enum as physical-pixel f64.
+#[cfg(not(target_os = "windows"))]
 fn size_wh(s: &tauri::Size) -> (f64, f64) {
     match s {
         tauri::Size::Physical(ph) => (ph.width as f64, ph.height as f64),
@@ -152,6 +154,7 @@ pub fn run() {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
+                        #[cfg(not(target_os = "windows"))]
                         rect,
                         ..
                     } = event
