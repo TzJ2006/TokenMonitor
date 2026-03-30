@@ -23,10 +23,59 @@ use tauri_plugin_autostart::MacosLauncher;
 #[cfg(not(target_os = "windows"))]
 use tauri_plugin_positioner::{Position, WindowExt};
 
-/// Try to position the window near the tray icon.
-/// `tauri-plugin-positioner` panics (instead of returning `Err`) when the tray
-/// position has not been recorded yet — common on Linux where `on_tray_event`
-/// may never capture coordinates.  We catch the panic and fall back to TopRight.
+/// Extract (x, y) from a `tauri::Position` enum as physical-pixel f64.
+fn pos_xy(p: &tauri::Position) -> (f64, f64) {
+    match p {
+        tauri::Position::Physical(ph) => (ph.x as f64, ph.y as f64),
+        tauri::Position::Logical(lo) => (lo.x, lo.y),
+    }
+}
+
+/// Extract (w, h) from a `tauri::Size` enum as physical-pixel f64.
+fn size_wh(s: &tauri::Size) -> (f64, f64) {
+    match s {
+        tauri::Size::Physical(ph) => (ph.width as f64, ph.height as f64),
+        tauri::Size::Logical(lo) => (lo.width, lo.height),
+    }
+}
+
+/// Position the window centered below the tray icon using the rect from the
+/// click event.  Falls back to `tauri-plugin-positioner` if the rect looks
+/// invalid (zero-sized), and ultimately to `TopRight`.
+#[cfg(not(target_os = "windows"))]
+fn move_window_below_tray(window: &tauri::WebviewWindow, tray_rect: &tauri::Rect) {
+    let (tw, th) = size_wh(&tray_rect.size);
+    let (tx, ty) = pos_xy(&tray_rect.position);
+
+    // Only use manual positioning when the rect is plausible.
+    if tw > 0.0 && th > 0.0 {
+        let win_size = window
+            .outer_size()
+            .unwrap_or(tauri::PhysicalSize::new(680, 600));
+        let x = tx + tw / 2.0 - win_size.width as f64 / 2.0;
+        let y = ty + th;
+        tracing::debug!(
+            tray_x = tx, tray_y = ty, tray_w = tw, tray_h = th,
+            win_x = x, win_y = y,
+            "Positioning window below tray icon"
+        );
+        let _ = window.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+        return;
+    }
+
+    // Fallback: positioner plugin → TopRight
+    tracing::debug!("Tray rect invalid, falling back to positioner plugin");
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let ok = catch_unwind(AssertUnwindSafe(|| window.move_window(Position::TrayCenter)))
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    if !ok {
+        tracing::debug!("TrayCenter unavailable, falling back to TopRight");
+        let _ = window.move_window(Position::TopRight);
+    }
+}
+
+/// Fallback positioning when no tray rect is available (e.g. right-click menu "Show").
 #[cfg(not(target_os = "windows"))]
 fn move_window_near_tray(window: &tauri::WebviewWindow) {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -34,7 +83,7 @@ fn move_window_near_tray(window: &tauri::WebviewWindow) {
         .map(|r| r.is_ok())
         .unwrap_or(false);
     if !ok {
-        tracing::debug!("TrayCenter unavailable (common on Linux), falling back to TopRight");
+        tracing::debug!("TrayCenter unavailable, falling back to TopRight");
         let _ = window.move_window(Position::TopRight);
     }
 }
@@ -83,16 +132,14 @@ pub fn run() {
                         app.exit(0);
                     } else if event.id() == "show" {
                         if let Some(window) = app.get_webview_window("main") {
-                            if window.current_monitor().ok().flatten().is_some() {
-                                #[cfg(target_os = "windows")]
-                                {
-                                    platform::windows::window::position_near_tray(&window);
-                                }
-                                #[cfg(not(target_os = "windows"))]
-                                {
-                                    move_window_near_tray(&window);
-                                    platform::clamp_window_to_work_area(&window);
-                                }
+                            #[cfg(target_os = "windows")]
+                            {
+                                platform::windows::window::position_near_tray(&window);
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                move_window_near_tray(&window);
+                                platform::clamp_window_to_work_area(&window);
                             }
                             let _ = window.show();
                             let _ = window.set_focus();
@@ -105,6 +152,7 @@ pub fn run() {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
+                        rect,
                         ..
                     } = event
                     {
@@ -113,17 +161,14 @@ pub fn run() {
                             if window.is_visible().unwrap_or(false) {
                                 let _ = window.hide();
                             } else {
-                                if window.current_monitor().ok().flatten().is_some() {
-                                    #[cfg(target_os = "windows")]
-                                    {
-                                        // Use Win32 APIs to position near system tray directly
-                                        platform::windows::window::position_near_tray(&window);
-                                    }
-                                    #[cfg(not(target_os = "windows"))]
-                                    {
-                                        move_window_near_tray(&window);
-                                        platform::clamp_window_to_work_area(&window);
-                                    }
+                                #[cfg(target_os = "windows")]
+                                {
+                                    platform::windows::window::position_near_tray(&window);
+                                }
+                                #[cfg(not(target_os = "windows"))]
+                                {
+                                    move_window_below_tray(&window, &rect);
+                                    platform::clamp_window_to_work_area(&window);
                                 }
                                 let _ = window.show();
                                 let _ = window.set_focus();
