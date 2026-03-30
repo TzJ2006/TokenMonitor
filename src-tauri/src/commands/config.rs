@@ -46,10 +46,14 @@ pub async fn set_dock_icon_visible(app: tauri::AppHandle, visible: bool) -> Resu
 
         crate::platform::macos::set_dock_icon_visible(&app, visible)?;
 
-        // Re-focus main window after the policy change so it stays visible.
+        // Re-focus main window after the policy change so it stays visible,
+        // but only if it was already showing — avoid pulling a hidden window
+        // to the center of the screen on startup.
         if let Some(win) = app.get_webview_window("main") {
-            let _ = win.show();
-            let _ = win.set_focus();
+            if win.is_visible().unwrap_or(false) {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
         }
     }
 
