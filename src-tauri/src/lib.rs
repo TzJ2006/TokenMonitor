@@ -74,12 +74,12 @@ pub fn run() {
                                 }
                                 #[cfg(not(target_os = "windows"))]
                                 {
-                                    let position = if cfg!(target_os = "macos") {
-                                        Position::TrayCenter
-                                    } else {
-                                        Position::TrayBottomCenter
-                                    };
-                                    let _ = window.move_window(position);
+                                    // TrayCenter works for both macOS menu bar and
+                                    // Linux top-panel desktops (GNOME, etc.).
+                                    // Fall back to TopRight if tray position is unavailable.
+                                    if window.move_window(Position::TrayCenter).is_err() {
+                                        let _ = window.move_window(Position::TopRight);
+                                    }
                                     platform::clamp_window_to_work_area(&window);
                                 }
                             }
@@ -110,13 +110,12 @@ pub fn run() {
                                     }
                                     #[cfg(not(target_os = "windows"))]
                                     {
-                                        // macOS: center on menu bar icon; Linux: bottom-align above taskbar tray
-                                        let position = if cfg!(target_os = "macos") {
-                                            Position::TrayCenter
-                                        } else {
-                                            Position::TrayBottomCenter
-                                        };
-                                        let _ = window.move_window(position);
+                                        // TrayCenter works for both macOS menu bar and
+                                        // Linux top-panel desktops (GNOME, etc.).
+                                        // Fall back to TopRight if tray position is unavailable.
+                                        if window.move_window(Position::TrayCenter).is_err() {
+                                            let _ = window.move_window(Position::TopRight);
+                                        }
                                         platform::clamp_window_to_work_area(&window);
                                     }
                                 }

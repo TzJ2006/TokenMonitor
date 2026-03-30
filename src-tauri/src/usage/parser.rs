@@ -1347,7 +1347,7 @@ pub fn read_codex_entries(sessions_dir: &Path, since: Option<NaiveDate>) -> Vec<
 // Hour label helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn format_hour(h: u32) -> String {
+pub(crate) fn format_hour(h: u32) -> String {
     match h {
         0 => "12AM".into(),
         1..=11 => format!("{}AM", h),
