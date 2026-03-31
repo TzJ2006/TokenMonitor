@@ -1,5 +1,6 @@
 //! Linux-specific platform code.
 
+use std::time::Duration;
 use tauri::{Manager, WebviewWindow};
 
 /// Position the window in the top-right corner of the work area.
@@ -47,4 +48,18 @@ pub fn position_top_right(window: &WebviewWindow) {
         "position_top_right: placing window"
     );
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+/// Spawn a deferred re-position after a short delay.
+///
+/// Linux window managers process `show()` asynchronously — on the very first
+/// show the WM may not have realized the window yet, causing `set_position` to
+/// be ignored or overridden. This function waits briefly, then re-applies the
+/// top-right position on the main thread.
+pub fn deferred_reposition(window: WebviewWindow) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        position_top_right(&window);
+        super::clamp_window_to_work_area(&window);
+    });
 }
