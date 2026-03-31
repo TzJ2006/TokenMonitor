@@ -57,8 +57,12 @@ fn move_window_below_tray(window: &tauri::WebviewWindow, tray_rect: &tauri::Rect
         let x = tx + tw / 2.0 - win_size.width as f64 / 2.0;
         let y = ty + th;
         tracing::debug!(
-            tray_x = tx, tray_y = ty, tray_w = tw, tray_h = th,
-            win_x = x, win_y = y,
+            tray_x = tx,
+            tray_y = ty,
+            tray_w = tw,
+            tray_h = th,
+            win_x = x,
+            win_y = y,
             "Positioning window below tray icon"
         );
         let _ = window.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
@@ -68,9 +72,11 @@ fn move_window_below_tray(window: &tauri::WebviewWindow, tray_rect: &tauri::Rect
     // Fallback: positioner plugin → TopRight
     tracing::debug!("Tray rect invalid, falling back to positioner plugin");
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    let ok = catch_unwind(AssertUnwindSafe(|| window.move_window(Position::TrayCenter)))
-        .map(|r| r.is_ok())
-        .unwrap_or(false);
+    let ok = catch_unwind(AssertUnwindSafe(|| {
+        window.move_window(Position::TrayCenter)
+    }))
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
     if !ok {
         tracing::debug!("TrayCenter unavailable, falling back to TopRight");
         let _ = window.move_window(Position::TopRight);
@@ -81,9 +87,11 @@ fn move_window_below_tray(window: &tauri::WebviewWindow, tray_rect: &tauri::Rect
 #[cfg(target_os = "macos")]
 fn move_window_near_tray(window: &tauri::WebviewWindow) {
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    let ok = catch_unwind(AssertUnwindSafe(|| window.move_window(Position::TrayCenter)))
-        .map(|r| r.is_ok())
-        .unwrap_or(false);
+    let ok = catch_unwind(AssertUnwindSafe(|| {
+        window.move_window(Position::TrayCenter)
+    }))
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
     if !ok {
         tracing::debug!("TrayCenter unavailable, falling back to TopRight");
         let _ = window.move_window(Position::TopRight);
@@ -137,6 +145,7 @@ pub fn run() {
                             #[cfg(target_os = "windows")]
                             {
                                 platform::windows::window::position_near_tray(&window);
+                                let _ = window.show();
                             }
                             #[cfg(target_os = "linux")]
                             {
@@ -150,9 +159,8 @@ pub fn run() {
                             {
                                 move_window_near_tray(&window);
                                 platform::clamp_window_to_work_area(&window);
+                                let _ = window.show();
                             }
-                            #[cfg(not(target_os = "linux"))]
-                            let _ = window.show();
                             let _ = window.set_focus();
                         }
                     }
@@ -176,6 +184,7 @@ pub fn run() {
                                 #[cfg(target_os = "windows")]
                                 {
                                     platform::windows::window::position_near_tray(&window);
+                                    let _ = window.show();
                                 }
                                 #[cfg(target_os = "linux")]
                                 {
@@ -189,9 +198,8 @@ pub fn run() {
                                 {
                                     move_window_below_tray(&window, &rect);
                                     platform::clamp_window_to_work_area(&window);
+                                    let _ = window.show();
                                 }
-                                #[cfg(not(target_os = "linux"))]
-                                let _ = window.show();
                                 let _ = window.set_focus();
                             }
                         }

@@ -133,12 +133,12 @@ pub async fn test_connection(alias: &str) -> SshTestResult {
 /// The script searches `~/.claude/projects/` and `~/.config/claude/projects/`
 /// for .jsonl files, extracts assistant entries with usage data, and outputs
 /// compact JSON records.
-fn build_extraction_script(since_epoch: Option<u64>) -> String {
-    let newer_filter = since_epoch
+fn build_extraction_script(claude_since: Option<u64>, codex_since: Option<u64>) -> String {
+    let newer_filter = claude_since
         .map(|ts| format!(" -newer /tmp/.tm-marker-{ts}"))
         .unwrap_or_default();
 
-    let touch_cmd = since_epoch
+    let touch_cmd = claude_since
         .map(|ts| format!("touch -d @{ts} /tmp/.tm-marker-{ts} 2>/dev/null; "))
         .unwrap_or_default();
 
@@ -150,11 +150,15 @@ fn build_extraction_script(since_epoch: Option<u64>) -> String {
     );
 
     // Codex: search session directory.
-    let codex_find = format!(
-        "for d in ~/.codex/sessions; do \
-           [ -d \"$d\" ] && find \"$d\" -name '*.jsonl'{newer_filter} -type f 2>/dev/null; \
+    // NOTE: Codex session files are written once and their mtime is never
+    // updated, so the `-newer` filter (based on last-sync time) would
+    // permanently skip them once Claude data advances the sync timestamp.
+    // We always find ALL Codex files and filter by timestamp in the Python
+    // extraction script instead.
+    let codex_find = "for d in ~/.codex/sessions; do \
+           [ -d \"$d\" ] && find \"$d\" -name '*.jsonl' -type f 2>/dev/null; \
          done"
-    );
+        .to_string();
 
     // Claude python extraction — uses explicit \n + indentation to avoid
     // Rust's trailing-backslash line continuation eating the leading spaces.
@@ -180,32 +184,61 @@ fn build_extraction_script(since_epoch: Option<u64>) -> String {
     // Codex python extraction — stateful: tracks model from turn_context,
     // extracts token deltas from last_token_usage / total_token_usage.
     // Normalizes cached_input out of input_tokens (Codex includes cached in input).
-    let codex_py = concat!(
-        "import json,sys\n",
-        "for f in sys.argv[1:]:\n",
-        " try:\n",
-        "  m='';pi=0;po=0;pc=0\n",
-        "  for line in open(f):\n",
-        "   try:\n",
-        "    d=json.loads(line)\n",
-        "    t=d.get('type','')\n",
-        "    if t=='turn_context':m=d.get('payload',{}).get('model','')\n",
-        "    elif t=='event_msg':\n",
-        "     p=d.get('payload',{})\n",
-        "     if p.get('type')=='token_count':\n",
-        "      nf=p.get('info') or {}\n",
-        "      tu=nf.get('total_token_usage')\n",
-        "      lu=nf.get('last_token_usage')\n",
-        "      if tu:\n",
-        "       i=tu.get('input_tokens',0);o=tu.get('output_tokens',0);c=tu.get('cached_input_tokens',0)\n",
-        "       di=max(0,i-pi);do2=max(0,o-po);dc=max(0,c-pc)\n",
-        "       pi=i;po=o;pc=c\n",
-        "       if di>0 or do2>0:print(json.dumps({'ts':d.get('timestamp',''),'m':m,'in':max(0,di-dc),'out':do2,'c5':0,'cr':dc}))\n",
-        "      elif lu:\n",
-        "       i=lu.get('input_tokens',0);o=lu.get('output_tokens',0);c=lu.get('cached_input_tokens',0)\n",
-        "       print(json.dumps({'ts':d.get('timestamp',''),'m':m,'in':max(0,i-c),'out':o,'c5':0,'cr':c}))\n",
-        "   except:pass\n",
-        " except:pass\n",
+    //
+    // Because Codex files are not filtered by -newer (mtime never changes),
+    // we pass `since_epoch` into the script and skip records whose timestamp
+    // is at or before the cutoff.  This avoids duplicating already-cached data.
+    let since_iso_filter = codex_since
+        .map(|ts| {
+            // Convert epoch to ISO-8601 string for Python comparison.
+            let dt = chrono::DateTime::from_timestamp(ts as i64, 0)
+                .unwrap_or_default()
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string();
+            format!("S='{dt}'\n")
+        })
+        .unwrap_or_else(|| "S=''\n".to_string());
+
+    // The script must still track cumulative state (pi/po/pc) for ALL records
+    // to compute correct deltas, but only *print* records whose timestamp is
+    // after the cutoff.  Skipping records entirely would corrupt the running
+    // totals used for delta calculation.
+    let codex_py = format!(
+        "import json,sys\n\
+         {since_iso_filter}\
+         for f in sys.argv[1:]:\n\
+         {S1}try:\n\
+         {S2}m='';pi=0;po=0;pc=0\n\
+         {S2}for line in open(f):\n\
+         {S3}try:\n\
+         {S4}d=json.loads(line)\n\
+         {S4}t=d.get('type','')\n\
+         {S4}if t=='turn_context':m=d.get('payload',{{}}).get('model','')\n\
+         {S4}elif t=='event_msg':\n\
+         {S5}p=d.get('payload',{{}})\n\
+         {S5}if p.get('type')=='token_count':\n\
+         {S6}nf=p.get('info') or {{}}\n\
+         {S6}tu=nf.get('total_token_usage')\n\
+         {S6}lu=nf.get('last_token_usage')\n\
+         {S6}ts=d.get('timestamp','')\n\
+         {S6}if tu:\n\
+         {S7}i=tu.get('input_tokens',0);o=tu.get('output_tokens',0);c=tu.get('cached_input_tokens',0)\n\
+         {S7}di=max(0,i-pi);do2=max(0,o-po);dc=max(0,c-pc)\n\
+         {S7}pi=i;po=o;pc=c\n\
+         {S7}if (not S or ts>S) and (di>0 or do2>0):print(json.dumps({{'ts':ts,'m':m,'in':max(0,di-dc),'out':do2,'c5':0,'cr':dc}}))\n\
+         {S6}elif lu:\n\
+         {S7}i=lu.get('input_tokens',0);o=lu.get('output_tokens',0);c=lu.get('cached_input_tokens',0)\n\
+         {S7}if not S or ts>S:print(json.dumps({{'ts':ts,'m':m,'in':max(0,i-c),'out':o,'c5':0,'cr':c}}))\n\
+         {S3}except:pass\n\
+         {S1}except:pass\n",
+        since_iso_filter = since_iso_filter,
+        S1 = " ",
+        S2 = "  ",
+        S3 = "   ",
+        S4 = "    ",
+        S5 = "     ",
+        S6 = "      ",
+        S7 = "       ",
     );
 
     format!(
@@ -244,9 +277,10 @@ fn build_extraction_script(since_epoch: Option<u64>) -> String {
 /// Returns compact records (jq/python path) or raw JSONL lines (grep fallback).
 pub async fn fetch_remote_usage(
     alias: &str,
-    since_epoch: Option<u64>,
+    claude_since: Option<u64>,
+    codex_since: Option<u64>,
 ) -> Result<Vec<CompactUsageRecord>, String> {
-    let script = build_extraction_script(since_epoch);
+    let script = build_extraction_script(claude_since, codex_since);
     let output = ssh_command(alias, &script).await?;
 
     if output.trim().is_empty() {
@@ -375,8 +409,9 @@ async fn ssh_command(alias: &str, script: &str) -> Result<String, String> {
 // Stores compact usage records per host, not raw JSONL files.
 // Cache structure:
 //   {app_data_dir}/remote-cache/{hostname}/
-//     .last-sync          — epoch timestamp
-//     usage.jsonl          — compact records (appended on each sync)
+//     .last-sync-claude    — epoch timestamp for Claude provider
+//     .last-sync-codex     — epoch timestamp for Codex provider
+//     usage.jsonl           — compact records (appended on each sync)
 
 pub struct SshCacheManager {
     base_dir: PathBuf,
@@ -408,16 +443,44 @@ impl SshCacheManager {
         self.host_cache_dir(alias).join("usage.jsonl")
     }
 
-    /// Read the last-sync timestamp for a host.
-    pub fn last_sync_epoch(&self, alias: &str) -> Option<u64> {
-        let marker = self.host_cache_dir(alias).join(".last-sync");
+    /// Migrate legacy `.last-sync` to per-provider files if needed.
+    ///
+    /// Copies the old unified timestamp to both `.last-sync-claude` and
+    /// `.last-sync-codex` (only when neither exists yet), then removes
+    /// the old file.
+    pub fn migrate_legacy_sync_marker(&self, alias: &str) {
+        let dir = self.host_cache_dir(alias);
+        let legacy = dir.join(".last-sync");
+        if !legacy.exists() {
+            return;
+        }
+        let claude_marker = dir.join(".last-sync-claude");
+        let codex_marker = dir.join(".last-sync-codex");
+        if claude_marker.exists() || codex_marker.exists() {
+            // Already migrated — clean up the legacy file.
+            let _ = std::fs::remove_file(&legacy);
+            return;
+        }
+        if let Ok(content) = std::fs::read_to_string(&legacy) {
+            // Only migrate Claude's timestamp; leave Codex empty so it
+            // does a full first sync (Codex data was never synced before).
+            let _ = std::fs::write(&claude_marker, content.trim());
+        }
+        let _ = std::fs::remove_file(&legacy);
+    }
+
+    /// Read the last-sync timestamp for a host and provider.
+    pub fn last_sync_epoch(&self, alias: &str, provider: &str) -> Option<u64> {
+        let marker = self
+            .host_cache_dir(alias)
+            .join(format!(".last-sync-{provider}"));
         std::fs::read_to_string(marker)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
     }
 
-    /// Write the last-sync timestamp for a host.
-    fn set_last_sync(&self, alias: &str) -> Result<(), String> {
+    /// Write the last-sync timestamp for a host and provider.
+    fn set_last_sync(&self, alias: &str, provider: &str) -> Result<(), String> {
         let dir = self.host_cache_dir(alias);
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
@@ -426,7 +489,7 @@ impl SshCacheManager {
             .unwrap_or_default()
             .as_secs();
 
-        let marker = dir.join(".last-sync");
+        let marker = dir.join(format!(".last-sync-{provider}"));
         std::fs::write(marker, epoch.to_string()).map_err(|e| format!("write: {e}"))
     }
 
@@ -435,7 +498,11 @@ impl SshCacheManager {
         configs
             .iter()
             .map(|cfg| {
-                let last_sync = self.last_sync_epoch(&cfg.alias).map(|ts| {
+                // Display the most recent sync time across providers.
+                let claude_ts = self.last_sync_epoch(&cfg.alias, "claude");
+                let codex_ts = self.last_sync_epoch(&cfg.alias, "codex");
+                let latest_ts = claude_ts.max(codex_ts);
+                let last_sync = latest_ts.map(|ts| {
                     chrono::DateTime::from_timestamp(ts as i64, 0)
                         .map(|dt| dt.to_rfc3339())
                         .unwrap_or_default()
@@ -458,10 +525,13 @@ impl SshCacheManager {
     ///
     /// Returns the number of new records synced.
     pub async fn sync_host(&self, alias: &str) -> Result<u32, String> {
-        let since = self.last_sync_epoch(alias);
+        self.migrate_legacy_sync_marker(alias);
+
+        let claude_since = self.last_sync_epoch(alias, "claude");
+        let codex_since = self.last_sync_epoch(alias, "codex");
 
         // Fetch compact usage records from remote.
-        let records = fetch_remote_usage(alias, since).await?;
+        let records = fetch_remote_usage(alias, claude_since, codex_since).await?;
 
         if records.is_empty() {
             // Don't update last-sync when no records found — the remote
@@ -477,10 +547,19 @@ impl SshCacheManager {
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
         let mut lines = String::new();
+        let mut has_claude = false;
+        let mut has_codex = false;
         for record in &records {
             if let Ok(json) = serde_json::to_string(record) {
                 lines.push_str(&json);
                 lines.push('\n');
+            }
+            // Detect provider by model family.
+            use crate::models::{detect_model_family, ModelFamily};
+            match detect_model_family(&record.model) {
+                ModelFamily::Anthropic => has_claude = true,
+                ModelFamily::OpenAI => has_codex = true,
+                _ => {} // Other models don't affect provider timestamps.
             }
         }
 
@@ -495,10 +574,15 @@ impl SshCacheManager {
             .write_all(lines.as_bytes())
             .map_err(|e| format!("write cache: {e}"))?;
 
-        let count = records.len() as u32;
-        self.set_last_sync(alias)?;
+        // Only advance a provider's timestamp when that provider had data.
+        if has_claude {
+            self.set_last_sync(alias, "claude")?;
+        }
+        if has_codex {
+            self.set_last_sync(alias, "codex")?;
+        }
 
-        Ok(count)
+        Ok(records.len() as u32)
     }
 
     /// Load all cached compact records for a host.
