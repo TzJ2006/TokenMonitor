@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.6.0)'
+        required: true
 
 jobs:
   # ── Build on each platform ───────────────────────────────────────────────────
@@ -60,7 +65,8 @@ jobs:
       - name: Version consistency check
         if: matrix.platform == 'linux'
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${TAG#v}"
           CARGO_VERSION=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           TAURI_VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
           NPM_VERSION=$(node -p "require('./package.json').version")
@@ -171,6 +177,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             artifacts/installers-macos/*
             artifacts/installers-windows/*
