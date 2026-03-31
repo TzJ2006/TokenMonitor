@@ -417,13 +417,17 @@ pub async fn create_float_ball(app: tauri::AppHandle) -> Result<(), String> {
         width: sizes.ball,
         height: sizes.ball,
     };
-    let default_state = FloatBallState::default();
+    let initial_state = FloatBallState {
+        anchor: Some(FloatBallAnchor::Right),
+        expand_direction: FloatBallExpandDirection::Left,
+        expanded: false,
+    };
     apply_float_ball_window_rect(&window, rect)?;
 
     {
         let state = app.state::<AppState>();
         let mut float_state = state.float_ball_state.write().await;
-        *float_state = default_state;
+        *float_state = initial_state;
     }
 
     Ok(())
