@@ -2961,6 +2961,15 @@ mod tests {
             &dir.path().join("session-b.jsonl"),
             r#"{"type":"assistant","timestamp":"2026-03-16T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":200,"output_tokens":75}}}"#,
         );
+        // Bump the directory mtime so the listing cache detects a change.
+        // On Windows, fast writes may land within the same timestamp granularity.
+        filetime::set_file_mtime(
+            dir.path(),
+            filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+            ),
+        )
+        .unwrap();
 
         let second = parser.get_daily("claude", "20260101");
         assert_eq!(second.input_tokens, 300);
