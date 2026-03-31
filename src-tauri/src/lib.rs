@@ -140,6 +140,9 @@ pub fn run() {
                             }
                             #[cfg(target_os = "linux")]
                             {
+                                // Show first so the window manager realizes the window,
+                                // then position — fixes first-open landing on the left side.
+                                let _ = window.show();
                                 platform::linux::position_top_right(&window);
                                 platform::clamp_window_to_work_area(&window);
                             }
@@ -148,6 +151,7 @@ pub fn run() {
                                 move_window_near_tray(&window);
                                 platform::clamp_window_to_work_area(&window);
                             }
+                            #[cfg(not(target_os = "linux"))]
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
@@ -175,6 +179,9 @@ pub fn run() {
                                 }
                                 #[cfg(target_os = "linux")]
                                 {
+                                    // Show first so the window manager realizes the window,
+                                    // then position — fixes first-open landing on the left side.
+                                    let _ = window.show();
                                     platform::linux::position_top_right(&window);
                                     platform::clamp_window_to_work_area(&window);
                                 }
@@ -183,6 +190,7 @@ pub fn run() {
                                     move_window_below_tray(&window, &rect);
                                     platform::clamp_window_to_work_area(&window);
                                 }
+                                #[cfg(not(target_os = "linux"))]
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
