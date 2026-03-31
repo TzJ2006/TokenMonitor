@@ -149,11 +149,14 @@ pub fn run() {
                             }
                             #[cfg(target_os = "linux")]
                             {
-                                // Show first so the window manager realizes the window,
-                                // then position — fixes first-open landing on the left side.
+                                // Pre-hint position before show (WM may respect this).
+                                platform::linux::position_top_right(&window);
                                 let _ = window.show();
+                                // Immediate re-position (works if WM realized fast enough).
                                 platform::linux::position_top_right(&window);
                                 platform::clamp_window_to_work_area(&window);
+                                // Deferred re-position to catch slow WM realization.
+                                platform::linux::deferred_reposition(window.clone());
                             }
                             #[cfg(target_os = "macos")]
                             {
@@ -188,11 +191,14 @@ pub fn run() {
                                 }
                                 #[cfg(target_os = "linux")]
                                 {
-                                    // Show first so the window manager realizes the window,
-                                    // then position — fixes first-open landing on the left side.
+                                    // Pre-hint position before show (WM may respect this).
+                                    platform::linux::position_top_right(&window);
                                     let _ = window.show();
+                                    // Immediate re-position (works if WM realized fast enough).
                                     platform::linux::position_top_right(&window);
                                     platform::clamp_window_to_work_area(&window);
+                                    // Deferred re-position to catch slow WM realization.
+                                    platform::linux::deferred_reposition(window.clone());
                                 }
                                 #[cfg(target_os = "macos")]
                                 {
