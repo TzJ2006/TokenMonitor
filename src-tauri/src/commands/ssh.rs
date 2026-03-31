@@ -230,8 +230,7 @@ pub async fn get_device_usage(
         let statuses = mgr.host_statuses(&configs);
         for cfg in configs.iter().filter(|c| c.enabled) {
             let records = mgr.load_cached_records(&cfg.alias);
-            let mut summary =
-                build_device_summary_from_compact(&cfg.alias, &records, since, end);
+            let mut summary = build_device_summary_from_compact(&cfg.alias, &records, since, end);
 
             // Enrich with status from cache manager.
             if let Some(host_status) = statuses.iter().find(|s| s.alias == cfg.alias) {
@@ -451,8 +450,7 @@ pub(crate) async fn build_device_breakdown_for_payload(
             if filtered.is_empty() {
                 continue;
             }
-            let mut summary =
-                build_device_summary_from_compact(&cfg.alias, &filtered, since, end);
+            let mut summary = build_device_summary_from_compact(&cfg.alias, &filtered, since, end);
 
             if let Some(host_status) = statuses.iter().find(|s| s.alias == cfg.alias) {
                 summary.last_synced = host_status.last_sync.clone();
@@ -808,10 +806,9 @@ fn bucket_label_for_key(sort_key: &str, period: &str) -> String {
             }
         }
         "year" => {
-            if let Ok(d) = chrono::NaiveDate::parse_from_str(
-                &format!("{}-01", sort_key),
-                "%Y-%m-%d",
-            ) {
+            if let Ok(d) =
+                chrono::NaiveDate::parse_from_str(&format!("{}-01", sort_key), "%Y-%m-%d")
+            {
                 return d.format("%b").to_string();
             }
         }
