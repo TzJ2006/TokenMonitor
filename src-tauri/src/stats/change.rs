@@ -46,7 +46,7 @@ pub enum ChangeEventKind {
 pub struct ParsedChangeEvent {
     pub timestamp: DateTime<Local>,
     pub model: String,
-    #[allow(dead_code)] // populated during parsing, reserved for future per-provider filtering
+    #[allow(dead_code)]
     pub provider: String,
     pub path: String,
     pub kind: ChangeEventKind,

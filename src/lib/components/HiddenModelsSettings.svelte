@@ -10,11 +10,15 @@
 
   let costInput = $state("50.00");
   let costEnabled = $state(true);
+  let costInputFocused = $state(false);
   let availableModels = $state<KnownModel[]>([]);
 
   $effect(() => {
     costEnabled = current.costAlertThreshold > 0;
-    costInput = current.costAlertThreshold > 0 ? current.costAlertThreshold.toFixed(2) : "50.00";
+    // Don't overwrite the input while the user is actively editing.
+    if (!costInputFocused) {
+      costInput = current.costAlertThreshold > 0 ? current.costAlertThreshold.toFixed(2) : "50.00";
+    }
   });
 
   onMount(() => {
@@ -65,7 +69,8 @@
             <input
               type="text"
               bind:value={costInput}
-              onblur={handleCostBlur}
+              onfocus={() => { costInputFocused = true; }}
+              onblur={() => { costInputFocused = false; handleCostBlur(); }}
               onkeydown={handleCostKeydown}
               class="cost-field"
             />

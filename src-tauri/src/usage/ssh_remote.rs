@@ -194,13 +194,12 @@ fn build_extraction_script(claude_since: Option<u64>, codex_since: Option<u64>) 
     // we pass `since_epoch` into the script and skip records whose timestamp
     // is at or before the cutoff.  This avoids duplicating already-cached data.
     let since_iso_filter = codex_since
-        .map(|ts| {
+        .and_then(|ts| {
             // Convert epoch to ISO-8601 string for Python comparison.
-            let dt = chrono::DateTime::from_timestamp(ts as i64, 0)
-                .unwrap_or_default()
-                .format("%Y-%m-%dT%H:%M:%S")
-                .to_string();
-            format!("S='{dt}'\n")
+            chrono::DateTime::from_timestamp(ts as i64, 0).map(|dt| {
+                let formatted = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+                format!("S='{formatted}'\n")
+            })
         })
         .unwrap_or_else(|| "S=''\n".to_string());
 
@@ -395,12 +394,17 @@ async fn ssh_command(alias: &str, script: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to wait for ssh: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if output.status.success() || !stdout.trim().is_empty() {
+    if output.status.success() {
         return Ok(stdout);
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Log stderr when exit code is non-zero.
+    if !stderr.trim().is_empty() {
+        tracing::warn!("SSH stderr for {alias}: {}", stderr.trim());
+    }
+
     let msg = if stderr.trim().is_empty() {
         format!(
             "SSH exited with code {}",
@@ -421,6 +425,7 @@ async fn ssh_command(alias: &str, script: &str) -> Result<String, String> {
 //     .last-sync-codex     — epoch timestamp for Codex provider
 //     usage.jsonl           — compact records (appended on each sync)
 
+#[derive(Clone)]
 pub struct SshCacheManager {
     base_dir: PathBuf,
 }
@@ -436,19 +441,17 @@ impl SshCacheManager {
     ///
     /// Validates that the resolved path stays within `base_dir` to prevent
     /// path traversal attacks via crafted alias values.
-    fn host_cache_dir(&self, alias: &str) -> PathBuf {
+    fn host_cache_dir(&self, alias: &str) -> Result<PathBuf, String> {
         let dir = self.base_dir.join(alias);
-        // SAFETY: Ensure resolved path is under base_dir to prevent path traversal.
-        assert!(
-            dir.starts_with(&self.base_dir),
-            "host_cache_dir resolved outside base_dir: {dir:?}"
-        );
-        dir
+        if !dir.starts_with(&self.base_dir) {
+            return Err(format!("host_cache_dir resolved outside base_dir: {dir:?}"));
+        }
+        Ok(dir)
     }
 
     /// Path to the compact usage cache file for a host.
-    fn usage_cache_path(&self, alias: &str) -> PathBuf {
-        self.host_cache_dir(alias).join("usage.jsonl")
+    fn usage_cache_path(&self, alias: &str) -> Result<PathBuf, String> {
+        Ok(self.host_cache_dir(alias)?.join("usage.jsonl"))
     }
 
     /// Migrate legacy `.last-sync` to per-provider files if needed.
@@ -457,7 +460,13 @@ impl SshCacheManager {
     /// `.last-sync-codex` (only when neither exists yet), then removes
     /// the old file.
     pub fn migrate_legacy_sync_marker(&self, alias: &str) {
-        let dir = self.host_cache_dir(alias);
+        let dir = match self.host_cache_dir(alias) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("migrate_legacy_sync_marker: {e}");
+                return;
+            }
+        };
         let legacy = dir.join(".last-sync");
         if !legacy.exists() {
             return;
@@ -466,22 +475,36 @@ impl SshCacheManager {
         let codex_marker = dir.join(".last-sync-codex");
         if claude_marker.exists() || codex_marker.exists() {
             // Already migrated — clean up the legacy file.
-            let _ = std::fs::remove_file(&legacy);
+            if let Err(e) = std::fs::remove_file(&legacy) {
+                tracing::warn!("Failed to remove legacy sync marker: {e}");
+            }
             return;
         }
         if let Ok(content) = std::fs::read_to_string(&legacy) {
             // Only migrate Claude's timestamp; leave Codex empty so it
             // does a full first sync (Codex data was never synced before).
-            let _ = std::fs::write(&claude_marker, content.trim());
+            if let Err(e) = std::fs::write(&claude_marker, content.trim()) {
+                tracing::warn!("Failed to write claude sync marker: {e}");
+            }
         }
-        let _ = std::fs::remove_file(&legacy);
+        if let Err(e) = std::fs::remove_file(&legacy) {
+            tracing::warn!("Failed to remove legacy sync marker: {e}");
+        }
+    }
+
+    /// Validate that a provider name is safe for use in filenames.
+    fn validate_provider(provider: &str) -> Result<(), String> {
+        if !matches!(provider, "claude" | "codex") {
+            return Err(format!("Invalid provider: {provider}"));
+        }
+        Ok(())
     }
 
     /// Read the last-sync timestamp for a host and provider.
     pub fn last_sync_epoch(&self, alias: &str, provider: &str) -> Option<u64> {
-        let marker = self
-            .host_cache_dir(alias)
-            .join(format!(".last-sync-{provider}"));
+        Self::validate_provider(provider).ok()?;
+        let dir = self.host_cache_dir(alias).ok()?;
+        let marker = dir.join(format!(".last-sync-{provider}"));
         std::fs::read_to_string(marker)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -489,7 +512,8 @@ impl SshCacheManager {
 
     /// Write the last-sync timestamp for a host and provider.
     fn set_last_sync(&self, alias: &str, provider: &str) -> Result<(), String> {
-        let dir = self.host_cache_dir(alias);
+        Self::validate_provider(provider)?;
+        let dir = self.host_cache_dir(alias)?;
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
         let epoch = std::time::SystemTime::now()
@@ -516,7 +540,13 @@ impl SshCacheManager {
                         .unwrap_or_default()
                 });
 
-                let entry_count = self.load_cached_records(&cfg.alias).len() as u32;
+                let entry_count = match self.load_cached_records(&cfg.alias) {
+                    Ok(records) => records.len() as u32,
+                    Err(e) => {
+                        tracing::warn!("Failed to load cached records for {}: {e}", cfg.alias);
+                        0
+                    }
+                };
 
                 SshHostStatus {
                     alias: cfg.alias.clone(),
@@ -550,8 +580,8 @@ impl SshCacheManager {
         }
 
         // Append new records to the cache file.
-        let cache_path = self.usage_cache_path(alias);
-        let dir = self.host_cache_dir(alias);
+        let cache_path = self.usage_cache_path(alias)?;
+        let dir = self.host_cache_dir(alias)?;
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
         let mut lines = String::new();
@@ -594,16 +624,17 @@ impl SshCacheManager {
     }
 
     /// Load all cached compact records for a host.
-    pub fn load_cached_records(&self, alias: &str) -> Vec<CompactUsageRecord> {
-        let cache_path = self.usage_cache_path(alias);
+    pub fn load_cached_records(&self, alias: &str) -> Result<Vec<CompactUsageRecord>, String> {
+        let cache_path = self.usage_cache_path(alias)?;
         let content = match std::fs::read_to_string(&cache_path) {
             Ok(c) => c,
-            Err(_) => return Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("Failed to read cache for {alias}: {e}")),
         };
 
-        content
+        Ok(content
             .lines()
             .filter_map(|line| serde_json::from_str::<CompactUsageRecord>(line).ok())
-            .collect()
+            .collect())
     }
 }

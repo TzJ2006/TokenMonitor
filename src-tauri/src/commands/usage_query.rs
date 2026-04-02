@@ -102,8 +102,10 @@ fn parser_payload_for_period(
         }
         "month" => {
             let (year, month) = resolve_month_offset(now.year(), now.month(), offset);
-            let first_of_month = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
-            let end_of_month = first_of_next_month(year, month);
+            let first_of_month = NaiveDate::from_ymd_opt(year, month, 1)
+                .ok_or_else(|| format!("Invalid month offset: year={year}, month={month}"))?;
+            let end_of_month = first_of_next_month(year, month)
+                .ok_or_else(|| format!("Invalid next month: year={year}, month={month}"))?;
             let since_str = first_of_month.format("%Y%m%d").to_string();
             let mut payload = parser.get_daily(provider, &since_str);
             filter_buckets_to_range(&mut payload, first_of_month, end_of_month);

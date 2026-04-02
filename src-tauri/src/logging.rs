@@ -34,8 +34,12 @@ impl LoggingState {
             message
         );
         if let Ok(mut writer) = self.frontend_writer.lock() {
-            let _ = writer.write_all(line.as_bytes());
-            let _ = writer.flush();
+            if let Err(e) = writer.write_all(line.as_bytes()) {
+                tracing::warn!("Failed to write frontend log: {e}");
+            }
+            if let Err(e) = writer.flush() {
+                tracing::warn!("Failed to flush frontend log: {e}");
+            }
         }
     }
 }
@@ -100,7 +104,9 @@ fn cleanup_old_logs(log_dir: &Path, max_days: i64) {
                 let modified: chrono::DateTime<Utc> = modified.into();
                 if modified < cutoff {
                     tracing::debug!(file = %path.display(), "Removing old log file");
-                    let _ = std::fs::remove_file(&path);
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!(file = %path.display(), "Failed to remove old log: {e}");
+                    }
                 }
             }
         }

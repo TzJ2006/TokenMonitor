@@ -29,9 +29,7 @@ pub struct ParsedEntry {
     pub cache_creation_1h_tokens: u64,
     pub cache_read_tokens: u64,
     pub unique_hash: Option<String>,
-    #[allow(dead_code)] // Will be populated in later subagent-stats tasks
     pub session_key: String,
-    #[allow(dead_code)] // Will be used in later subagent-stats tasks
     pub agent_scope: crate::stats::subagent::AgentScope,
 }
 

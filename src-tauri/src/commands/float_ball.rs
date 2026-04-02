@@ -22,6 +22,9 @@ pub(crate) struct FloatBallState {
     pub(crate) anchor: Option<FloatBallAnchor>,
     pub(crate) expand_direction: FloatBallExpandDirection,
     pub(crate) expanded: bool,
+    /// Last-set window rect (authoritative). Used instead of querying the WM,
+    /// which returns stale/incorrect values on Linux.
+    pub(crate) last_rect: Option<FloatBallRect>,
 }
 
 impl Default for FloatBallState {
@@ -31,6 +34,7 @@ impl Default for FloatBallState {
             anchor: Some(FloatBallAnchor::Left),
             expand_direction: FloatBallExpandDirection::Right,
             expanded: false,
+            last_rect: None,
         }
     }
 }
@@ -42,7 +46,7 @@ pub struct FloatBallLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FloatBallRect {
+pub(crate) struct FloatBallRect {
     x: i32,
     y: i32,
     width: i32,
@@ -174,6 +178,41 @@ fn inset_bounds(bounds: FloatBallBounds, margin: i32) -> FloatBallBounds {
     }
 }
 
+fn clamp_anchored_expand_x(
+    inner_bounds: FloatBallBounds,
+    target_x: i32,
+    width: i32,
+    expand_direction: FloatBallExpandDirection,
+) -> i32 {
+    let max_x = inner_bounds.right - width;
+    if max_x <= inner_bounds.left {
+        return inner_bounds.left;
+    }
+
+    match expand_direction {
+        FloatBallExpandDirection::Right => target_x.min(max_x),
+        FloatBallExpandDirection::Left => target_x.max(inner_bounds.left),
+    }
+}
+
+fn clamp_anchored_expand_y(
+    inner_bounds: FloatBallBounds,
+    target_y: i32,
+    height: i32,
+    anchor: FloatBallAnchor,
+) -> i32 {
+    let max_y = inner_bounds.bottom - height;
+    if max_y <= inner_bounds.top {
+        return inner_bounds.top;
+    }
+
+    match anchor {
+        FloatBallAnchor::Top => target_y.min(max_y),
+        FloatBallAnchor::Bottom => target_y.max(inner_bounds.top),
+        FloatBallAnchor::Left | FloatBallAnchor::Right => target_y.clamp(inner_bounds.top, max_y),
+    }
+}
+
 fn collapsed_rect_from_ball(
     bounds: FloatBallBounds,
     ball_rect: FloatBallRect,
@@ -211,10 +250,18 @@ fn expanded_rect_from_ball(
     sizes: FloatBallSizes,
 ) -> FloatBallRect {
     let inner_bounds = inset_bounds(bounds, sizes.expand_margin);
+    let anchored_x = match expand_direction {
+        FloatBallExpandDirection::Right => ball_rect.x,
+        FloatBallExpandDirection::Left => ball_rect.x - (sizes.expanded_width - sizes.ball),
+    };
 
     let x = match anchor {
-        Some(FloatBallAnchor::Left) => inner_bounds.left,
-        Some(FloatBallAnchor::Right) => inner_bounds.right - sizes.expanded_width,
+        Some(FloatBallAnchor::Left) | Some(FloatBallAnchor::Right) => clamp_anchored_expand_x(
+            inner_bounds,
+            anchored_x,
+            sizes.expanded_width,
+            expand_direction,
+        ),
         Some(FloatBallAnchor::Top) | Some(FloatBallAnchor::Bottom) | None => match expand_direction
         {
             FloatBallExpandDirection::Right => {
@@ -227,8 +274,18 @@ fn expanded_rect_from_ball(
         },
     };
     let y = match anchor {
-        Some(FloatBallAnchor::Top) => inner_bounds.top,
-        Some(FloatBallAnchor::Bottom) => inner_bounds.bottom - sizes.expanded_height,
+        Some(FloatBallAnchor::Top) => clamp_anchored_expand_y(
+            inner_bounds,
+            ball_rect.y,
+            sizes.expanded_height,
+            FloatBallAnchor::Top,
+        ),
+        Some(FloatBallAnchor::Bottom) => clamp_anchored_expand_y(
+            inner_bounds,
+            ball_rect.y + sizes.ball - sizes.expanded_height,
+            sizes.expanded_height,
+            FloatBallAnchor::Bottom,
+        ),
         Some(FloatBallAnchor::Left) | Some(FloatBallAnchor::Right) | None => inner_bounds.clamp_y(
             ball_rect.y + sizes.ball - sizes.expanded_height,
             sizes.expanded_height,
@@ -343,7 +400,20 @@ fn apply_float_ball_window_rect(window: &WebviewWindow, rect: FloatBallRect) -> 
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        window
+            .set_position(tauri::PhysicalPosition::new(rect.x, rect.y))
+            .map_err(|e| e.to_string())?;
+        window
+            .set_size(tauri::PhysicalSize::new(
+                rect.width as u32,
+                rect.height as u32,
+            ))
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "macos")]
     {
         window
             .set_size(tauri::PhysicalSize::new(
@@ -356,6 +426,16 @@ fn apply_float_ball_window_rect(window: &WebviewWindow, rect: FloatBallRect) -> 
             .map_err(|e| e.to_string())?;
     }
 
+    Ok(())
+}
+
+fn apply_and_store_rect(
+    window: &WebviewWindow,
+    rect: FloatBallRect,
+    state: &mut FloatBallState,
+) -> Result<(), String> {
+    apply_float_ball_window_rect(window, rect)?;
+    state.last_rect = Some(rect);
     Ok(())
 }
 
@@ -421,6 +501,7 @@ pub async fn create_float_ball(app: tauri::AppHandle) -> Result<(), String> {
         anchor: Some(FloatBallAnchor::Right),
         expand_direction: FloatBallExpandDirection::Left,
         expanded: false,
+        last_rect: Some(rect),
     };
     apply_float_ball_window_rect(&window, rect)?;
 
@@ -464,7 +545,9 @@ pub async fn set_float_ball_expanded(
     let bounds = float_ball_bounds(&window)?;
     let state = app.state::<AppState>();
     let mut float_state = state.float_ball_state.write().await;
-    let window_rect = current_float_ball_rect(&window)?;
+    let window_rect = float_state
+        .last_rect
+        .unwrap_or(current_float_ball_rect(&window)?);
     let ball_rect = ball_rect_from_window(window_rect, *float_state, sizes.ball);
     let direction = choose_expand_direction(
         float_state.anchor,
@@ -483,7 +566,7 @@ pub async fn set_float_ball_expanded(
         sizes,
     );
 
-    apply_float_ball_window_rect(&window, target_rect)?;
+    apply_and_store_rect(&window, target_rect, &mut float_state)?;
 
     float_state.expand_direction = direction;
     float_state.expanded = expanded;
@@ -536,7 +619,7 @@ pub async fn move_float_ball_to(app: tauri::AppHandle, x: i32, y: i32) -> Result
     };
 
     float_state.anchor = None;
-    apply_float_ball_window_rect(&window, rect)?;
+    apply_and_store_rect(&window, rect, &mut float_state)?;
     Ok(())
 }
 
@@ -556,7 +639,9 @@ pub async fn snap_float_ball(app: tauri::AppHandle) -> Result<(), String> {
     if float_state.expanded {
         return Ok(());
     }
-    let window_rect = current_float_ball_rect(&window)?;
+    let window_rect = float_state
+        .last_rect
+        .unwrap_or(current_float_ball_rect(&window)?);
     let ball_rect = ball_rect_from_window(window_rect, *float_state, sizes.ball);
 
     let Some(anchor) = choose_float_ball_anchor(bounds, ball_rect, snap_threshold_px) else {
@@ -582,11 +667,32 @@ pub async fn snap_float_ball(app: tauri::AppHandle) -> Result<(), String> {
         sizes,
     );
 
-    apply_float_ball_window_rect(&window, target_rect)?;
+    apply_and_store_rect(&window, target_rect, &mut float_state)?;
     float_state.anchor = Some(anchor);
     float_state.expand_direction = direction;
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct FloatBallPosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Return the authoritative window position from state (not from the WM).
+/// Used by the frontend's drag-start to avoid stale `outerPosition()` reads.
+#[tauri::command]
+pub async fn get_float_ball_position(app: tauri::AppHandle) -> Result<FloatBallPosition, String> {
+    let state = app.state::<AppState>();
+    let float_state = state.float_ball_state.read().await;
+    let rect = float_state
+        .last_rect
+        .ok_or("Float ball not initialized")?;
+    Ok(FloatBallPosition {
+        x: rect.x,
+        y: rect.y,
+    })
 }
 
 // ── Taskbar panel commands (Windows only) ────────────────────────────
@@ -690,11 +796,11 @@ mod tests {
     }
 
     #[test]
-    fn expanded_bottom_anchor_stays_within_bounds_with_margin() {
+    fn expanded_bottom_anchor_keeps_ball_position() {
         let bounds = sample_bounds();
         let ball_rect = FloatBallRect {
             x: 420,
-            y: 344,
+            y: 372,
             width: 56,
             height: 56,
         };
@@ -708,10 +814,8 @@ mod tests {
             sizes(8),
         );
 
-        // Expanded rect stays within bounds with 8px margin
-        assert_eq!(rect.y, 400 - 56 - 8); // bottom - expanded_height - margin
-        assert!(rect.x >= 8); // at least margin from left
-        assert!(rect.x + rect.width <= 592); // at most margin from right
+        assert_eq!(rect.y, 372);
+        assert_eq!(rect.x, 324);
     }
 
     #[test]
@@ -784,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_right_anchor_stays_within_bounds_with_margin() {
+    fn expanded_right_anchor_keeps_ball_half_hidden_at_the_edge() {
         let bounds = sample_bounds();
         let ball_rect = FloatBallRect {
             x: 572,
@@ -802,13 +906,12 @@ mod tests {
             sizes(8),
         );
 
-        // Right edge at bounds.right - margin = 592
-        assert_eq!(rect.x, 600 - 152 - 8);
-        assert_eq!(rect.x + rect.width, 592);
+        assert_eq!(rect.x, 476);
+        assert_eq!(rect.x + rect.width - 56, 572);
     }
 
     #[test]
-    fn expanded_left_anchor_stays_within_bounds_with_margin() {
+    fn expanded_left_anchor_keeps_ball_half_hidden_at_the_edge() {
         let bounds = sample_bounds();
         let ball_rect = FloatBallRect {
             x: -28,
@@ -826,12 +929,11 @@ mod tests {
             sizes(8),
         );
 
-        // Left edge at bounds.left + margin = 8
-        assert_eq!(rect.x, 8);
+        assert_eq!(rect.x, -28);
     }
 
     #[test]
-    fn expanded_top_anchor_stays_within_bounds_with_margin() {
+    fn expanded_top_anchor_keeps_ball_half_hidden_at_the_edge() {
         let bounds = sample_bounds();
         let ball_rect = FloatBallRect {
             x: 300,
@@ -849,8 +951,34 @@ mod tests {
             sizes(8),
         );
 
-        // Top edge at bounds.top + margin = 8
-        assert_eq!(rect.y, 8);
+        assert_eq!(rect.y, -28);
+    }
+
+    #[test]
+    fn anchored_expand_clamps_only_when_the_monitor_is_too_narrow() {
+        let bounds = FloatBallBounds {
+            left: 0,
+            top: 0,
+            right: 120,
+            bottom: 400,
+        };
+        let ball_rect = FloatBallRect {
+            x: 92,
+            y: 200,
+            width: 56,
+            height: 56,
+        };
+
+        let rect = layout_float_ball_rect(
+            bounds,
+            ball_rect,
+            Some(FloatBallAnchor::Right),
+            true,
+            FloatBallExpandDirection::Left,
+            sizes(8),
+        );
+
+        assert_eq!(rect.x, 8);
     }
 
     #[test]
@@ -911,6 +1039,7 @@ mod tests {
             anchor: None,
             expand_direction: FloatBallExpandDirection::Left,
             expanded: true,
+            last_rect: None,
         };
 
         let ball_rect = ball_rect_from_window(expanded_rect, state, 56);

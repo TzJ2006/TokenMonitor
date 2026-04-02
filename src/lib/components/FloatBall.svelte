@@ -2,7 +2,9 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+  import { currentMonitor } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
+  import { isLinux } from "../utils/platform.js";
   import { logger } from "../utils/logger.js";
   import type {
     FloatBallExpandDirection,
@@ -10,8 +12,14 @@
     StatusWidgetSummary,
     TrayConfig,
   } from "../types/index.js";
+  import {
+    detectScreenToPhysicalScale,
+    getPhysicalWindowPositionFromPointer,
+    shouldHandleFloatBallPointerButton,
+  } from "./floatBallInteraction.js";
 
   const appWindow = getCurrentWebviewWindow();
+  const IS_LINUX = isLinux();
   const DRAG_THRESHOLD_PX = 5;
   const BLUR_GUARD_MS = 180;
 
@@ -32,11 +40,13 @@
     title: "$0.00",
   });
   let expanded = $state(false);
+  let nativeExpanded = false;
   let expandDirection = $state<FloatBallExpandDirection>("right");
 
   let dragging = $state(false);
   let ignoreBlurUntil = 0;
   let suppressShellClick = false;
+  let expansionRequestId = 0;
 
   let dragState: {
     pointerId: number;
@@ -44,7 +54,7 @@
     startScreenY: number;
     startWindowX: number;
     startWindowY: number;
-    scale: number;
+    screenToPhysicalScale: number;
     initiated: boolean;
   } | null = null;
 
@@ -95,25 +105,81 @@
 
   async function setExpanded(next: boolean) {
     logger.info("floatBall", `${next ? "Expanded" : "Collapsed"}`);
+    const requestId = ++expansionRequestId;
+
     if (next) {
       ignoreBlurUntil = Date.now() + BLUR_GUARD_MS;
+
+      if (expanded) return;
+
+      if (nativeExpanded) {
+        expanded = true;
+        return;
+      }
+
+      try {
+        // Pre-determine direction to explicitly prevent visually jumping
+        const pos = await invoke<{ x: number; y: number }>("get_float_ball_position");
+        const monitor = await currentMonitor();
+        if (monitor) {
+          const middle = monitor.size.width / 2;
+          expandDirection = pos.x > middle ? "left" : "right";
+        }
+        
+        // Let Svelte update DOM with correct flex-direction BEFORE resizing OS window
+        await new Promise((r) => requestAnimationFrame(r));
+
+        const nextLayout = await invoke<{ expandDirection: FloatBallExpandDirection }>(
+          "set_float_ball_expanded",
+          { expanded: true },
+        );
+        if (requestId !== expansionRequestId) return;
+        expandDirection = nextLayout.expandDirection;
+        nativeExpanded = true;
+        expanded = true;
+      } catch (e) {
+        if (requestId !== expansionRequestId) return;
+        logger.error("floatBall", "Expansion failed", e);
+        expanded = false;
+        nativeExpanded = false;
+      }
+      return;
     }
 
-    expanded = next;
+    if (!expanded && !nativeExpanded) {
+      return;
+    }
+
+    if (!nativeExpanded) return;
+
+    // Trigger visual collapse before resizing the OS window
+    expanded = false;
+
+    // Wait for the CSS transition to play out before shrinking OS window
+    await new Promise((r) => setTimeout(r, 260));
+
+    if (requestId !== expansionRequestId) return;
 
     try {
-      const nextLayout = await invoke<{ expandDirection: FloatBallExpandDirection }>(
-        "set_float_ball_expanded",
-        { expanded: next },
-      );
-      expandDirection = nextLayout.expandDirection;
-    } catch {
-      expanded = !next;
+      await invoke("set_float_ball_expanded", { expanded: false });
+    } catch (e) {
+      logger.error("floatBall", "Collapse native OS call failed", e);
+    } finally {
+      if (requestId === expansionRequestId) {
+        nativeExpanded = false;
+        expanded = false;
+      }
+    }
+  }
+
+  function releasePointerCapture(target: HTMLElement, pointerId: number) {
+    if (target.hasPointerCapture(pointerId)) {
+      target.releasePointerCapture(pointerId);
     }
   }
 
   function onPointerDown(event: PointerEvent) {
-    if (event.button !== 0 && event.button !== 2) return;
+    if (!shouldHandleFloatBallPointerButton(event.button, IS_LINUX)) return;
     event.preventDefault();
 
     const target = event.currentTarget as HTMLElement;
@@ -121,8 +187,13 @@
 
     const screenX = event.screenX;
     const screenY = event.screenY;
+    const clientX = event.clientX;
+    const clientY = event.clientY;
 
-    Promise.all([appWindow.outerPosition(), appWindow.scaleFactor()])
+    Promise.all([
+      invoke<{ x: number; y: number }>("get_float_ball_position"),
+      appWindow.scaleFactor(),
+    ])
       .then(([pos, scale]) => {
         dragState = {
           pointerId: event.pointerId,
@@ -130,17 +201,25 @@
           startScreenY: screenY,
           startWindowX: pos.x,
           startWindowY: pos.y,
-          scale,
+          screenToPhysicalScale: detectScreenToPhysicalScale({
+            scale,
+            windowX: pos.x,
+            windowY: pos.y,
+            clientX,
+            clientY,
+            screenX,
+            screenY,
+          }),
           initiated: false,
         };
       })
       .catch(() => {
-        target.releasePointerCapture(event.pointerId);
+        releasePointerCapture(target, event.pointerId);
       });
   }
 
   function onPointerMove(event: PointerEvent) {
-    if (!dragState) return;
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
 
     const dx = event.screenX - dragState.startScreenX;
     const dy = event.screenY - dragState.startScreenY;
@@ -151,20 +230,29 @@
     }
 
     if (dragState.initiated) {
-      const newX = dragState.startWindowX + Math.round(dx * dragState.scale);
-      const newY = dragState.startWindowY + Math.round(dy * dragState.scale);
+      const { x: newX, y: newY } = getPhysicalWindowPositionFromPointer({
+        startScreenX: dragState.startScreenX,
+        startScreenY: dragState.startScreenY,
+        startWindowX: dragState.startWindowX,
+        startWindowY: dragState.startWindowY,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        screenToPhysicalScale: dragState.screenToPhysicalScale,
+      });
       invoke("move_float_ball_to", { x: newX, y: newY }).catch(() => {});
     }
   }
 
   function onPointerUp(event: PointerEvent) {
-    const target = event.currentTarget as HTMLElement;
-    target.releasePointerCapture(event.pointerId);
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
 
-    const wasDragging = dragState?.initiated ?? false;
+    const target = event.currentTarget as HTMLElement;
+    releasePointerCapture(target, event.pointerId);
+
+    const wasDragging = dragState.initiated;
     dragState = null;
     dragging = false;
-    suppressShellClick = wasDragging;
+    suppressShellClick = true;
 
     if (wasDragging) {
       if (!expanded) {
@@ -184,7 +272,7 @@
     }
 
     const target = event.target;
-    if (target instanceof HTMLElement && target.closest(".ball")) {
+    if (target instanceof HTMLElement && target.closest(".ball-handle")) {
       return;
     }
 
@@ -196,7 +284,7 @@
     if (event.key !== "Enter" && event.key !== " ") return;
 
     const target = event.target;
-    if (target instanceof HTMLElement && target.closest(".ball")) {
+    if (target instanceof HTMLElement && target.closest(".ball-handle")) {
       return;
     }
 
@@ -207,30 +295,32 @@
   onMount(() => {
     void refreshSummary();
 
-    let cleanupWidget: (() => void) | undefined;
-    let cleanupData: (() => void) | undefined;
-    let cleanupBlur: (() => void) | undefined;
+    let destroyed = false;
+    const cleanups: (() => void)[] = [];
 
-    listen("status-widget-updated", () => refreshSummary()).then((fn) => {
-      cleanupWidget = fn;
-    });
-    listen("data-updated", () => refreshSummary()).then((fn) => {
-      cleanupData = fn;
-    });
+    function registerListener(promise: Promise<() => void>) {
+      promise.then((fn) => {
+        if (destroyed) {
+          fn(); // Already unmounted — clean up immediately.
+        } else {
+          cleanups.push(fn);
+        }
+      });
+    }
 
-    // Collapse when the float ball window loses focus (user clicked elsewhere).
-    listen("tauri://blur", () => {
-      if (expanded && !dragging && Date.now() >= ignoreBlurUntil) {
-        void setExpanded(false);
-      }
-    }).then((fn) => {
-      cleanupBlur = fn;
-    });
+    registerListener(listen("status-widget-updated", () => refreshSummary()));
+    registerListener(listen("data-updated", () => refreshSummary()));
+    registerListener(
+      listen("tauri://blur", () => {
+        if (expanded && !dragging && Date.now() >= ignoreBlurUntil) {
+          void setExpanded(false);
+        }
+      }),
+    );
 
     return () => {
-      cleanupWidget?.();
-      cleanupData?.();
-      cleanupBlur?.();
+      destroyed = true;
+      for (const fn of cleanups) fn();
     };
   });
 </script>
@@ -238,6 +328,7 @@
 <div
   class="shell"
   class:expanded
+  class:linux={IS_LINUX}
   data-direction={expandDirection}
   role="button"
   aria-label="Floating status widget"
@@ -341,6 +432,13 @@
       0 0 0 1px rgba(255, 255, 255, 0.12),
       inset 0 1px 2px rgba(255, 255, 255, 0.15),
       inset 0 -2px 8px rgba(0, 0, 0, 0.6);
+  }
+
+  /* Linux: disable width transition to prevent ghost artifacts on transparent windows */
+  .shell.linux .capsule {
+    transition:
+      background 200ms ease,
+      box-shadow 200ms ease;
   }
 
   .shell[data-direction="left"] .capsule {

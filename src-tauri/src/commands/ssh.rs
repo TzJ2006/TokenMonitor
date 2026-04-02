@@ -172,11 +172,16 @@ pub async fn sync_ssh_host(
     }
 
     // Step 2: Connection OK — proceed with sync.
-    let cache_mgr = state.ssh_cache.read().await;
-    let count = match cache_mgr.as_ref() {
-        Some(mgr) => mgr.sync_host(&alias).await?,
-        None => return Err("SSH cache not initialized".to_string()),
+    // Clone the cache manager and drop the read lock before the long SSH I/O
+    // to avoid holding the RwLock across the await (potentially 10+ seconds).
+    let mgr = {
+        let cache_mgr = state.ssh_cache.read().await;
+        cache_mgr
+            .as_ref()
+            .ok_or_else(|| "SSH cache not initialized".to_string())?
+            .clone()
     };
+    let count = mgr.sync_host(&alias).await?;
 
     let diagnostic = if count == 0 {
         Some(
@@ -229,7 +234,7 @@ pub async fn get_device_usage(
     if let Some(mgr) = cache_mgr.as_ref() {
         let statuses = mgr.host_statuses(&configs);
         for cfg in configs.iter().filter(|c| c.enabled) {
-            let records = mgr.load_cached_records(&cfg.alias);
+            let records = mgr.load_cached_records(&cfg.alias).unwrap_or_default();
             let mut summary = build_device_summary_from_compact(&cfg.alias, &records, since, end);
 
             // Enrich with status from cache manager.
@@ -442,7 +447,7 @@ pub(crate) async fn build_device_breakdown_for_payload(
     if let Some(mgr) = cache_mgr.as_ref() {
         let statuses = mgr.host_statuses(&configs);
         for cfg in configs.iter().filter(|c| c.enabled) {
-            let all_records = mgr.load_cached_records(&cfg.alias);
+            let all_records = mgr.load_cached_records(&cfg.alias).unwrap_or_default();
             let filtered: Vec<_> = all_records
                 .into_iter()
                 .filter(|r| compact_record_matches_provider(r, provider))
@@ -513,7 +518,7 @@ pub(crate) async fn build_included_devices_payload(
     let mut output_tokens = 0_u64;
 
     for cfg in &included {
-        let records = mgr.load_cached_records(&cfg.alias);
+        let records = mgr.load_cached_records(&cfg.alias).unwrap_or_default();
         for record in records
             .iter()
             .filter(|r| compact_record_matches_provider(r, provider))
@@ -695,7 +700,7 @@ pub(crate) async fn build_device_time_chart_buckets(
         let cache_mgr = state.ssh_cache.read().await;
         if let Some(mgr) = cache_mgr.as_ref() {
             for cfg in configs.iter().filter(|c| c.enabled) {
-                let records = mgr.load_cached_records(&cfg.alias);
+                let records = mgr.load_cached_records(&cfg.alias).unwrap_or_default();
                 for record in records
                     .iter()
                     .filter(|r| compact_record_matches_provider(r, provider))
@@ -871,7 +876,7 @@ pub async fn get_single_device_usage(
     } else {
         let cache_mgr = state.ssh_cache.read().await;
         if let Some(mgr) = cache_mgr.as_ref() {
-            let records = mgr.load_cached_records(&device);
+            let records = mgr.load_cached_records(&device).unwrap_or_default();
             for record in &records {
                 let record_date = chrono::DateTime::parse_from_rfc3339(&record.ts)
                     .or_else(|_| {
