@@ -75,7 +75,8 @@ pub(crate) fn get_monthly_usage_with_debug_sync(
     let month_start = NaiveDate::from_ymd_opt(year, month, 1)
         .ok_or_else(|| format!("Invalid date: year={year}, month={month}"))?;
 
-    let end_date = first_of_next_month(year, month);
+    let end_date = first_of_next_month(year, month)
+        .ok_or_else(|| format!("Invalid next month: year={year}, month={month}"))?;
 
     #[allow(clippy::type_complexity)]
     let fetch_for_provider = |prov: &str| -> Result<
@@ -158,7 +159,8 @@ async fn get_monthly_usage_with_debug(
     let month_offset = month_offset_from_now(year, month);
     let month_start = NaiveDate::from_ymd_opt(year, month, 1)
         .ok_or_else(|| format!("Invalid date: year={year}, month={month}"))?;
-    let end_date = first_of_next_month(year, month);
+    let end_date = first_of_next_month(year, month)
+        .ok_or_else(|| format!("Invalid next month: year={year}, month={month}"))?;
 
     let (mut payload, queries) = get_monthly_usage_with_debug_sync(state, provider, year, month)?;
 

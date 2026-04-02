@@ -105,11 +105,14 @@ async function runTauriBuild(context) {
     args.push("--no-sign");
   }
 
-  await runCommand(npxCommand(), args, {
+  const result = await runCommand(npxCommand(), args, {
     cwd: REPO_ROOT,
     env: process.env,
     stdio: "inherit",
   });
+  if (result.code !== 0) {
+    throw new Error(`Tauri build failed with exit code ${result.code}`);
+  }
 }
 
 function shouldDisableSigning(platformId) {
