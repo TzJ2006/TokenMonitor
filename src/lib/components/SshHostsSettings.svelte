@@ -15,8 +15,10 @@
   let sshTestingHost = $state<string | null>(null);
   let sshSyncing = $state(false);
   let sshSyncResult = $state<{ total: number; msg: string } | null>(null);
+  let destroyed = false;
 
   onMount(() => {
+    destroyed = false;
     sshConfiguredHosts = current.sshHosts.map((h) => ({
       alias: h.alias,
       enabled: h.enabled,
@@ -38,6 +40,10 @@
         }));
       })
       .catch(() => {});
+
+    return () => {
+      destroyed = true;
+    };
   });
 
   async function testSshHost(alias: string) {
@@ -97,8 +103,10 @@
     let totalRecords = 0;
     let failedHosts: string[] = [];
     for (const host of sshConfiguredHosts.filter((h) => h.enabled)) {
+      if (destroyed) return;
       try {
         const result = await invoke<SshSyncResult>("sync_ssh_host", { alias: host.alias });
+        if (destroyed) return;
         sshTestResults = {
           ...sshTestResults,
           [host.alias]: {
@@ -113,10 +121,12 @@
           totalRecords += result.recordsSynced;
         }
       } catch (e) {
+        if (destroyed) return;
         failedHosts.push(host.alias);
         console.error(`Sync failed for ${host.alias}:`, e);
       }
     }
+    if (destroyed) return;
     sshSyncing = false;
     const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
     if (failedHosts.length > 0) {
@@ -126,7 +136,7 @@
       sshSyncResult = { total: totalRecords, msg: `${detail} in ${elapsed}s` };
     }
     logger.info("ssh", `Sync done: ${totalRecords} records, ${failedHosts.length} failures`);
-    setTimeout(() => { sshSyncResult = null; }, 4000);
+    setTimeout(() => { if (!destroyed) sshSyncResult = null; }, 4000);
   }
 </script>
 

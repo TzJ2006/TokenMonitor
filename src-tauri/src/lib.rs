@@ -100,6 +100,15 @@ fn move_window_near_tray(window: &tauri::WebviewWindow) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Force X11 backend on Wayland sessions so set_position() works.
+    // Wayland compositors ignore client-side window positioning entirely,
+    // which causes the popover to appear at a compositor-chosen default
+    // position instead of the top-right corner.
+    #[cfg(target_os = "linux")]
+    if std::env::var("GDK_BACKEND").is_err() && std::env::var("WAYLAND_DISPLAY").is_ok() {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -248,6 +257,13 @@ pub fn run() {
                 });
             }
 
+            // Pre-position the hidden window on Linux so the WM has a position
+            // hint before the first show — some compositors respect this.
+            #[cfg(target_os = "linux")]
+            if let Some(ref w) = app.get_webview_window("main") {
+                platform::linux::position_top_right(w);
+            }
+
             // Initialize SSH cache manager with Tauri app data dir.
             if let Ok(app_data) = app.path().app_data_dir() {
                 let state = app.state::<commands::AppState>();
@@ -306,6 +322,7 @@ pub fn run() {
             commands::float_ball::set_float_ball_expanded,
             commands::float_ball::move_float_ball_to,
             commands::float_ball::snap_float_ball,
+            commands::float_ball::get_float_ball_position,
             commands::float_ball::init_taskbar_panel,
             commands::float_ball::destroy_taskbar_panel_cmd,
             commands::ssh::get_ssh_hosts,

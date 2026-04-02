@@ -21,11 +21,12 @@ pub(crate) fn resolve_month_offset(base_year: i32, base_month: u32, offset: i32)
 }
 
 /// Return the first day of the month following (year, month).
-pub(crate) fn first_of_next_month(year: i32, month: u32) -> NaiveDate {
+/// Returns None if the resulting date is out of range.
+pub(crate) fn first_of_next_month(year: i32, month: u32) -> Option<NaiveDate> {
     if month == 12 {
-        NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
+        NaiveDate::from_ymd_opt(year.checked_add(1)?, 1, 1)
     } else {
-        NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap()
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
     }
 }
 
@@ -46,13 +47,15 @@ pub(crate) fn compute_date_bounds(period: &str, offset: i32) -> Option<(NaiveDat
         }
         "month" => {
             let (y, m) = resolve_month_offset(now.year(), now.month(), offset);
-            let first = NaiveDate::from_ymd_opt(y, m, 1).unwrap();
-            Some((first, first_of_next_month(y, m)))
+            let first = NaiveDate::from_ymd_opt(y, m, 1)?;
+            let end = first_of_next_month(y, m)?;
+            Some((first, end))
         }
         "year" => {
-            let ty = now.year() + offset;
-            let first = NaiveDate::from_ymd_opt(ty, 1, 1).unwrap();
-            Some((first, NaiveDate::from_ymd_opt(ty + 1, 1, 1).unwrap()))
+            let ty = now.year().checked_add(offset)?;
+            let first = NaiveDate::from_ymd_opt(ty, 1, 1)?;
+            let end = NaiveDate::from_ymd_opt(ty.checked_add(1)?, 1, 1)?;
+            Some((first, end))
         }
         _ => None,
     }

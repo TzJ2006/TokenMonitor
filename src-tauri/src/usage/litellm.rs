@@ -37,6 +37,9 @@ const LITELLM_URL: &str =
 const CACHE_FILENAME: &str = "pricing-cache.json";
 const CACHE_TTL_SECS: u64 = 24 * 60 * 60; // 24 hours
 const PER_MTOK: f64 = 1_000_000.0;
+/// Sanity upper bound: reject per-million-token rates above $500.
+/// Current max is ~$75/Mtok (output) so this is 6x+ headroom.
+const MAX_RATE_PER_MTOK: f64 = 500.0;
 
 fn cache_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join(CACHE_FILENAME)
@@ -181,6 +184,15 @@ fn parse_litellm_json(
                     input * 0.25
                 }
             });
+
+        // Reject wildly out-of-range values that could indicate bad upstream data.
+        if input > MAX_RATE_PER_MTOK
+            || output > MAX_RATE_PER_MTOK
+            || cache_write_5m > MAX_RATE_PER_MTOK
+            || cache_read > MAX_RATE_PER_MTOK
+        {
+            continue;
+        }
 
         let model_rates = DynamicModelRates {
             input,

@@ -294,10 +294,16 @@ mod tests {
     #[test]
     fn get_claude_oauth_token_reads_env_override() {
         let json = r#"{"claudeAiOauth":{"accessToken":"sk-from-env"}}"#;
-        // Temporarily set the env var for this test.
-        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", json);
+        // SAFETY: This test must not run concurrently with other tests that
+        // read/write the same env var. `cargo test` runs tests in the same
+        // binary serially by default within a single thread for #[test].
+        unsafe {
+            std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", json);
+        }
         let result = get_claude_oauth_token();
-        std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        unsafe {
+            std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        }
         assert_eq!(result.unwrap(), "sk-from-env");
     }
 }

@@ -1,6 +1,5 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onMount } from "svelte";
   import { formatCost, formatTimeAgo, deviceColor } from "../utils/format.js";
   import { activePeriod, activeOffset } from "../stores/usage.js";
   import type { DeviceUsagePayload, DeviceSummary } from "../types/index.js";
@@ -42,11 +41,8 @@
     loading = false;
   }
 
-  onMount(() => {
-    fetchDeviceData();
-  });
-
-  // Refetch when period/offset changes.
+  // Fetch on mount and refetch when period/offset changes.
+  // In Svelte 5, $effect runs immediately on mount, so onMount is not needed.
   $effect(() => {
     void period;
     void offset;
