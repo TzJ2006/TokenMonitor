@@ -49,8 +49,12 @@ echo "Releasing $TAG..."
 
 # ── Bump versions ─────────────────────────────────────────────────────────────
 
-# 1. src-tauri/Cargo.toml
-sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+# 1. src-tauri/Cargo.toml (cross-platform sed: macOS needs '', GNU doesn't)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+else
+  sed -i "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+fi
 
 # 2. src-tauri/tauri.conf.json
 python3 -c "

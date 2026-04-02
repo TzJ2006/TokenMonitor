@@ -120,10 +120,10 @@ jobs:
       - name: Write API key
         if: matrix.platform == 'macos' && env.HAS_APPLE_CERT == 'true'
         env:
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY }}
         run: |
           P8_PATH="$RUNNER_TEMP/apikey.p8"
-          echo "$APPLE_API_KEY" > "$P8_PATH"
+          echo "$APPLE_API_KEY_CONTENT" > "$P8_PATH"
           echo "APPLE_API_KEY_PATH=$P8_PATH" >> "$GITHUB_ENV"
 
       # ── Build installers ───────────────────────────────────────────────────
