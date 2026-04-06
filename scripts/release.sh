@@ -3,7 +3,7 @@
 # Example: ./scripts/release.sh 0.3.0
 #
 # Bumps version in all 3 files, commits, tags, and pushes.
-# The GitHub Actions release workflow picks up the tag and builds the signed DMG.
+# The GitHub Actions release workflow picks up the tag and builds the native installers.
 
 set -e
 
@@ -49,8 +49,12 @@ echo "Releasing $TAG..."
 
 # ── Bump versions ─────────────────────────────────────────────────────────────
 
-# 1. src-tauri/Cargo.toml
-sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+# 1. src-tauri/Cargo.toml (cross-platform sed: macOS needs '', GNU doesn't)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+else
+  sed -i "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+fi
 
 # 2. src-tauri/tauri.conf.json
 python3 -c "
@@ -102,5 +106,5 @@ git push origin "$TAG"
 
 echo ""
 echo "✓ Released $TAG"
-echo "  GitHub Actions will now build, sign, and publish the DMG."
+echo "  GitHub Actions will now build, sign where configured, and publish the installers."
 echo "  Track progress: https://github.com/Michael-OvO/TokenMonitor/actions"
