@@ -88,21 +88,23 @@ fn system_tray_is_dark() -> bool {
 
     let mut hkey = HKEY::default();
     let subkey = w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
-    if RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &mut hkey).is_ok() {
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &mut hkey) }.is_ok() {
         let mut data: u32 = 1;
         let mut size = std::mem::size_of::<u32>() as u32;
         let value_name = w!("SystemUsesLightTheme");
-        let is_dark = RegQueryValueExW(
-            hkey,
-            value_name,
-            None,
-            None,
-            Some(std::ptr::from_mut(&mut data).cast()),
-            Some(&mut size),
-        )
+        let is_dark = unsafe {
+            RegQueryValueExW(
+                hkey,
+                value_name,
+                None,
+                None,
+                Some(std::ptr::from_mut(&mut data).cast()),
+                Some(&mut size),
+            )
+        }
         .is_ok()
             && data == 0;
-        let _ = RegCloseKey(hkey);
+        let _ = unsafe { RegCloseKey(hkey) };
         return is_dark;
     }
 
