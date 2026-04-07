@@ -320,6 +320,7 @@ pub fn run() {
             commands::float_ball::create_float_ball,
             commands::float_ball::destroy_float_ball,
             commands::float_ball::set_float_ball_expanded,
+            commands::float_ball::set_float_ball_dragging,
             commands::float_ball::move_float_ball_to,
             commands::float_ball::snap_float_ball,
             commands::float_ball::get_float_ball_position,
@@ -338,6 +339,7 @@ pub fn run() {
             commands::ssh::toggle_device_include_in_stats,
             commands::logging::log_frontend_message,
             commands::logging::set_log_level,
+            commands::logging::get_log_level,
             commands::logging::get_log_dir,
         ])
         .run(tauri::generate_context!())
