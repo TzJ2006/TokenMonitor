@@ -4109,9 +4109,11 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "token-monitor"
 version = "0.6.2"
 dependencies = [
+ "cairo-rs",
  "chrono",
  "dirs 6.0.0",
  "filetime",
+ "gtk",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -4128,6 +4130,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "webkit2gtk",
  "windows 0.58.0",
 ]
 
