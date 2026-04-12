@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+pub mod archive;
+#[allow(dead_code)]
 pub mod ccusage;
 pub mod integrations;
 pub mod litellm;

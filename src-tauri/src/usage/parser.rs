@@ -1602,6 +1602,7 @@ pub struct UsageParser {
     file_cache: Mutex<HashMap<String, CachedFileEntries>>,
     root_file_lists: Mutex<HashMap<String, CachedRootFileList>>,
     last_query_debug: Mutex<Option<UsageQueryDebugReport>>,
+    archive: Mutex<Option<super::archive::ArchiveManager>>,
 }
 
 fn prune_payload_cache(cache: &mut HashMap<String, PayloadCacheEntry>) {
@@ -1703,7 +1704,19 @@ impl UsageParser {
             file_cache: Mutex::new(HashMap::new()),
             root_file_lists: Mutex::new(HashMap::new()),
             last_query_debug: Mutex::new(None),
+            archive: Mutex::new(None),
         }
+    }
+
+    /// Set the archive manager for persistent hourly data storage.
+    /// Once set, `load_entries()` merges archived data with live source data.
+    pub fn set_archive(&self, archive: super::archive::ArchiveManager) {
+        *self.archive.lock().unwrap() = Some(archive);
+    }
+
+    /// Access the archive manager (if set).
+    pub fn archive(&self) -> Option<super::archive::ArchiveManager> {
+        self.archive.lock().unwrap().clone()
     }
 
     /// Create with default home-directory paths.
@@ -2142,19 +2155,48 @@ impl UsageParser {
         let mut change_events = Vec::new();
         let mut reports = Vec::new();
 
+        let archive_guard = self.archive.lock().unwrap();
+        let archive = archive_guard.as_ref();
+
         for integration_id in selection.integration_ids() {
+            let source_key = format!("local:{}", integration_id.as_str());
+            let frontier = archive.and_then(|a| a.frontier(&source_key));
+
+            // Load archived entries for completed hours (up to frontier).
+            if let (Some(a), Some(_frontier)) = (archive, frontier) {
+                let archived = a.load_archived(&source_key, since);
+                entries.extend(archived);
+            }
+
+            // Load live entries from source JSONL files.
             match integration_id {
                 UsageIntegrationId::Claude => {
                     let (next_entries, next_change_events, next_reports) =
                         self.load_claude_entries_with_debug(since);
-                    entries.extend(next_entries);
+
+                    // If archive covers some hours, filter live entries to
+                    // only include those AFTER the archive frontier.
+                    if let Some(ref f) = frontier {
+                        entries.extend(next_entries.into_iter().filter(|e| {
+                            !f.covers(e.timestamp.date_naive(), e.timestamp.hour() as u8)
+                        }));
+                    } else {
+                        entries.extend(next_entries);
+                    }
                     change_events.extend(next_change_events);
                     reports.extend(next_reports);
                 }
                 UsageIntegrationId::Codex => {
                     let (next_entries, next_change_events, next_report) =
                         self.load_codex_entries_with_debug(since);
-                    entries.extend(next_entries);
+
+                    if let Some(ref f) = frontier {
+                        entries.extend(next_entries.into_iter().filter(|e| {
+                            !f.covers(e.timestamp.date_naive(), e.timestamp.hour() as u8)
+                        }));
+                    } else {
+                        entries.extend(next_entries);
+                    }
                     change_events.extend(next_change_events);
                     reports.push(next_report);
                 }
