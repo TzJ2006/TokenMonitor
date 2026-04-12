@@ -7,6 +7,7 @@ mod stats;
 mod tray;
 mod usage;
 
+use chrono::Timelike;
 use commands::{
     sync_tray_title,
     tray::{patch_tray_utilization, tray_utilization_from_rate_limits},
@@ -264,18 +265,26 @@ pub fn run() {
                 platform::linux::position_top_right(w);
             }
 
-            // Initialize SSH cache manager with Tauri app data dir.
+            // Initialize SSH cache manager and usage archive with Tauri app data dir.
             if let Ok(app_data) = app.path().app_data_dir() {
                 let state = app.state::<commands::AppState>();
                 let mut cache = state.ssh_cache.blocking_write();
                 *cache = Some(usage::ssh_remote::SshCacheManager::new(&app_data));
+
+                // Initialize usage archive for data loss prevention.
+                let archive = usage::archive::ArchiveManager::new(&app_data);
+                state.parser.set_archive(archive);
+                tracing::info!(
+                    "Usage archive initialized at {:?}",
+                    app_data.join("usage-archive")
+                );
 
                 // Load cached dynamic pricing immediately (non-blocking).
                 if let Some(rates) = usage::litellm::load_cached(&app_data) {
                     usage::pricing::set_dynamic_pricing(rates);
                 }
 
-                // Spawn async refresh if cache is stale (>7 days).
+                // Spawn async refresh if cache is stale (>7 days) or version-mismatched.
                 if usage::litellm::should_refresh(&app_data) {
                     let data_dir = app_data.clone();
                     tauri::async_runtime::spawn(async move {
@@ -443,6 +452,10 @@ async fn background_loop(app: tauri::AppHandle) {
 
         sync_tray_title(&app, &state).await;
 
+        // Archive completed hours for data loss prevention.
+        // Runs every cycle (~30s) but is fast: only writes when new hours are complete.
+        archive_local_usage(&state);
+
         // Periodically sync SSH hosts in background.
         if ssh_sync_counter >= SSH_SYNC_EVERY_N_CYCLES {
             ssh_sync_counter = 0;
@@ -452,10 +465,155 @@ async fn background_loop(app: tauri::AppHandle) {
                 state.parser.invalidate_if_changed();
                 let _ = app.emit("data-updated", update_counter);
             }
+            // Archive SSH device data for data loss prevention.
+            archive_ssh_device_usage(&state).await;
         }
 
         if changed {
             let _ = app.emit("data-updated", update_counter);
+        }
+    }
+}
+
+/// Archive completed hours for all local providers.
+/// Fast no-op when no new hours have completed since the last archive.
+fn archive_local_usage(state: &AppState) {
+    let Some(archive) = state.parser.archive() else {
+        return;
+    };
+
+    let now = chrono::Local::now();
+    let current_date = now.date_naive();
+    let current_hour = now.hour() as u8;
+
+    // Archive each local provider independently.
+    for (provider, integration_id) in [
+        ("claude", usage::integrations::UsageIntegrationId::Claude),
+        ("codex", usage::integrations::UsageIntegrationId::Codex),
+    ] {
+        let source_key = format!("local:{provider}");
+
+        // Quick check: skip if frontier is already up to date.
+        if let Some(frontier) = archive.frontier(&source_key) {
+            if frontier.is_up_to_date(current_date, current_hour) {
+                continue;
+            }
+        }
+
+        // Load entries for this provider. The parser's file cache makes this fast.
+        let (entries, _, _) = state.parser.load_entries(integration_id.as_str(), None);
+
+        let count = archive.archive_completed_hours(
+            &entries,
+            &source_key,
+            provider,
+            current_date,
+            current_hour,
+        );
+
+        if count > 0 {
+            tracing::debug!(
+                provider = provider,
+                records = count,
+                "Archived {count} hourly aggregate records for {provider}"
+            );
+        }
+    }
+}
+
+/// Archive SSH device usage data from remote-cache into hourly aggregates.
+async fn archive_ssh_device_usage(state: &AppState) {
+    let Some(archive) = state.parser.archive() else {
+        return;
+    };
+
+    let configs = state.ssh_hosts.read().await;
+    let enabled: Vec<String> = configs
+        .iter()
+        .filter(|c| c.enabled)
+        .map(|c| c.alias.clone())
+        .collect();
+    drop(configs);
+
+    if enabled.is_empty() {
+        return;
+    }
+
+    let cache_mgr = state.ssh_cache.read().await;
+    let Some(mgr) = cache_mgr.as_ref() else {
+        return;
+    };
+
+    let now = chrono::Local::now();
+    let current_date = now.date_naive();
+    let current_hour = now.hour() as u8;
+
+    for alias in &enabled {
+        let source_key = format!("device:{alias}");
+
+        // Quick frontier check: skip if already up to date.
+        if let Some(frontier) = archive.frontier(&source_key) {
+            if frontier.is_up_to_date(current_date, current_hour) {
+                continue;
+            }
+        }
+
+        let records = match mgr.load_cached_records(alias) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        // Convert CompactUsageRecord → ParsedEntry for archiving.
+        let entries: Vec<usage::parser::ParsedEntry> = records
+            .iter()
+            .filter_map(|r| {
+                let dt = chrono::DateTime::parse_from_rfc3339(&r.ts)
+                    .or_else(|_| chrono::DateTime::parse_from_str(&r.ts, "%Y-%m-%dT%H:%M:%S%.f%z"));
+                let dt = match dt {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            device = alias.as_str(),
+                            ts = %r.ts,
+                            error = %e,
+                            "Skipping record with unparseable timestamp"
+                        );
+                        return None;
+                    }
+                };
+                let local_dt = dt.with_timezone(&chrono::Local);
+                Some(usage::parser::ParsedEntry {
+                    timestamp: local_dt,
+                    model: r.model.clone(),
+                    input_tokens: r.input_tokens,
+                    output_tokens: r.output_tokens,
+                    cache_creation_5m_tokens: r.cache_5m,
+                    cache_creation_1h_tokens: r.cache_1h,
+                    cache_read_tokens: r.cache_read,
+                    web_search_requests: 0,
+                    unique_hash: None,
+                    session_key: format!("ssh:{alias}"),
+                    agent_scope: crate::stats::subagent::AgentScope::Main,
+                })
+            })
+            .collect();
+
+        // Determine provider from records (SSH can have both Claude and Codex).
+        // Archive as "all" since device records mix providers.
+        let count = archive.archive_completed_hours(
+            &entries,
+            &source_key,
+            "all",
+            current_date,
+            current_hour,
+        );
+
+        if count > 0 {
+            tracing::debug!(
+                device = alias.as_str(),
+                records = count,
+                "Archived {count} hourly aggregate records for device {alias}"
+            );
         }
     }
 }
