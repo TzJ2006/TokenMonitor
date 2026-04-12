@@ -247,13 +247,24 @@ pub async fn get_device_usage(
     let mut devices = vec![local_summary];
     let mut total_cost = devices[0].total_cost;
 
-    // 2. Remote device usage from compact cached records.
+    // 2. Remote device usage from archive + compact cached records.
     let configs = state.ssh_hosts.read().await;
     let cache_mgr = state.ssh_cache.read().await;
+    let archive = parser.archive();
 
     if let Some(mgr) = cache_mgr.as_ref() {
         let statuses = mgr.host_statuses(&configs);
         for cfg in configs.iter().filter(|c| c.enabled) {
+            let source_key = format!("device:{}", cfg.alias);
+            let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
+
+            // Load archived entries for this device (completed hours).
+            let archived_entries = archive
+                .as_ref()
+                .map(|a| a.load_archived(&source_key, Some(since)))
+                .unwrap_or_default();
+
+            // Load live compact records from remote-cache.
             let records = match mgr.load_cached_records(&cfg.alias) {
                 Ok(r) => r,
                 Err(e) => {
@@ -261,7 +272,31 @@ pub async fn get_device_usage(
                     Vec::new()
                 }
             };
-            let mut summary = build_device_summary_from_compact(&cfg.alias, &records, since, end);
+
+            // Filter live records: exclude hours covered by the archive frontier.
+            let live_records: Vec<&CompactUsageRecord> = if let Some(ref f) = frontier {
+                records
+                    .iter()
+                    .filter(|r| {
+                        let dt = parse_remote_ts(&r.ts).map(|d| d.with_timezone(&chrono::Local));
+                        match dt {
+                            Some(local) => !f.covers(local.date_naive(), local.hour() as u8),
+                            None => true, // Can't parse → include as live.
+                        }
+                    })
+                    .collect()
+            } else {
+                records.iter().collect()
+            };
+
+            // Build summary: archived entries + live compact records.
+            let mut summary = build_device_summary_merged(
+                &cfg.alias,
+                &archived_entries,
+                &live_records,
+                since,
+                end,
+            );
 
             // Enrich with status from cache manager.
             if let Some(host_status) = statuses.iter().find(|s| s.alias == cfg.alias) {
@@ -378,6 +413,75 @@ fn build_device_summary_from_compact(
         );
         let tokens = record.input_tokens + record.output_tokens;
 
+        let agg = model_map
+            .entry(model_key)
+            .or_insert_with(|| (display_name, 0.0, 0));
+        agg.1 += cost;
+        agg.2 += tokens;
+    }
+
+    finish_device_summary(device_name, model_map)
+}
+
+/// Build a DeviceSummary from archived ParsedEntry + live compact records.
+/// Archived entries cover completed hours; live records cover the current hour.
+fn build_device_summary_merged(
+    device_name: &str,
+    archived_entries: &[crate::usage::parser::ParsedEntry],
+    live_records: &[&CompactUsageRecord],
+    since: chrono::NaiveDate,
+    end: chrono::NaiveDate,
+) -> DeviceSummary {
+    use crate::models::normalize_model;
+    use crate::usage::pricing::calculate_cost_for_key;
+    use std::collections::HashMap;
+
+    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+
+    // Process archived entries.
+    for entry in archived_entries {
+        let entry_date = entry.timestamp.date_naive();
+        if entry_date < since || entry_date >= end {
+            continue;
+        }
+        let (display_name, model_key) = normalize_model(&entry.model);
+        let cost = calculate_cost_for_key(
+            &model_key,
+            entry.input_tokens,
+            entry.output_tokens,
+            entry.cache_creation_5m_tokens,
+            entry.cache_creation_1h_tokens,
+            entry.cache_read_tokens,
+            0,
+        );
+        let tokens = entry.input_tokens + entry.output_tokens;
+        let agg = model_map
+            .entry(model_key)
+            .or_insert_with(|| (display_name, 0.0, 0));
+        agg.1 += cost;
+        agg.2 += tokens;
+    }
+
+    // Process live compact records (hours after archive frontier).
+    for record in live_records {
+        if record.model.starts_with('<') {
+            continue;
+        }
+        let record_date = parse_remote_ts_to_local_date(&record.ts);
+        if record_date < since || record_date >= end {
+            continue;
+        }
+        let (display_name, model_key) = normalize_model(&record.model);
+        let cost = calculate_cost_for_key(
+            &model_key,
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_5m,
+            record.cache_1h,
+            record.cache_read,
+            0,
+        );
+        let tokens = record.input_tokens + record.output_tokens;
         let agg = model_map
             .entry(model_key)
             .or_insert_with(|| (display_name, 0.0, 0));
