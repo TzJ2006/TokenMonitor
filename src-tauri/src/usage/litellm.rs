@@ -15,8 +15,17 @@ pub struct DynamicModelRates {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PricingCache {
     fetched_at: u64,
+    /// Cache format version. Bumped when pricing sources change (e.g. adding
+    /// OpenRouter) so that stale caches are automatically invalidated.
+    #[serde(default)]
+    version: u32,
     rates: HashMap<String, DynamicModelRates>,
 }
+
+/// Current cache version. Bump this whenever a new pricing data source is
+/// added or the cache format changes, to force re-fetch on next startup.
+/// v1 = LiteLLM only, v2 = LiteLLM + OpenRouter.
+const CACHE_VERSION: u32 = 2;
 
 /// Raw entry from the LiteLLM JSON (only the fields we need).
 #[derive(Debug, serde::Deserialize)]
@@ -52,22 +61,35 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-/// Check if the local cache needs refreshing (missing or older than 7 days).
+/// Check if the local cache needs refreshing (missing, corrupt, wrong version,
+/// or older than 7 days).
 pub fn should_refresh(app_data_dir: &Path) -> bool {
     let path = cache_path(app_data_dir);
     match std::fs::read_to_string(&path) {
         Ok(content) => match serde_json::from_str::<PricingCache>(&content) {
-            Ok(cache) => now_epoch().saturating_sub(cache.fetched_at) > CACHE_TTL_SECS,
+            Ok(cache) => {
+                cache.version != CACHE_VERSION
+                    || now_epoch().saturating_sub(cache.fetched_at) > CACHE_TTL_SECS
+            }
             Err(_) => true,
         },
         Err(_) => true,
     }
 }
 
-/// Load cached dynamic pricing from disk. Returns None if cache is missing or corrupt.
+/// Load cached dynamic pricing from disk. Returns None if cache is missing,
+/// corrupt, or from an older cache version (forces re-fetch).
 pub fn load_cached(app_data_dir: &Path) -> Option<HashMap<String, DynamicModelRates>> {
     let content = std::fs::read_to_string(cache_path(app_data_dir)).ok()?;
     let cache: PricingCache = serde_json::from_str(&content).ok()?;
+    if cache.version != CACHE_VERSION {
+        tracing::info!(
+            cached = cache.version,
+            current = CACHE_VERSION,
+            "Pricing cache version mismatch — will re-fetch"
+        );
+        return None;
+    }
     Some(cache.rates)
 }
 
@@ -128,10 +150,12 @@ pub async fn fetch_and_cache(
     #[derive(serde::Serialize)]
     struct PricingCacheRef<'a> {
         fetched_at: u64,
+        version: u32,
         rates: &'a HashMap<String, DynamicModelRates>,
     }
     let cache_ref = PricingCacheRef {
         fetched_at: now_epoch(),
+        version: CACHE_VERSION,
         rates: &rates,
     };
     let json = serde_json::to_string(&cache_ref).map_err(|e| format!("serialize: {e}"))?;
@@ -363,21 +387,33 @@ mod tests {
         // No cache file → should refresh.
         assert!(should_refresh(dir.path()));
 
-        // Write a fresh cache.
+        // Write a fresh cache with current version.
         let cache = PricingCache {
             fetched_at: now_epoch(),
+            version: CACHE_VERSION,
             rates: HashMap::new(),
         };
         let json = serde_json::to_string(&cache).unwrap();
         std::fs::write(cache_path(dir.path()), json).unwrap();
         assert!(!should_refresh(dir.path()));
 
-        // Write a stale cache (>24h ago).
+        // Write a stale cache (>7 days ago).
         let old_cache = PricingCache {
             fetched_at: now_epoch() - CACHE_TTL_SECS - 1,
+            version: CACHE_VERSION,
             rates: HashMap::new(),
         };
         let json = serde_json::to_string(&old_cache).unwrap();
+        std::fs::write(cache_path(dir.path()), json).unwrap();
+        assert!(should_refresh(dir.path()));
+
+        // Write a fresh cache with OLD version → should still refresh.
+        let old_version_cache = PricingCache {
+            fetched_at: now_epoch(),
+            version: CACHE_VERSION - 1,
+            rates: HashMap::new(),
+        };
+        let json = serde_json::to_string(&old_version_cache).unwrap();
         std::fs::write(cache_path(dir.path()), json).unwrap();
         assert!(should_refresh(dir.path()));
     }
