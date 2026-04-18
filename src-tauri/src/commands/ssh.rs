@@ -1505,6 +1505,7 @@ mod tests {
             cache_5m: 0,
             cache_1h: 0,
             cache_read: 0,
+            speed: None,
         }];
 
         // The record's local date depends on the machine's timezone.

@@ -227,7 +227,11 @@ fn get_fallback_rates(model: &str) -> ModelRates {
     match detect_model_family(model) {
         ModelFamily::Anthropic => {
             if model.contains("opus") {
-                claude_rates(5.00, 25.00)
+                if model.contains("fast") {
+                    claude_rates(30.00, 150.00)
+                } else {
+                    claude_rates(5.00, 25.00)
+                }
             } else if model.contains("sonnet") {
                 claude_rates(3.00, 15.00)
             } else if model.contains("haiku") {
@@ -335,6 +339,12 @@ mod tests {
     fn opus_4_bare_falls_back_to_family() {
         // "opus-4" without minor version → family fallback.
         assert!(approx_eq(cost("claude-opus-4-20250401", M, M), 30.00));
+    }
+
+    #[test]
+    fn opus_4_6_fast_uses_6x_pricing() {
+        // Fast mode: $30/$150 → (30+150)/M = $180/M
+        assert!(approx_eq(cost("claude-opus-4-6-fast", M, M), 180.00));
     }
 
     #[test]
