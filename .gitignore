@@ -37,6 +37,7 @@ scripts/*.exe
 # Build/lint artifacts
 src-tauri/clippy_ascii.txt
 src-tauri/clippy_errors.txt
+*.long-type-*.txt
 
 # User-specific Claude Code settings
 .claude/settings.local.json
