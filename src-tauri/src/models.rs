@@ -270,16 +270,27 @@ fn extract_claude_version(after_family: &str) -> Option<(&str, &str)> {
 
 pub fn normalize_claude_model(raw: &str) -> (String, String) {
     let normalized = raw.trim().to_ascii_lowercase();
+    let is_fast = normalized.ends_with("-fast");
+    let base = if is_fast {
+        &normalized[..normalized.len() - 5]
+    } else {
+        &normalized
+    };
+    let suffix_display = if is_fast { " Fast" } else { "" };
+    let suffix_key = if is_fast { "-fast" } else { "" };
     for &(family_lower, family_display) in CLAUDE_FAMILIES {
-        if let Some(pos) = normalized.find(family_lower) {
-            let after = &normalized[pos + family_lower.len()..];
+        if let Some(pos) = base.find(family_lower) {
+            let after = &base[pos + family_lower.len()..];
             if let Some((major, minor)) = extract_claude_version(after) {
                 return (
-                    format!("{family_display} {major}.{minor}"),
-                    format!("{family_lower}-{major}-{minor}"),
+                    format!("{family_display} {major}.{minor}{suffix_display}"),
+                    format!("{family_lower}-{major}-{minor}{suffix_key}"),
                 );
             }
-            return (family_display.into(), family_lower.into());
+            return (
+                format!("{family_display}{suffix_display}"),
+                format!("{family_lower}{suffix_key}"),
+            );
         }
     }
     ("Unknown".into(), "unknown".into())
@@ -533,6 +544,38 @@ mod tests {
     fn claude_opus_4_7_bare() {
         let (d, k) = normalize_claude_model("opus-4-7");
         assert_eq!((d.as_str(), k.as_str()), ("Opus 4.7", "opus-4-7"));
+    }
+
+    // ── fast mode ──
+
+    #[test]
+    fn claude_opus_4_6_fast() {
+        let (d, k) = normalize_claude_model("claude-opus-4-6-fast");
+        assert_eq!((d.as_str(), k.as_str()), ("Opus 4.6 Fast", "opus-4-6-fast"));
+    }
+
+    #[test]
+    fn claude_sonnet_4_6_fast() {
+        let (d, k) = normalize_claude_model("claude-sonnet-4-6-fast");
+        assert_eq!(
+            (d.as_str(), k.as_str()),
+            ("Sonnet 4.6 Fast", "sonnet-4-6-fast")
+        );
+    }
+
+    #[test]
+    fn claude_opus_bare_fast() {
+        let (d, k) = normalize_claude_model("opus-4-7-fast");
+        assert_eq!((d.as_str(), k.as_str()), ("Opus 4.7 Fast", "opus-4-7-fast"));
+    }
+
+    #[test]
+    fn claude_haiku_fast() {
+        let (d, k) = normalize_claude_model("claude-haiku-4-5-fast");
+        assert_eq!(
+            (d.as_str(), k.as_str()),
+            ("Haiku 4.5 Fast", "haiku-4-5-fast")
+        );
     }
 
     // ── edge cases ──
