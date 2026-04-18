@@ -53,6 +53,14 @@ const CODEX_COLOR: Color = Color {
     a: 255,
 }; // #7aafff
 
+const BADGE_COLOR: Color = Color {
+    r: 255,
+    g: 77,
+    b: 77,
+    a: 255,
+}; // red dot for update available
+const BADGE_RADIUS_PX: i32 = 4; // @2x → 8px diameter
+
 /// Track and icon colors adapt to menu bar appearance
 const TRACK_COLOR_DARK: Color = Color {
     r: 255,
@@ -166,9 +174,15 @@ pub fn render_tray_icon(
     claude_util: Option<f64>,
     codex_util: Option<f64>,
     dark_bar: bool,
+    update_available: bool,
 ) -> (Vec<u8>, u32, u32, bool) {
     // If bars are off, or we have no utilization data yet, return original icon for template mode
     if config.bar_display == BarDisplay::Off || !has_utilization(config, claude_util, codex_util) {
+        if update_available {
+            let mut buf = render_icon_only(base_icon, dark_bar);
+            draw_update_badge(&mut buf, ICON_W);
+            return (buf, ICON_W, ICON_H, false);
+        }
         return (base_icon.to_vec(), ICON_W, ICON_H, true);
     }
 
@@ -265,6 +279,9 @@ pub fn render_tray_icon(
         );
     }
 
+    if update_available {
+        draw_update_badge(&mut buf, width);
+    }
     (buf, width, height, false) // false = don't use template mode, we rendered colors
 }
 
@@ -343,6 +360,55 @@ fn in_rounded_rect(px: u32, py: u32, w: u32, h: u32, r: u32) -> bool {
     true
 }
 
+/// Overlay a filled red circle near the top-right of the icon area.
+fn draw_update_badge(buf: &mut [u8], canvas_w: u32) {
+    let cx = (ICON_W as i32) - 6;
+    let cy = 6;
+    let r = BADGE_RADIUS_PX;
+    let r_sq = r * r;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy > r_sq {
+                continue;
+            }
+            let x = cx + dx;
+            let y = cy + dy;
+            if x < 0 || y < 0 || (x as u32) >= canvas_w {
+                continue;
+            }
+            let idx = ((y as u32 * canvas_w + x as u32) * 4) as usize;
+            if idx + 3 >= buf.len() {
+                continue;
+            }
+            buf[idx] = BADGE_COLOR.r;
+            buf[idx + 1] = BADGE_COLOR.g;
+            buf[idx + 2] = BADGE_COLOR.b;
+            buf[idx + 3] = BADGE_COLOR.a;
+        }
+    }
+}
+
+/// Render the base icon alone (no bars), applying menu-bar appearance — used
+/// when bars are off so we can still draw the update badge on a colored icon.
+fn render_icon_only(base_icon: &[u8], dark_bar: bool) -> Vec<u8> {
+    let icon_rgb: u8 = if dark_bar { 255 } else { 0 };
+    let mut buf = vec![0u8; (ICON_W * ICON_H * 4) as usize];
+    for y in 0..ICON_H {
+        for x in 0..ICON_W {
+            let src_idx = ((y * ICON_W + x) * 4) as usize;
+            let dst_idx = ((y * ICON_W + x) * 4) as usize;
+            if src_idx + 3 < base_icon.len() {
+                let a = base_icon[src_idx + 3];
+                buf[dst_idx] = icon_rgb;
+                buf[dst_idx + 1] = icon_rgb;
+                buf[dst_idx + 2] = icon_rgb;
+                buf[dst_idx + 3] = a;
+            }
+        }
+    }
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,8 +423,14 @@ mod tests {
     #[test]
     fn off_returns_original_icon_with_template() {
         let icon = vec![0u8; (44 * 44 * 4) as usize];
-        let (buf, w, h, tmpl) =
-            render_tray_icon(&icon, &make_config(BarDisplay::Off), None, None, true);
+        let (buf, w, h, tmpl) = render_tray_icon(
+            &icon,
+            &make_config(BarDisplay::Off),
+            None,
+            None,
+            true,
+            false,
+        );
         assert_eq!(w, 44);
         assert_eq!(h, 44);
         assert_eq!(buf.len(), icon.len());
@@ -368,8 +440,14 @@ mod tests {
     #[test]
     fn no_utilization_returns_template() {
         let icon = vec![0u8; (44 * 44 * 4) as usize];
-        let (_, w, _, tmpl) =
-            render_tray_icon(&icon, &make_config(BarDisplay::Both), None, None, true);
+        let (_, w, _, tmpl) = render_tray_icon(
+            &icon,
+            &make_config(BarDisplay::Both),
+            None,
+            None,
+            true,
+            false,
+        );
         assert_eq!(w, 44);
         assert!(tmpl, "should use template mode when no utilization data");
     }
@@ -383,6 +461,7 @@ mod tests {
             Some(70.0),
             Some(30.0),
             true,
+            false,
         );
         assert_eq!(w, CANVAS_W_BOTH);
         assert_eq!(h, 44);
@@ -404,6 +483,7 @@ mod tests {
             Some(50.0),
             None,
             true,
+            false,
         );
         assert_eq!(w, CANVAS_W_SINGLE);
         assert_eq!(h, 44);
@@ -422,6 +502,7 @@ mod tests {
             Some(50.0),
             Some(50.0),
             true,
+            false,
         );
         let dst_idx = (10 * w as usize + 10) * 4;
         assert_eq!(buf[dst_idx], 255, "R should be white on dark bar");
@@ -441,6 +522,7 @@ mod tests {
             Some(50.0),
             Some(50.0),
             false,
+            false,
         );
         let dst_idx = (10 * w as usize + 10) * 4;
         assert_eq!(buf[dst_idx], 0, "R should be black on light bar");
@@ -456,5 +538,46 @@ mod tests {
     #[test]
     fn in_rounded_rect_outside_corner() {
         assert!(!in_rounded_rect(0, 0, 20, 10, 5));
+    }
+
+    #[test]
+    fn badge_changes_output_when_enabled_with_bars() {
+        let icon = vec![0u8; (44 * 44 * 4) as usize];
+        let (without, _, _, _) = render_tray_icon(
+            &icon,
+            &make_config(BarDisplay::Both),
+            Some(50.0),
+            Some(50.0),
+            true,
+            false,
+        );
+        let (with, _, _, tmpl) = render_tray_icon(
+            &icon,
+            &make_config(BarDisplay::Both),
+            Some(50.0),
+            Some(50.0),
+            true,
+            true,
+        );
+        assert_ne!(without, with, "badge should change pixels");
+        assert!(!tmpl, "bars path already non-template");
+    }
+
+    #[test]
+    fn badge_rendered_when_bars_off() {
+        let icon = vec![0u8; (44 * 44 * 4) as usize];
+        let (without, _, _, tmpl_wo) = render_tray_icon(
+            &icon,
+            &make_config(BarDisplay::Off),
+            None,
+            None,
+            true,
+            false,
+        );
+        let (with, _, _, tmpl_w) =
+            render_tray_icon(&icon, &make_config(BarDisplay::Off), None, None, true, true);
+        assert_ne!(without, with);
+        assert!(tmpl_wo, "no badge → template");
+        assert!(!tmpl_w, "badge → non-template");
     }
 }
