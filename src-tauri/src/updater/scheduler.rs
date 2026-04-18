@@ -1,3 +1,12 @@
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_updater::UpdaterExt;
+
+use super::persistence;
+use super::state::UpdateInfo;
+use crate::commands::AppState;
+
 /// Returns true if `candidate` is strictly newer than `current` by semver.
 /// Uses a simple dotted-numeric comparison. Rejects candidates that look like
 /// prereleases (contain `-`), per the "stable-only" design decision.
@@ -11,6 +20,108 @@ pub fn is_newer(current: &str, candidate: &str) -> bool {
     match (parse(current), parse(candidate)) {
         (Some(c), Some(n)) => n > c,
         _ => false,
+    }
+}
+
+#[allow(dead_code)]
+const INITIAL_DELAY: Duration = Duration::from_secs(10);
+#[allow(dead_code)]
+const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+#[allow(dead_code)]
+const BACKOFF_MIN: Duration = Duration::from_secs(12 * 3600);
+#[allow(dead_code)]
+const BACKOFF_MAX: Duration = Duration::from_secs(24 * 3600);
+
+/// Spawn the background updater task. Called from `lib.rs` setup().
+#[allow(dead_code)]
+pub fn spawn<R: Runtime>(app: AppHandle<R>) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(INITIAL_DELAY).await;
+        let mut backoff: Option<Duration> = None;
+        loop {
+            let enabled = {
+                let state = app.state::<AppState>();
+                let guard = state.updater.read().await;
+                guard.auto_check_enabled
+            };
+            if enabled {
+                match run_check(&app).await {
+                    Ok(_) => backoff = None,
+                    Err(e) => {
+                        tracing::warn!("Updater check failed: {e}");
+                        backoff = Some(match backoff {
+                            None => BACKOFF_MIN,
+                            Some(prev) => (prev * 2).min(BACKOFF_MAX),
+                        });
+                    }
+                }
+            }
+            let sleep_for = backoff.unwrap_or(CHECK_INTERVAL);
+            tokio::time::sleep(sleep_for).await;
+        }
+    });
+}
+
+/// Execute a single update check and update state. Exposed for `check_now`.
+#[allow(dead_code)]
+pub async fn run_check<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let check_result = updater.check().await;
+
+    let state = app.state::<AppState>();
+    let mut guard = state.updater.write().await;
+    guard.last_check = Some(chrono::Utc::now());
+
+    match check_result {
+        Ok(Some(update)) => {
+            let pub_date = update.date.and_then(|d| {
+                chrono::DateTime::parse_from_rfc3339(&d.to_string())
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            let info = UpdateInfo {
+                version: update.version.clone(),
+                current_version: update.current_version.clone(),
+                notes: update.body.clone(),
+                pub_date,
+            };
+            let version = info.version.clone();
+            let should_notify = guard.should_notify(&version);
+            guard.available = Some(info);
+            guard.last_check_error = None;
+
+            if should_notify {
+                guard.last_notified_version = Some(version.clone());
+                // Fire OS notification (best-effort; ignore errors).
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("TokenMonitor update available")
+                    .body(format!("Version {version} is ready to install."))
+                    .show();
+            }
+
+            let _ = persistence::save(app, &guard);
+            drop(guard);
+            let _ = app.emit("updater://status-changed", ());
+            Ok(())
+        }
+        Ok(None) => {
+            guard.available = None;
+            guard.last_check_error = None;
+            let _ = persistence::save(app, &guard);
+            drop(guard);
+            let _ = app.emit("updater://status-changed", ());
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            guard.last_check_error = Some(msg.clone());
+            let _ = persistence::save(app, &guard);
+            drop(guard);
+            let _ = app.emit("updater://status-changed", ());
+            Err(msg)
+        }
     }
 }
 
