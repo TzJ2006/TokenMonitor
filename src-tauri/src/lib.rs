@@ -5,6 +5,7 @@ mod platform;
 mod rate_limits;
 mod stats;
 mod tray;
+mod updater;
 mod usage;
 
 use chrono::Timelike;
