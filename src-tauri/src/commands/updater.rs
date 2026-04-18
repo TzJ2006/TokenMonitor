@@ -18,7 +18,6 @@ pub struct UpdaterStatusPayload {
 
 /// Returns "auto" unless running from a `.deb` install on Linux
 /// (detected by absence of `APPIMAGE` env var on a Linux target).
-#[allow(dead_code)]
 fn install_mode() -> &'static str {
     #[cfg(target_os = "linux")]
     {
@@ -35,7 +34,6 @@ fn install_mode() -> &'static str {
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 pub async fn updater_status(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -49,13 +47,11 @@ pub async fn updater_status(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 pub async fn updater_check_now(app: AppHandle) -> Result<(), String> {
     scheduler::run_check(&app).await
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 pub async fn updater_set_auto_check(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -71,7 +67,6 @@ pub async fn updater_set_auto_check(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 pub async fn updater_skip_version(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -87,7 +82,6 @@ pub async fn updater_skip_version(
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 pub async fn updater_dismiss(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     {
         let mut guard = state.updater.write().await;
@@ -98,7 +92,6 @@ pub async fn updater_dismiss(app: AppHandle, state: State<'_, AppState>) -> Resu
 }
 
 #[tauri::command]
-#[allow(dead_code)]
 pub async fn updater_install(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater
