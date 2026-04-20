@@ -610,7 +610,7 @@
   .ch.detail-above .xa { order: 4; }
 
   .ch-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-  .ch-t { font: 500 8px/1 "Inter", sans-serif; color: var(--t3); text-transform: uppercase; letter-spacing: .8px; }
+  .ch-t { font: 500 8px/1 "Inter", sans-serif; color: var(--t3); }
   .ch-right { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .leg { display: flex; gap: 7px; overflow: hidden; min-width: 0; }
   .leg-item {
