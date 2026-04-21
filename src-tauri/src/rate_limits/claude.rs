@@ -47,11 +47,18 @@ fn extract_access_token(json_str: &str) -> Result<String, String> {
 
 /// Read OAuth token from macOS Keychain via Security.framework.
 ///
-/// Calling the Keychain Services API in-process (rather than shelling out to
-/// `/usr/bin/security`) lets macOS bind "Always Allow" decisions to this
-/// binary's code signature. The shell-out path never stops prompting because
-/// `/usr/bin/security` is a separate caller that TCC sees anew on every
-/// invocation, so the user's approval never attaches to TokenMonitor itself.
+/// `skip_authenticated_items(true)` sets `kSecUseAuthenticationUI =
+/// kSecUseAuthenticationUISkip`, so `SecItemCopyMatching` silently returns
+/// `errSecItemNotFound` instead of putting up a Keychain prompt when the item
+/// would require one. This is the only way to guarantee zero recurring prompts
+/// — Claude Code rewrites the credentials item on every OAuth rotation and
+/// resets its ACL / partition list, so the user's "Always Allow" grant for
+/// TokenMonitor is dropped along with the old item, and any future read would
+/// otherwise re-prompt.
+///
+/// When access is silently denied the caller falls through to the CLI probe
+/// in `rate_limits/mod.rs`, which goes through the Claude Code binary itself
+/// (already trusted for its own item) and so doesn't hit our prompt path.
 ///
 /// Searches by service only (equivalent to `security -s "…" -w`), so we don't
 /// need to guess what account name Claude Code used when writing the item.
@@ -64,8 +71,9 @@ fn read_token_from_keychain() -> Result<String, String> {
         .service("Claude Code-credentials")
         .load_data(true)
         .limit(1)
+        .skip_authenticated_items(true)
         .search()
-        .map_err(|e| format!("Claude Code credentials not found in Keychain: {e}"))?;
+        .map_err(|e| format!("Claude Code credentials not available in Keychain: {e}"))?;
 
     let data = results
         .into_iter()
