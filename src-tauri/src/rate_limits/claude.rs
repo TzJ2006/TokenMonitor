@@ -1,9 +1,36 @@
 use crate::models::{ExtraUsageInfo, ProviderRateLimits, RateLimitWindow};
 use chrono::Local;
 use serde::Deserialize;
+use std::sync::Mutex;
 
 use super::http::rate_limit_error_from_response;
 use super::RateLimitFetchError;
+
+/// In-process cache of the Claude OAuth access token.
+///
+/// Claude Code rewrites the `Claude Code-credentials` Keychain item each time
+/// it rotates its OAuth token. That rewrite resets the item's ACL / partition
+/// list, so the user's "Always Allow" grant for TokenMonitor is lost — and
+/// without a cache the next background refresh (every ~2.5 min) re-prompts.
+/// Caching lets us reuse the token across refresh cycles and only touch the
+/// Keychain on a cold cache or when the API returns 401 (real rotation).
+static CACHED_ACCESS_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+fn cached_access_token() -> Option<String> {
+    CACHED_ACCESS_TOKEN.lock().ok().and_then(|g| g.clone())
+}
+
+fn store_access_token(token: &str) {
+    if let Ok(mut guard) = CACHED_ACCESS_TOKEN.lock() {
+        *guard = Some(token.to_string());
+    }
+}
+
+fn invalidate_access_token_cache() {
+    if let Ok(mut guard) = CACHED_ACCESS_TOKEN.lock() {
+        *guard = None;
+    }
+}
 
 /// Extract `claudeAiOauth.accessToken` from a JSON string.
 fn extract_access_token(json_str: &str) -> Result<String, String> {
@@ -20,11 +47,18 @@ fn extract_access_token(json_str: &str) -> Result<String, String> {
 
 /// Read OAuth token from macOS Keychain via Security.framework.
 ///
-/// Calling the Keychain Services API in-process (rather than shelling out to
-/// `/usr/bin/security`) lets macOS bind "Always Allow" decisions to this
-/// binary's code signature. The shell-out path never stops prompting because
-/// `/usr/bin/security` is a separate caller that TCC sees anew on every
-/// invocation, so the user's approval never attaches to TokenMonitor itself.
+/// `skip_authenticated_items(true)` sets `kSecUseAuthenticationUI =
+/// kSecUseAuthenticationUISkip`, so `SecItemCopyMatching` silently returns
+/// `errSecItemNotFound` instead of putting up a Keychain prompt when the item
+/// would require one. This is the only way to guarantee zero recurring prompts
+/// — Claude Code rewrites the credentials item on every OAuth rotation and
+/// resets its ACL / partition list, so the user's "Always Allow" grant for
+/// TokenMonitor is dropped along with the old item, and any future read would
+/// otherwise re-prompt.
+///
+/// When access is silently denied the caller falls through to the CLI probe
+/// in `rate_limits/mod.rs`, which goes through the Claude Code binary itself
+/// (already trusted for its own item) and so doesn't hit our prompt path.
 ///
 /// Searches by service only (equivalent to `security -s "…" -w`), so we don't
 /// need to guess what account name Claude Code used when writing the item.
@@ -37,8 +71,9 @@ fn read_token_from_keychain() -> Result<String, String> {
         .service("Claude Code-credentials")
         .load_data(true)
         .limit(1)
+        .skip_authenticated_items(true)
         .search()
-        .map_err(|e| format!("Claude Code credentials not found in Keychain: {e}"))?;
+        .map_err(|e| format!("Claude Code credentials not available in Keychain: {e}"))?;
 
     let data = results
         .into_iter()
@@ -50,6 +85,41 @@ fn read_token_from_keychain() -> Result<String, String> {
 
     let raw = String::from_utf8(data).map_err(|e| format!("Invalid UTF-8 from Keychain: {e}"))?;
     extract_access_token(&raw)
+}
+
+/// Interactive Keychain read used by the one-time setup flow.
+///
+/// Unlike [`read_token_from_keychain`], this deliberately does **not** set
+/// `skip_authenticated_items(true)`, so macOS will show the user-auth prompt
+/// when needed. This is the only path in the app that allows that prompt to
+/// appear — it's invoked from the explicit "Allow Keychain access" button in
+/// the welcome flow, never from background refreshes. On success the token is
+/// stored in the in-process cache so the very next API call succeeds without
+/// re-reading the Keychain.
+#[cfg(target_os = "macos")]
+pub(super) fn prime_token_from_keychain_interactive() -> Result<(), String> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+
+    let results = ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service("Claude Code-credentials")
+        .load_data(true)
+        .limit(1)
+        .search()
+        .map_err(|e| format!("Keychain access denied or unavailable: {e}"))?;
+
+    let data = results
+        .into_iter()
+        .find_map(|r| match r {
+            SearchResult::Data(bytes) => Some(bytes),
+            _ => None,
+        })
+        .ok_or_else(|| "Claude Code credentials not found in Keychain".to_string())?;
+
+    let raw = String::from_utf8(data).map_err(|e| format!("Invalid UTF-8 from Keychain: {e}"))?;
+    let token = extract_access_token(&raw)?;
+    store_access_token(&token);
+    Ok(())
 }
 
 /// Read OAuth token from `~/.claude/.credentials.json` (Windows/Linux).
@@ -72,25 +142,34 @@ fn read_token_from_credentials_file() -> Result<String, String> {
 /// Get Claude Code OAuth access token (cross-platform).
 ///
 /// Resolution order:
-/// 1. `CLAUDE_CODE_OAUTH_TOKEN` environment variable (JSON string)
-/// 2. macOS: Keychain; Windows/Linux: `~/.claude/.credentials.json`
+/// 1. `CLAUDE_CODE_OAUTH_TOKEN` environment variable (JSON string) — never cached
+/// 2. In-process cache (set on previous successful read)
+/// 3. macOS: Keychain; Windows/Linux: `~/.claude/.credentials.json`
+///
+/// The result of (3) is stored in the cache. Callers that observe a 401 from
+/// the API should call [`invalidate_access_token_cache`] before retrying so
+/// the next call re-reads from the source.
 pub(crate) fn get_claude_oauth_token() -> Result<String, String> {
-    // Environment variable override (all platforms).
+    // Environment variable override (all platforms). Cheap to read each call,
+    // and we don't want to cache an env value that the user might change.
     if let Ok(env_json) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
         if !env_json.trim().is_empty() {
             return extract_access_token(&env_json);
         }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        read_token_from_keychain()
+    if let Some(cached) = cached_access_token() {
+        return Ok(cached);
     }
 
+    #[cfg(target_os = "macos")]
+    let token = read_token_from_keychain()?;
+
     #[cfg(not(target_os = "macos"))]
-    {
-        read_token_from_credentials_file()
-    }
+    let token = read_token_from_credentials_file()?;
+
+    store_access_token(&token);
+    Ok(token)
 }
 
 // ── Claude API response types ──
@@ -147,8 +226,37 @@ struct ClaudeOrganization {
     rate_limit_tier: Option<String>,
 }
 
+/// Outcome of one API attempt. We surface 401 separately so the outer
+/// function can drop the cached token and retry with a fresh read.
+enum FetchAttempt {
+    Ok(ProviderRateLimits),
+    Unauthorized(RateLimitFetchError),
+    Other(RateLimitFetchError),
+}
+
 pub(super) async fn fetch_claude_rate_limits() -> Result<ProviderRateLimits, RateLimitFetchError> {
-    let token = get_claude_oauth_token().map_err(RateLimitFetchError::message)?;
+    match try_fetch_claude_rate_limits().await {
+        FetchAttempt::Ok(rate_limits) => Ok(rate_limits),
+        FetchAttempt::Other(err) => Err(err),
+        FetchAttempt::Unauthorized(_) => {
+            // The cached token (if any) is stale — Claude Code rotated it.
+            // Drop it and retry once with a fresh source read. If the second
+            // attempt is also unauthorized we surface that to the caller, who
+            // falls through to the CLI probe in `rate_limits/mod.rs`.
+            invalidate_access_token_cache();
+            match try_fetch_claude_rate_limits().await {
+                FetchAttempt::Ok(rate_limits) => Ok(rate_limits),
+                FetchAttempt::Unauthorized(err) | FetchAttempt::Other(err) => Err(err),
+            }
+        }
+    }
+}
+
+async fn try_fetch_claude_rate_limits() -> FetchAttempt {
+    let token = match get_claude_oauth_token() {
+        Ok(token) => token,
+        Err(err) => return FetchAttempt::Other(RateLimitFetchError::message(err)),
+    };
 
     let client = reqwest::Client::new();
 
@@ -168,14 +276,30 @@ pub(super) async fn fetch_claude_rate_limits() -> Result<ProviderRateLimits, Rat
     let (usage_res, account_res) = tokio::join!(usage_fut, account_fut);
 
     // Parse usage response
-    let usage_resp = usage_res
-        .map_err(|e| RateLimitFetchError::message(format!("Usage API request failed: {e}")))?;
+    let usage_resp = match usage_res {
+        Ok(r) => r,
+        Err(e) => {
+            return FetchAttempt::Other(RateLimitFetchError::message(format!(
+                "Usage API request failed: {e}"
+            )));
+        }
+    };
     if !usage_resp.status().is_success() {
-        return Err(rate_limit_error_from_response(&usage_resp));
+        let err = rate_limit_error_from_response(&usage_resp);
+        return if usage_resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            FetchAttempt::Unauthorized(err)
+        } else {
+            FetchAttempt::Other(err)
+        };
     }
-    let usage: ClaudeUsageResponse = usage_resp.json().await.map_err(|e| {
-        RateLimitFetchError::message(format!("Failed to parse usage response: {e}"))
-    })?;
+    let usage: ClaudeUsageResponse = match usage_resp.json().await {
+        Ok(u) => u,
+        Err(e) => {
+            return FetchAttempt::Other(RateLimitFetchError::message(format!(
+                "Failed to parse usage response: {e}"
+            )));
+        }
+    };
 
     // Parse account response (non-fatal if it fails)
     let plan_tier = match account_res {
@@ -216,7 +340,7 @@ pub(super) async fn fetch_claude_rate_limits() -> Result<ProviderRateLimits, Rat
 
     let extra_usage = usage.extra_usage.map(normalize_claude_extra_usage);
 
-    Ok(ProviderRateLimits {
+    FetchAttempt::Ok(ProviderRateLimits {
         provider: "claude".to_string(),
         plan_tier,
         windows,
@@ -300,12 +424,16 @@ mod tests {
         assert!(extract_access_token("not json").is_err());
     }
 
+    /// Serializes tests that touch the module-level token cache or the
+    /// `CLAUDE_CODE_OAUTH_TOKEN` env var, both of which are global state.
+    static SHARED_STATE_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn get_claude_oauth_token_reads_env_override() {
+        let _guard = SHARED_STATE_LOCK.lock().unwrap();
         let json = r#"{"claudeAiOauth":{"accessToken":"sk-from-env"}}"#;
-        // SAFETY: This test must not run concurrently with other tests that
-        // read/write the same env var. `cargo test` runs tests in the same
-        // binary serially by default within a single thread for #[test].
+        // SAFETY: serialized via SHARED_STATE_LOCK so no other test reads or
+        // writes the same env var concurrently.
         unsafe {
             std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", json);
         }
@@ -314,5 +442,32 @@ mod tests {
             std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
         }
         assert_eq!(result.unwrap(), "sk-from-env");
+    }
+
+    #[test]
+    fn access_token_cache_stores_and_invalidates() {
+        let _guard = SHARED_STATE_LOCK.lock().unwrap();
+        invalidate_access_token_cache();
+        assert!(cached_access_token().is_none());
+
+        store_access_token("sk-cached");
+        assert_eq!(cached_access_token().as_deref(), Some("sk-cached"));
+
+        invalidate_access_token_cache();
+        assert!(cached_access_token().is_none());
+    }
+
+    #[test]
+    fn get_claude_oauth_token_returns_cached_value_without_keychain() {
+        let _guard = SHARED_STATE_LOCK.lock().unwrap();
+        // Make sure the env var is not set so we exercise the cache branch.
+        // SAFETY: serialized via SHARED_STATE_LOCK.
+        unsafe {
+            std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        }
+        store_access_token("sk-from-cache");
+        let result = get_claude_oauth_token();
+        invalidate_access_token_cache();
+        assert_eq!(result.unwrap(), "sk-from-cache");
     }
 }
