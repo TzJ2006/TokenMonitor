@@ -1481,7 +1481,7 @@ fn parse_codex_session_file(path: &Path) -> CodexParseResult {
         &mut pending_change_model_indices,
     );
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
 
     if parse_failures > 0 && entries.is_empty() && lines_read > 10 {
         tracing::warn!(
@@ -1541,7 +1541,7 @@ fn read_codex_entries_with_debug(
         }
     }
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     report.emitted_entries = entries.len();
     (entries, report)
 }
@@ -2623,7 +2623,7 @@ impl UsageParser {
         });
 
         // Sort by timestamp ascending
-        entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        entries.sort_by_key(|a| a.timestamp);
 
         // NOT a const — chrono::Duration::minutes() is not const fn
         let gap_threshold = chrono::Duration::minutes(30);
