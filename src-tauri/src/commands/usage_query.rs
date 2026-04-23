@@ -324,7 +324,7 @@ fn merge_usage_warning(left: Option<String>, right: Option<String>) -> Option<St
 fn merge_payloads(mut c: UsagePayload, x: UsagePayload) -> UsagePayload {
     let mut bucket_map: BTreeMap<String, ChartBucket> = BTreeMap::new();
     let c_buckets = std::mem::take(&mut c.chart_buckets);
-    for b in c_buckets.into_iter().chain(x.chart_buckets.into_iter()) {
+    for b in c_buckets.into_iter().chain(x.chart_buckets) {
         let entry = bucket_map
             .entry(b.sort_key.clone())
             .or_insert_with(|| ChartBucket {
@@ -339,7 +339,7 @@ fn merge_payloads(mut c: UsagePayload, x: UsagePayload) -> UsagePayload {
 
     let mut model_map: HashMap<String, ModelSummary> = HashMap::new();
     let c_models = std::mem::take(&mut c.model_breakdown);
-    for model in c_models.into_iter().chain(x.model_breakdown.into_iter()) {
+    for model in c_models.into_iter().chain(x.model_breakdown) {
         let entry = model_map
             .entry(model.model_key.clone())
             .or_insert_with(|| ModelSummary {
