@@ -52,7 +52,7 @@ fn calendar_days_from_payload(
 
 fn merge_calendar_days(days: &mut Vec<CalendarDay>, incoming: Vec<CalendarDay>) {
     let mut day_map: HashMap<u32, f64> = HashMap::new();
-    for day in days.drain(..).chain(incoming.into_iter()) {
+    for day in days.drain(..).chain(incoming) {
         *day_map.entry(day.day).or_insert(0.0) += day.cost;
     }
 
