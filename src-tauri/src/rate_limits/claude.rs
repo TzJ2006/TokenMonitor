@@ -47,24 +47,43 @@ fn extract_access_token(json_str: &str) -> Result<String, String> {
 
 /// Read OAuth token from macOS Keychain via Security.framework.
 ///
-/// `skip_authenticated_items(true)` sets `kSecUseAuthenticationUI =
-/// kSecUseAuthenticationUISkip`, so `SecItemCopyMatching` silently returns
-/// `errSecItemNotFound` instead of putting up a Keychain prompt when the item
-/// would require one. This is the only way to guarantee zero recurring prompts
-/// — Claude Code rewrites the credentials item on every OAuth rotation and
-/// resets its ACL / partition list, so the user's "Always Allow" grant for
-/// TokenMonitor is dropped along with the old item, and any future read would
-/// otherwise re-prompt.
+/// Suppressing the Keychain prompt requires **two** mechanisms, because
+/// macOS has two keychain stores with different UI-gating knobs:
 ///
-/// When access is silently denied the caller falls through to the CLI probe
-/// in `rate_limits/mod.rs`, which goes through the Claude Code binary itself
-/// (already trusted for its own item) and so doesn't hit our prompt path.
+/// 1. `skip_authenticated_items(true)` →
+///    `kSecUseAuthenticationUI = kSecUseAuthenticationUISkip`. This governs
+///    the **Data Protection keychain** (Touch ID / Face ID items). For
+///    those, a would-prompt item is omitted from the result set.
+/// 2. `SecKeychain::disable_user_interaction()` →
+///    `SecKeychainSetUserInteractionAllowed(false)`. This is a process-wide
+///    flag and is the **only** thing that suppresses the classic
+///    "Always Allow / Allow / Deny" prompt produced by the **legacy
+///    keychain** — which is what `Claude Code-credentials` lives in, since
+///    Claude Code writes it through the legacy ACL path. Without this,
+///    `kSecUseAuthenticationUISkip` is silently ignored and macOS still
+///    pops the ACL panel whenever the machine is awake. (Log evidence for
+///    this: reads that failed during dark wake reported "In dark wake, no
+///    UI possible" — macOS only emits that after deciding UI was needed,
+///    which means the UI-skip flag wasn't consulted.)
 ///
-/// Searches by service only (equivalent to `security -s "…" -w`), so we don't
-/// need to guess what account name Claude Code used when writing the item.
+/// The RAII lock re-enables user interaction on drop, so this function is
+/// a pure silent probe: no process-wide side effect outlives the call.
+///
+/// Claude Code rewrites the credentials item on every OAuth rotation and
+/// resets its ACL / partition list, so any "Always Allow" grant the user
+/// gave TokenMonitor is dropped with the old item. When the fresh item
+/// would prompt, silent denial returns us to the caller, which falls
+/// through to the CLI probe in `rate_limits/mod.rs`. That path shells out
+/// to the `claude` binary itself — Claude Code is trusted for its own
+/// item, so no prompt.
 #[cfg(target_os = "macos")]
 fn read_token_from_keychain() -> Result<String, String> {
     use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+    use security_framework::os::macos::keychain::SecKeychain;
+
+    // Held for the duration of the search; drop re-enables interaction.
+    let _ui_lock = SecKeychain::disable_user_interaction()
+        .map_err(|e| format!("Failed to disable Keychain UI: {e}"))?;
 
     let results = ItemSearchOptions::new()
         .class(ItemClass::generic_password())
