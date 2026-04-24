@@ -182,10 +182,16 @@
       {#if remoteDevices.length > 0}
         <button
           class="sync-btn"
+          class:spinning={syncing}
           type="button"
           onclick={syncAll}
           disabled={syncing}
         >
+          <svg class="sync-icon" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"></polyline>
+            <polyline points="1 20 1 14 7 14"></polyline>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+          </svg>
           {syncing ? "Syncing..." : "Sync All"}
         </button>
       {/if}
@@ -393,6 +399,9 @@
   }
 
   .sync-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     font: 500 9px/1 'Inter', sans-serif;
     color: var(--t1);
     background: var(--surface-2);
@@ -409,6 +418,13 @@
   .sync-btn:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+  .sync-btn.spinning .sync-icon {
+    animation: refresh-spin 900ms linear infinite;
+    transform-origin: center;
+  }
+  @keyframes refresh-spin {
+    to { transform: rotate(360deg); }
   }
 
   .settings-link {

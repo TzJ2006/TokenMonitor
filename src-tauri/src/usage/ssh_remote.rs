@@ -139,7 +139,10 @@ pub async fn test_connection(alias: &str) -> SshTestResult {
 
 /// Build the remote extraction script.
 ///
-/// The script searches `~/.claude/projects/` and `~/.config/claude/projects/`
+/// The script auto-discovers Claude project directories on the remote host:
+/// 1. All `~/.claude*/projects/` directories (covers `.claude`, `.claude-code`, etc.)
+/// 2. `$XDG_CONFIG_HOME/claude/projects/` (or `~/.config/claude/projects/`)
+/// 3. Any additional directories listed in the remote `$CLAUDE_CONFIG_DIR` env var
 /// for .jsonl files, extracts assistant entries with usage data, and outputs
 /// compact JSON records.
 fn build_extraction_script(claude_since: Option<u64>, codex_since: Option<u64>) -> String {
@@ -151,11 +154,33 @@ fn build_extraction_script(claude_since: Option<u64>, codex_since: Option<u64>) 
         .map(|ts| format!("touch -d @{ts} /tmp/.tm-marker-{ts} 2>/dev/null; "))
         .unwrap_or_default();
 
-    // Claude: search both config locations.
+    // Claude: auto-discover all directories that look like Claude config roots.
+    // 1. Glob ~/.claude* for any dir with a projects/ subdir (covers .claude,
+    //    .claude-code, etc.)
+    // 2. Check XDG config dir
+    // 3. Source shell rc files and honour $CLAUDE_CONFIG_DIR (comma-separated)
     let claude_find = format!(
-        "for d in ~/.claude/projects ~/.config/claude/projects; do \
-           [ -d \"$d\" ] && find \"$d\" -name '*.jsonl'{newer_filter} -type f 2>/dev/null; \
-         done"
+        "{{ \
+           for f in ~/.bashrc ~/.bash_profile ~/.profile ~/.zshrc; do \
+             [ -f \"$f\" ] && . \"$f\" 2>/dev/null; \
+           done; \
+           _TM_DIRS=''; \
+           for _cd in \"$HOME\"/.claude*; do \
+             [ -d \"$_cd/projects\" ] && _TM_DIRS=\"$_TM_DIRS $_cd/projects\"; \
+           done; \
+           _xdg=\"${{XDG_CONFIG_HOME:-$HOME/.config}}/claude/projects\"; \
+           [ -d \"$_xdg\" ] && _TM_DIRS=\"$_TM_DIRS $_xdg\"; \
+           if [ -n \"$CLAUDE_CONFIG_DIR\" ]; then \
+             IFS=','; for _cd in $CLAUDE_CONFIG_DIR; do \
+               _cd=$(echo \"$_cd\" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'); \
+               [ -z \"$_cd\" ] && continue; \
+               case \"$_cd\" in */projects) _TM_DIRS=\"$_TM_DIRS $_cd\" ;; *) _TM_DIRS=\"$_TM_DIRS $_cd/projects\" ;; esac; \
+             done; unset IFS; \
+           fi; \
+           for d in $_TM_DIRS; do \
+             find \"$d\" -name '*.jsonl'{newer_filter} -type f 2>/dev/null; \
+           done; \
+         }}"
     );
 
     // Codex: search session directory.
