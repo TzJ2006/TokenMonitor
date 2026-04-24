@@ -460,6 +460,31 @@ pub async fn get_known_models(
         let model = crate::models::known_model_from_raw(&entry.model);
         models.entry(model.model_key.clone()).or_insert(model);
     }
+
+    // Also include models discovered from SSH remote caches.
+    if crate::usage::device_aggregation::provider_includes_remote_ssh_usage(&provider) {
+        let cache_guard = state.ssh_cache.read().await;
+        if let Some(mgr) = cache_guard.as_ref() {
+            let hosts = state.ssh_hosts.read().await;
+            for cfg in hosts.iter().filter(|c| c.enabled) {
+                if let Ok(records) = mgr.load_cached_records(&cfg.alias) {
+                    for record in &records {
+                        if record.model.starts_with('<') {
+                            continue;
+                        }
+                        if !crate::usage::device_aggregation::compact_record_matches_provider(
+                            record, &provider,
+                        ) {
+                            continue;
+                        }
+                        let model = crate::models::known_model_from_raw(&record.model);
+                        models.entry(model.model_key.clone()).or_insert(model);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(models.into_values().collect())
 }
 
