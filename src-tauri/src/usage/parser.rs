@@ -1200,6 +1200,11 @@ impl UsageParser {
         if let Ok(mut current) = self.last_query_debug.lock() {
             *current = None;
         }
+        if let Ok(guard) = self.archive.lock() {
+            if let Some(archive) = guard.as_ref() {
+                archive.reset();
+            }
+        }
     }
 
     pub fn clear_payload_cache(&self) {
