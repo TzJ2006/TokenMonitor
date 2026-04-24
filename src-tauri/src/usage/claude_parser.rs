@@ -126,8 +126,10 @@ struct CacheCreationBreakdown {
 
 fn create_claude_unique_hash(entry: &ClaudeJsonlEntry) -> Option<String> {
     let message_id = entry.message.as_ref()?.id.as_ref()?;
-    let request_id = entry.request_id.as_ref()?;
-    Some(format!("{message_id}:{request_id}"))
+    match entry.request_id.as_ref() {
+        Some(request_id) => Some(format!("{message_id}:{request_id}")),
+        None => Some(message_id.clone()),
+    }
 }
 
 fn claude_scope_priority(scope: AgentScope) -> u8 {
