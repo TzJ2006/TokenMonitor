@@ -15,6 +15,7 @@
   import TrayConfigSettings from "./TrayConfigSettings.svelte";
   import HiddenModelsSettings from "./HiddenModelsSettings.svelte";
   import SshHostsSettings from "./SshHostsSettings.svelte";
+  import UpdateBanner from "./UpdateBanner.svelte";
 
   interface Props {
     onBack: () => void;
@@ -144,14 +145,21 @@
     return `${Math.floor(diff / 86_400_000)}d ago`;
   }
 
+  let resetStatus = $state<"idle" | "done" | "error">("idle");
+  let resetTimer: ReturnType<typeof setTimeout> | null = null;
+
   async function resetCache() {
     logger.info("settings", "Cache reset by user");
     clearUsageCache();
     try {
       await invoke("clear_cache");
+      resetStatus = "done";
     } catch (error) {
       console.error("Failed to clear backend cache:", error);
+      resetStatus = "error";
     }
+    if (resetTimer) clearTimeout(resetTimer);
+    resetTimer = setTimeout(() => { resetStatus = "idle"; }, 2000);
   }
 </script>
 
@@ -231,7 +239,11 @@
         </div>
         <div class="row center">
           <div class="actions">
-            <button class="reset-btn" onclick={resetCache}>Reset Cache</button>
+            <button class="reset-btn" class:done={resetStatus === "done"} class:error={resetStatus === "error"} onclick={resetCache}>
+              {#if resetStatus === "done"}Cache Reset ✓
+              {:else if resetStatus === "error"}Reset Failed
+              {:else}Reset Cache{/if}
+            </button>
           </div>
         </div>
       </div>
@@ -279,6 +291,10 @@
           </div>
         </div>
       </div>
+    </div>
+
+    <div class="update-bottom">
+      <UpdateBanner />
     </div>
   </div>
 </div>
@@ -447,5 +463,17 @@
   }
   .reset-btn:hover {
     color: var(--t2);
+  }
+  .reset-btn.done {
+    color: var(--ch-plus);
+  }
+  .reset-btn.error {
+    color: var(--ch-minus);
+  }
+
+  .update-bottom :global(.banner) {
+    border-bottom: none;
+    border-top: 1px solid var(--border-subtle);
+    border-radius: 0 0 8px 8px;
   }
 </style>

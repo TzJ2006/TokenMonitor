@@ -72,6 +72,7 @@ pub(crate) fn build_device_summary_from_parsed(
     finish_device_summary(device_name, model_map)
 }
 
+#[cfg(test)]
 pub(crate) fn build_device_summary_from_compact(
     device_name: &str,
     records: &[CompactUsageRecord],
@@ -261,9 +262,18 @@ pub(crate) async fn build_device_breakdown_for_payload(
     }
 
     let cache_mgr = state.ssh_cache.read().await;
+    let archive = parser.archive();
     if let Some(mgr) = cache_mgr.as_ref() {
         let statuses = mgr.host_statuses(&configs);
         for cfg in configs.iter().filter(|c| c.enabled) {
+            let source_key = format!("device:{}", cfg.alias);
+            let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
+
+            let archived_entries = archive
+                .as_ref()
+                .map(|a| a.load_archived(&source_key, Some(since)))
+                .unwrap_or_default();
+
             let all_records = match mgr.load_cached_records(&cfg.alias) {
                 Ok(r) => r,
                 Err(e) => {
@@ -272,13 +282,32 @@ pub(crate) async fn build_device_breakdown_for_payload(
                 }
             };
             let filtered: Vec<_> = all_records
-                .into_iter()
+                .iter()
                 .filter(|r| compact_record_matches_provider(r, provider))
+                .filter(|r| {
+                    if let Some(ref f) = frontier {
+                        let dt = parse_remote_ts(&r.ts).map(|d| d.with_timezone(&chrono::Local));
+                        match dt {
+                            Some(local) => !f.covers(local.date_naive(), local.hour() as u8),
+                            None => true,
+                        }
+                    } else {
+                        true
+                    }
+                })
                 .collect();
-            if filtered.is_empty() {
+
+            if archived_entries.is_empty() && filtered.is_empty() {
                 continue;
             }
-            let mut summary = build_device_summary_from_compact(&cfg.alias, &filtered, since, end);
+
+            let mut summary = build_device_summary_merged(
+                &cfg.alias,
+                &archived_entries,
+                &filtered,
+                since,
+                end,
+            );
 
             if let Some(host_status) = statuses.iter().find(|s| s.alias == cfg.alias) {
                 summary.last_synced = host_status.last_sync.clone();
@@ -512,8 +541,40 @@ pub(crate) async fn build_device_time_chart_buckets(
 
     if provider_includes_remote_ssh_usage(provider) {
         let cache_mgr = state.ssh_cache.read().await;
+        let archive = parser.archive();
         if let Some(mgr) = cache_mgr.as_ref() {
             for cfg in configs.iter().filter(|c| c.enabled) {
+                let source_key = format!("device:{}", cfg.alias);
+                let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
+
+                // Archived entries for this device.
+                if let Some(ref a) = archive {
+                    for entry in a.load_archived(&source_key, Some(since)) {
+                        let date = entry.timestamp.date_naive();
+                        if date >= end {
+                            continue;
+                        }
+                        let bucket_key =
+                            bucket_key_for_timestamp(&entry.timestamp.fixed_offset(), period);
+                        let (_, model_key) = normalize_model(&entry.model);
+                        let cost = calculate_cost_for_key(
+                            &model_key,
+                            entry.input_tokens,
+                            entry.output_tokens,
+                            entry.cache_creation_5m_tokens,
+                            entry.cache_creation_1h_tokens,
+                            entry.cache_read_tokens,
+                            0,
+                        );
+                        *device_cost_by_bucket
+                            .entry(bucket_key)
+                            .or_default()
+                            .entry(cfg.alias.clone())
+                            .or_insert(0.0) += cost;
+                    }
+                }
+
+                // Live compact records (excluding archived hours).
                 let records = match mgr.load_cached_records(&cfg.alias) {
                     Ok(r) => r,
                     Err(e) => {
@@ -529,8 +590,13 @@ pub(crate) async fn build_device_time_chart_buckets(
                         Some(ts) => ts,
                         None => continue,
                     };
-                    let record_date = parsed_ts.with_timezone(&chrono::Local).date_naive();
-
+                    let local = parsed_ts.with_timezone(&chrono::Local);
+                    if let Some(ref f) = frontier {
+                        if f.covers(local.date_naive(), local.hour() as u8) {
+                            continue;
+                        }
+                    }
+                    let record_date = local.date_naive();
                     if record_date < since || record_date >= end {
                         continue;
                     }
