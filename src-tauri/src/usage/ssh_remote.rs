@@ -76,6 +76,10 @@ pub struct CompactUsageRecord {
     pub speed: Option<String>,
 }
 
+fn compact_record_key(r: &CompactUsageRecord) -> String {
+    format!("{}:{}:{}:{}", r.ts, r.model, r.input_tokens, r.output_tokens)
+}
+
 /// Test SSH connectivity to a host using `ssh <host> echo ok`.
 pub async fn test_connection(alias: &str) -> SshTestResult {
     let start = std::time::Instant::now();
@@ -198,16 +202,23 @@ fn build_extraction_script(claude_since: Option<u64>, codex_since: Option<u64>) 
     // Rust's trailing-backslash line continuation eating the leading spaces.
     let claude_py = concat!(
         "import json,sys\n",
+        "seen=set()\n",
         "for f in sys.argv[1:]:\n",
         " try:\n",
         "  for line in open(f):\n",
         "   try:\n",
         "    d=json.loads(line)\n",
         "    if d.get('type')=='assistant':\n",
-        "     u=d.get('message',{}).get('usage')\n",
+        "     msg=d.get('message',{})\n",
+        "     mid=msg.get('id','')\n",
+        "     rid=d.get('requestId','')\n",
+        "     dk=mid+':'+rid if rid else mid\n",
+        "     if dk and dk in seen:continue\n",
+        "     if dk:seen.add(dk)\n",
+        "     u=msg.get('usage')\n",
         "     if u:\n",
         "      r={'ts':d.get('timestamp',''),",
-        "'m':d.get('message',{}).get('model',''),",
+        "'m':msg.get('model',''),",
         "'in':u.get('input_tokens',0),",
         "'out':u.get('output_tokens',0),",
         "'c5':u.get('cache_creation_input_tokens',0),",
@@ -507,6 +518,14 @@ impl SshCacheManager {
         }
     }
 
+    pub fn reset_all_caches(&self) {
+        if self.base_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.base_dir) {
+                tracing::warn!("Failed to remove remote cache dir {:?}: {e}", self.base_dir);
+            }
+        }
+    }
+
     /// Get the cache directory for a specific host.
     ///
     /// Validates that the resolved path stays within `base_dir` to prevent
@@ -679,18 +698,35 @@ impl SshCacheManager {
             return Ok(0);
         }
 
-        // Append new records to the cache file.
+        // Append new records to the cache file, deduplicating against existing cache.
         let cache_path = self.usage_cache_path(alias)?;
         let dir = self.host_cache_dir(alias)?;
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
+        // Build a set of existing record keys for dedup.
+        let mut existing_keys = std::collections::HashSet::new();
+        if let Ok(content) = std::fs::read_to_string(&cache_path) {
+            for line in content.lines() {
+                if let Ok(r) = serde_json::from_str::<CompactUsageRecord>(line) {
+                    existing_keys.insert(compact_record_key(&r));
+                }
+            }
+        }
+
         let mut lines = String::new();
         let mut has_claude = false;
         let mut has_codex = false;
+        let mut new_count = 0u32;
         for record in &records {
+            let key = compact_record_key(record);
+            if existing_keys.contains(&key) {
+                continue;
+            }
+            existing_keys.insert(key);
             if let Ok(json) = serde_json::to_string(record) {
                 lines.push_str(&json);
                 lines.push('\n');
+                new_count += 1;
             }
             // Detect provider by model family.
             use crate::models::{detect_model_family, ModelFamily};
@@ -720,7 +756,7 @@ impl SshCacheManager {
             self.set_last_sync(alias, "codex")?;
         }
 
-        Ok(records.len() as u32)
+        Ok(new_count)
     }
 
     /// Count cached records without parsing JSON (line count).

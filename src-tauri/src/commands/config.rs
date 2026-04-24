@@ -159,6 +159,9 @@ pub async fn set_dock_icon_visible(app: tauri::AppHandle, visible: bool) -> Resu
 #[tauri::command]
 pub async fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.parser.clear_cache();
+    if let Some(ssh_cache) = state.ssh_cache.read().await.as_ref() {
+        ssh_cache.reset_all_caches();
+    }
     *state.cached_rate_limits.write().await = None;
     *state.last_usage_debug.write().await = None;
     Ok(())
