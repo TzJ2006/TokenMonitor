@@ -59,7 +59,18 @@
 
   const CHART_H = 108;
   const CHART_W = 280; // SVG viewbox width (y-axis labels sit outside)
-  let maxCost = $derived(Math.max(...visibleBuckets.map((b) => b.total), 0.01));
+  let maxCostStacked = $derived(Math.max(...visibleBuckets.map((b) => b.total), 0.01));
+  let maxCostSingle = $derived(Math.max(
+    ...visibleBuckets.flatMap((b) => {
+      const merged = new Map<string, number>();
+      for (const s of b.segments) {
+        merged.set(s.model_key, (merged.get(s.model_key) ?? 0) + s.cost);
+      }
+      return Array.from(merged.values());
+    }),
+    0.01,
+  ));
+  let maxCost = $derived($chartMode === "line" ? maxCostSingle : maxCostStacked);
   let hoveredIdx = $state(-1);
 
   let displayedIdx = $state(-1);
@@ -128,16 +139,11 @@
   });
 
   function niceMax(v: number): number {
-    if (v <= 0.5) return 0.5;
-    if (v <= 1) return 1;
-    if (v <= 2) return 2;
-    if (v <= 5) return 5;
-    if (v <= 10) return 10;
-    if (v <= 20) return 20;
-    if (v <= 50) return 50;
-    if (v <= 100) return 100;
-    if (v <= 200) return 200;
-    return Math.ceil(v / 100) * 100;
+    const steps = [0.5, 1, 2, 5, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000];
+    for (const s of steps) {
+      if (v <= s) return s;
+    }
+    return Math.ceil(v / 500) * 500;
   }
 
   function yLabel(v: number): string {
@@ -272,8 +278,9 @@
 
     return models.map((m) => {
       const points = visibleBuckets.map((b, i) => {
-        const seg = b.segments.find((s) => s.model_key === m.key);
-        const cost = seg?.cost ?? 0;
+        const cost = b.segments
+          .filter((s) => s.model_key === m.key)
+          .reduce((sum, s) => sum + s.cost, 0);
         const x = visibleBuckets.length > 1 ? i * stepX : CHART_W / 2;
         const y = CHART_H - (cost / niceM) * CHART_H;
         return { x, y, cost };

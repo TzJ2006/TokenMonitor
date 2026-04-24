@@ -628,7 +628,7 @@
     style:max-height="{scrollThresholdH}px"
     style:overflow-y={scrollThresholdH < DEFAULT_MAX_WINDOW_HEIGHT ? 'auto' : 'visible'}
   >
-    <UpdateBanner />
+    {#if !showSettings}<UpdateBanner />{/if}
     {#if showSplash}
       <SplashScreen ready={appReady} onComplete={() => { showSplash = false; tick().then(() => syncSizeAndVerify("splash-complete")); }} />
     {:else if !$settings.hasSeenWelcome}
