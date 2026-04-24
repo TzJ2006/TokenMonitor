@@ -300,15 +300,7 @@ fn build_extraction_script(claude_since: Option<u64>, codex_since: Option<u64>) 
          CODEX_FILES=$({codex_find}); \
          [ -z \"$CLAUDE_FILES\" ] && [ -z \"$CODEX_FILES\" ] && exit 0; \
          if [ -n \"$CLAUDE_FILES\" ]; then \
-           if command -v jq >/dev/null 2>&1; then \
-             echo \"$CLAUDE_FILES\" | xargs jq -c 'select(.type==\"assistant\" and .message.usage) | \
-               {{ts:.timestamp, m:.message.model, \
-                 \"in\":.message.usage.input_tokens, \
-                 out:.message.usage.output_tokens, \
-                 c5:(.message.usage.cache_creation_input_tokens // 0), \
-                 cr:(.message.usage.cache_read_input_tokens // 0)}} + \
-                 (if .message.usage.speed == \"fast\" then {{sp:\"fast\"}} else {{}} end)'; \
-           elif command -v python3 >/dev/null 2>&1; then \
+           if command -v python3 >/dev/null 2>&1; then \
              echo \"$CLAUDE_FILES\" | tr '\\n' '\\0' | xargs -0 python3 -c \"{claude_py}\"; \
            else \
              echo \"$CLAUDE_FILES\" | xargs grep -lh '\"usage\"' 2>/dev/null | xargs grep -h '\"assistant\"' 2>/dev/null; \
