@@ -462,6 +462,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn oauth_token_prefers_credentials_file_on_macos() {
+        let _shared_guard = SHARED_STATE_LOCK.lock().unwrap();
         let _guard = ENV_LOCK.lock().unwrap();
         invalidate_access_token_cache();
         let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
