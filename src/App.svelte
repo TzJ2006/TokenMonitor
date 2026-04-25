@@ -35,6 +35,7 @@
     fetchRateLimits,
   } from "./lib/stores/rateLimits.js";
   import { providerPayload } from "./lib/views/rateLimitMonitor.js";
+  import { hasRateLimitWindows } from "./lib/views/rateLimits.js";
   import { setDeviceIncludeFlag, setSshHostIncludeFlag } from "./lib/views/deviceStats.js";
   import {
     DEFAULT_HEADER_TABS,
@@ -120,8 +121,21 @@
       label: headerTabs[value].label,
     })),
   );
-  let visibleRateLimitProviders = $derived.by(() =>
-    rateLimitProvidersForScope(provider).filter((candidate) => Boolean(providerPayload(rateLimits, candidate))),
+  let visibleUsableRateLimitProviders = $derived.by(() =>
+    rateLimitProvidersForScope(provider).filter((candidate) =>
+      hasRateLimitWindows(providerPayload(rateLimits, candidate)),
+    ),
+  );
+  let hasFiveHourUsageData = $derived.by(() =>
+    Boolean(data && (
+      data.total_tokens > 0
+      || data.total_cost > 0
+      || data.five_hour_cost > 0
+      || data.chart_buckets.length > 0
+    )),
+  );
+  let shouldShowFiveHourUsageFallback = $derived.by(() =>
+    period === "5h" && hasFiveHourUsageData,
   );
 
   // Subscribe to stores
@@ -701,12 +715,33 @@
             </button>
           </div>
         </div>
+      {:else if period === "5h" && $settings.rateLimitsEnabled && visibleUsableRateLimitProviders.length > 0}
+        {#each visibleUsableRateLimitProviders as rateLimitProvider, index}
+          <UsageBars
+            providerLabel={provider === ALL_USAGE_PROVIDER_ID ? getUsageProviderLabel(rateLimitProvider) : undefined}
+            rateLimits={providerPayload(rateLimits, rateLimitProvider)!}
+          />
+          {#if index < visibleUsableRateLimitProviders.length - 1}
+            <div class="hr"></div>
+          {/if}
+        {/each}
+      {:else if period === "5h" && shouldShowFiveHourUsageFallback}
+        {#if !$settings.rateLimitsEnabled}
+          <div class="rate-limit-note">
+            Live rate-limit percentages are off. Showing local 5h usage.
+          </div>
+        {:else if rateLimitsRequest.error}
+          <div class="rate-limit-note">
+            Live rate-limit percentages unavailable: {rateLimitsRequest.error} Showing local 5h usage.
+          </div>
+        {/if}
+        <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} deviceBuckets={data.device_chart_buckets} />
       {:else if period === "5h" && !$settings.rateLimitsEnabled}
         <div class="rate-limit-empty">
           <div class="rate-limit-empty-title">Live rate limits are off</div>
           <div class="rate-limit-empty-text">
-            Turn this on to see session &amp; weekly usage. TokenMonitor uses
-            your Claude credentials file first and does not open Keychain from this button.
+            Turn this on to see live 5h and weekly rate-limit percentages.
+            TokenMonitor uses your Claude credentials file first and does not open Keychain from this button.
           </div>
           <button
             type="button"
@@ -717,16 +752,6 @@
             Enable rate limits
           </button>
         </div>
-      {:else if period === "5h" && visibleRateLimitProviders.length > 0}
-        {#each visibleRateLimitProviders as rateLimitProvider, index}
-          <UsageBars
-            providerLabel={provider === ALL_USAGE_PROVIDER_ID ? getUsageProviderLabel(rateLimitProvider) : undefined}
-            rateLimits={providerPayload(rateLimits, rateLimitProvider)!}
-          />
-          {#if index < visibleRateLimitProviders.length - 1}
-            <div class="hr"></div>
-          {/if}
-        {/each}
       {:else if period === "5h" && rateLimitsRequest.loading}
         <div class="loading-bars"><div class="spinner"></div></div>
       {:else if period === "5h"}
@@ -832,6 +857,11 @@
   }
   .rate-limit-empty-text {
     font: 400 9px/1.4 'Inter', sans-serif;
+    color: var(--t3);
+  }
+  .rate-limit-note {
+    margin: 6px 14px 0;
+    font: 400 9px/1.35 'Inter', sans-serif;
     color: var(--t3);
   }
   .rate-limit-cta {
