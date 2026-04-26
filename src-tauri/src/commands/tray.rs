@@ -57,11 +57,12 @@ impl Default for TrayConfig {
 pub(crate) struct TrayUtilization {
     pub(crate) claude: Option<f64>,
     pub(crate) codex: Option<f64>,
+    pub(crate) cursor: Option<f64>,
 }
 
 impl TrayUtilization {
     pub(crate) fn has_any(self) -> bool {
-        self.claude.is_some() || self.codex.is_some()
+        self.claude.is_some() || self.codex.is_some() || self.cursor.is_some()
     }
 }
 
@@ -139,6 +140,9 @@ pub(crate) fn tray_utilization_from_rate_limits(
         codex: primary_window_utilization(
             payload.and_then(|rate_limits| rate_limits.codex.as_ref()),
         ),
+        cursor: primary_window_utilization(
+            payload.and_then(|rate_limits| rate_limits.cursor.as_ref()),
+        ),
     }
 }
 
@@ -146,6 +150,7 @@ fn merge_tray_utilization(current: TrayUtilization, patch: TrayUtilization) -> T
     TrayUtilization {
         claude: patch.claude.or(current.claude),
         codex: patch.codex.or(current.codex),
+        cursor: patch.cursor.or(current.cursor),
     }
 }
 
@@ -338,6 +343,7 @@ pub async fn set_tray_config(
             TrayUtilization {
                 claude: claude_util,
                 codex: codex_util,
+                cursor: None,
             },
         )
         .await
@@ -442,6 +448,7 @@ mod tests {
         let current = TrayUtilization {
             claude: Some(72.0),
             codex: Some(35.0),
+            cursor: None,
         };
 
         assert_eq!(
@@ -455,10 +462,12 @@ mod tests {
         let current = TrayUtilization {
             claude: Some(72.0),
             codex: Some(35.0),
+            cursor: None,
         };
         let patch = TrayUtilization {
             claude: None,
             codex: Some(41.0),
+            cursor: None,
         };
 
         assert_eq!(
@@ -466,6 +475,7 @@ mod tests {
             TrayUtilization {
                 claude: Some(72.0),
                 codex: Some(41.0),
+                cursor: None,
             }
         );
     }
@@ -505,6 +515,7 @@ mod tests {
                 cooldown_until: None,
                 fetched_at: "2026-03-18T00:00:00Z".to_string(),
             }),
+            cursor: None,
         };
 
         assert_eq!(
@@ -512,6 +523,7 @@ mod tests {
             TrayUtilization {
                 claude: Some(72.0),
                 codex: Some(35.0),
+                cursor: None,
             }
         );
     }
@@ -529,6 +541,7 @@ mod tests {
             TrayUtilization {
                 claude: Some(72.0),
                 codex: None,
+                cursor: None,
             }
         ));
         assert!(should_update_tray_icon(
