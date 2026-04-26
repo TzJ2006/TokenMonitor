@@ -21,7 +21,10 @@
     "notification:allow-is-permission-granted",
     {
       "identifier": "opener:allow-open-url",
-      "allow": [{ "url": "https://github.com/Michael-OvO/TokenMonitor/releases/**" }]
+      "allow": [
+        { "url": "https://github.com/Michael-OvO/TokenMonitor/releases/**" },
+        { "url": "https://cursor.com/dashboard" }
+      ]
     }
   ]
 }
