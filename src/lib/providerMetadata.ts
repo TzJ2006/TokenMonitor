@@ -103,7 +103,14 @@ const USAGE_INTEGRATION_DEFINITIONS: UsageProviderDefinition[] = [
     title: "Cursor IDE",
     logoKind: "cursor",
     brandColor: [92, 106, 196],
-    supportsRateLimits: false,
+    supportsRateLimits: true,
+    rateLimits: {
+      cacheFile: "rate-limits-cursor.json",
+      minFetchIntervalMs: 300_000,
+      primaryWindowId: "auto_composer",
+      utilizationLabelFormat: "percent_used",
+      idleSummary: "No Cursor usage data available. Make sure Cursor IDE is signed in on this machine.",
+    },
   },
 ];
 

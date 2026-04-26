@@ -180,6 +180,7 @@ pub struct ProviderRateLimits {
 pub struct RateLimitsPayload {
     pub claude: Option<ProviderRateLimits>,
     pub codex: Option<ProviderRateLimits>,
+    pub cursor: Option<ProviderRateLimits>,
 }
 
 // ── Helpers ──
