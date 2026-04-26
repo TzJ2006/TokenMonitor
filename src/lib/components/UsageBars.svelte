@@ -101,6 +101,7 @@
     if (windowId === "five_hour" || windowId === "primary") return 5;
     if (windowId === "secondary") return 168;
     if (windowId.startsWith("seven_day")) return 168;
+    if (windowId === "auto_composer" || windowId === "api") return 720;
     return 5;
   }
 

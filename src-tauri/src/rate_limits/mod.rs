@@ -1,6 +1,7 @@
 mod claude;
 mod claude_cli;
 mod codex;
+mod cursor;
 mod http;
 
 use crate::models::{ProviderRateLimits, RateLimitsPayload};
@@ -10,6 +11,7 @@ use std::path::Path;
 use claude::fetch_claude_rate_limits;
 use claude_cli::fetch_claude_rate_limits_via_cli;
 use codex::extract_codex_rate_limits;
+use cursor::fetch_cursor_rate_limits;
 use http::{
     mark_rate_limits_stale, merge_provider_rate_limits, provider_cooldown_is_active,
     provider_rate_limit_error,
@@ -64,6 +66,7 @@ pub enum RateLimitSelection {
     All,
     Claude,
     Codex,
+    Cursor,
 }
 
 impl RateLimitSelection {
@@ -73,6 +76,10 @@ impl RateLimitSelection {
 
     pub fn includes_codex(self) -> bool {
         matches!(self, Self::All | Self::Codex)
+    }
+
+    pub fn includes_cursor(self) -> bool {
+        matches!(self, Self::All | Self::Cursor)
     }
 }
 
@@ -101,6 +108,10 @@ pub fn merge_rate_limits(
             fresh.codex,
             cached.and_then(|payload| payload.codex.clone()),
         ),
+        cursor: merge_provider_rate_limits(
+            fresh.cursor,
+            cached.and_then(|payload| payload.cursor.clone()),
+        ),
     }
 }
 
@@ -113,6 +124,7 @@ pub async fn fetch_selected_rate_limits(
 
     let cached_claude = cached.and_then(|payload| payload.claude.clone());
     let cached_codex = cached.and_then(|payload| payload.codex.clone());
+    let cached_cursor = cached.and_then(|payload| payload.cursor.clone());
 
     let claude_future = async {
         if !selection.includes_claude() {
@@ -179,8 +191,34 @@ pub async fn fetch_selected_rate_limits(
         }
     };
 
-    let (claude, codex) = tokio::join!(claude_future, codex_future);
-    RateLimitsPayload { claude, codex }
+    let cursor_future = async {
+        if !selection.includes_cursor() {
+            return cached_cursor;
+        }
+
+        let now = Utc::now();
+
+        if let Some(rate_limits) = cached_cursor.clone() {
+            if provider_cooldown_is_active(&rate_limits, now) {
+                return Some(mark_rate_limits_stale(rate_limits));
+            }
+        }
+
+        match fetch_cursor_rate_limits().await {
+            Ok(rate_limits) => Some(rate_limits),
+            Err(error) => {
+                tracing::warn!(error = %error.message, "Cursor rate-limit fetch failed");
+                Some(provider_rate_limit_error("cursor", error))
+            }
+        }
+    };
+
+    let (claude, codex, cursor) = tokio::join!(claude_future, codex_future, cursor_future);
+    RateLimitsPayload {
+        claude,
+        codex,
+        cursor,
+    }
 }
 
 #[cfg(test)]
