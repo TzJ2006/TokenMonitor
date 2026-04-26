@@ -66,6 +66,7 @@ export function shallowPayloadEqual(a: UsagePayload, b: UsagePayload): boolean {
     ) &&
     a.period_label === b.period_label &&
     a.has_earlier_data === b.has_earlier_data &&
+    a.usage_warning === b.usage_warning &&
     (a.device_breakdown?.length ?? 0) === (b.device_breakdown?.length ?? 0) &&
     (a.device_breakdown?.[0]?.total_cost ?? 0) === (b.device_breakdown?.[0]?.total_cost ?? 0) &&
     (a.device_breakdown ?? []).every((d, i) =>
@@ -224,6 +225,18 @@ interface FetchCtx {
   cacheKey: string;
 }
 
+function logPayloadWarning(
+  ctx: Omit<FetchCtx, "requestId"> | FetchCtx,
+  data: UsagePayload,
+  source: string,
+) {
+  if (!data.usage_warning) return;
+  logger.warn(
+    "usage",
+    `Backend warning (${source}): provider=${ctx.provider} period=${ctx.period} offset=${ctx.offset} warning=${data.usage_warning}`,
+  );
+}
+
 function logBackgroundRefreshResult(
   ctx: FetchCtx,
   prev: UsagePayload,
@@ -274,6 +287,7 @@ export async function fetchData(
     // Silent background refresh — no loading indicator
     requestUsagePayload(provider, period, offset)
       .then((fresh: UsagePayload) => {
+        logPayloadWarning(ctx, fresh, "background-refresh");
         cachePayload(key, fresh, cacheEpoch);
         const appliedToUi = applyUsageDataIfCurrent(requestId, fresh);
         logBackgroundRefreshResult(ctx, cached.data, fresh, appliedToUi);
@@ -300,6 +314,7 @@ export async function fetchData(
       fetchInFlight.set(key, pending);
     }
     const data = await pending;
+    logPayloadWarning(ctx, data, "fetch");
     cachePayload(key, data, cacheEpoch);
     const appliedToUi = applyUsageDataIfCurrent(requestId, data);
     await logUsageReadDebug("usage:fetch-resolved", {
@@ -329,6 +344,7 @@ export function warmCache(
   const cacheEpoch = currentCacheEpoch;
   requestUsagePayload(provider, period, offset)
     .then((data: UsagePayload) => {
+      logPayloadWarning({ provider, period, offset, cacheKey: key }, data, "warm-cache");
       cachePayload(key, data, cacheEpoch);
       void logUsageReadDebug("usage:warm-cache-resolved", {
         provider,

@@ -49,6 +49,77 @@ pub fn codex_sessions_default() -> Option<PathBuf> {
     home().map(|h| h.join(".codex").join("sessions"))
 }
 
+/// Default Cursor workspace storage root for local chat/session metadata.
+pub fn cursor_workspace_storage_default() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        home().map(|h| {
+            h.join("Library")
+                .join("Application Support")
+                .join("Cursor")
+                .join("User")
+                .join("workspaceStorage")
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        env::var("APPDATA").ok().map(|appdata| {
+            PathBuf::from(appdata)
+                .join("Cursor")
+                .join("User")
+                .join("workspaceStorage")
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        home().map(|h| {
+            h.join(".config")
+                .join("Cursor")
+                .join("User")
+                .join("workspaceStorage")
+        })
+    }
+}
+
+/// Default Cursor global state DB path.
+pub fn cursor_global_state_vscdb_default() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        home().map(|h| {
+            h.join("Library")
+                .join("Application Support")
+                .join("Cursor")
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb")
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        env::var("APPDATA").ok().map(|appdata| {
+            PathBuf::from(appdata)
+                .join("Cursor")
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb")
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        home().map(|h| {
+            h.join(".config")
+                .join("Cursor")
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb")
+        })
+    }
+}
+
 /// `~/.ssh/config` — read only when SSH remote devices are configured.
 pub fn ssh_config() -> Option<PathBuf> {
     home().map(|h| h.join(".ssh").join("config"))
@@ -87,6 +158,20 @@ pub fn accessed_paths() -> Vec<AccessedPath> {
             env_override: Some("CODEX_HOME"),
         });
     }
+    if let Some(p) = cursor_workspace_storage_default() {
+        out.push(AccessedPath {
+            purpose: "Cursor IDE workspace session metadata",
+            path: p,
+            env_override: Some("CURSOR_USER_DIR"),
+        });
+    }
+    if let Some(p) = cursor_global_state_vscdb_default() {
+        out.push(AccessedPath {
+            purpose: "Cursor IDE global auth/session state DB",
+            path: p,
+            env_override: Some("CURSOR_USER_DIR"),
+        });
+    }
     if let Some(p) = ssh_config() {
         out.push(AccessedPath {
             purpose: "SSH host discovery (only when remote devices configured)",
@@ -113,6 +198,7 @@ mod tests {
         let set: Vec<_> = accessed_paths().iter().map(|p| p.purpose).collect();
         assert!(set.iter().any(|p| p.contains("Claude Code")));
         assert!(set.iter().any(|p| p.contains("Codex")));
+        assert!(set.iter().any(|p| p.contains("Cursor IDE")));
         assert!(set.iter().any(|p| p.contains("SSH")));
     }
 

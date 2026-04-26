@@ -1,9 +1,11 @@
 use super::tray::{patch_tray_utilization, sync_tray_title, tray_utilization_from_rate_limits};
 use super::{AppState, UsageDebugReport};
 use crate::models::*;
+use crate::secrets;
+use crate::usage::parser::CursorAuthStatus;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 #[cfg(target_os = "macos")]
 static CLAUDE_KEYCHAIN_REQUESTED_THIS_RUN: AtomicBool = AtomicBool::new(false);
@@ -68,6 +70,128 @@ pub async fn set_usage_access_enabled(
         .usage_access_enabled
         .store(enabled, std::sync::atomic::Ordering::SeqCst);
     Ok(())
+}
+
+/// Set or refresh the user's Cursor secret.
+///
+/// **Empty / `None` does NOT clear** persisted credentials — that's reserved
+/// for [`clear_cursor_auth_config`]. The reason is that frontend bootstrap
+/// passes whatever lives in `settings.json` on every launch (legacy migration
+/// path), and we don't want a stale-empty `cursorApiKey` to wipe a perfectly
+/// good keyring entry.
+///
+/// Behavior:
+/// - Non-empty input → persist to keyring (preferred) or 0600-perm file
+///   fallback, then update the in-memory cache and return the resulting
+///   status (with `storage_backend` populated).
+/// - Empty / `None` input → leave persisted state alone; if the keyring
+///   already has a secret, sync the in-memory cache from it and report
+///   that. This is the bootstrap-with-empty-settings.json path.
+#[tauri::command]
+pub async fn set_cursor_auth_config(
+    app: AppHandle,
+    api_key: Option<String>,
+) -> Result<CursorAuthStatus, String> {
+    let trimmed = api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if let Some(value) = trimmed {
+        let backend = secrets::cursor::store(&app, Some(&value))?;
+        Ok(crate::usage::parser::set_cursor_auth_config(
+            Some(value),
+            backend,
+        ))
+    } else if let Some((existing, backend)) = secrets::cursor::load(&app) {
+        Ok(crate::usage::parser::set_cursor_auth_config(
+            Some(existing),
+            backend,
+        ))
+    } else {
+        // No user-pasted secret in either layer. Refresh the IDE token
+        // cache; if the IDE provides one, the active credential becomes
+        // an `IdeBearer` with `StorageBackend::IdeAuto`. Otherwise the
+        // user is genuinely not connected.
+        let ide_present = crate::usage::parser::prime_ide_access_token();
+        let backend = if ide_present {
+            secrets::StorageBackend::IdeAuto
+        } else {
+            secrets::StorageBackend::None
+        };
+        Ok(crate::usage::parser::set_cursor_auth_config(None, backend))
+    }
+}
+
+/// Hard-clear the user-pasted Cursor secret. Wipes both the keyring entry
+/// and the file fallback (best-effort) and resets the override cache. Bound
+/// to the Settings UI's "Disconnect" button.
+///
+/// **The IDE auto-detected token is NOT cleared** — a Disconnect on the
+/// pasted-secret layer should fall through to the same zero-config state
+/// the user would have had if they'd never pasted anything. To genuinely
+/// stop reading from Cursor IDE, the user signs out of the IDE itself
+/// (which empties `cursorAuth/accessToken` in `state.vscdb`).
+#[tauri::command]
+pub async fn clear_cursor_auth_config(app: AppHandle) -> Result<CursorAuthStatus, String> {
+    secrets::cursor::store(&app, None)?;
+    let ide_present = crate::usage::parser::prime_ide_access_token();
+    let backend = if ide_present {
+        secrets::StorageBackend::IdeAuto
+    } else {
+        secrets::StorageBackend::None
+    };
+    Ok(crate::usage::parser::set_cursor_auth_config(None, backend))
+}
+
+#[tauri::command]
+pub async fn get_cursor_auth_status() -> Result<CursorAuthStatus, String> {
+    Ok(crate::usage::parser::cursor_auth_status())
+}
+
+/// Hydrate the in-memory Cursor secret state from disk so the very first
+/// usage refresh after launch can hit the remote API without waiting for
+/// the frontend bootstrap to round-trip an IPC call.
+///
+/// Two layers, both best-effort:
+///
+/// 1. **User-pasted secret** — keyring (preferred) or 0600-perm file
+///    fallback. If present, it's loaded into the override cache and the
+///    storage backend is reported as `Keyring` / `File`.
+/// 2. **Auto-detected IDE bearer** — Cursor IDE writes its current access
+///    token to `~/Library/Application Support/Cursor/.../state.vscdb` and
+///    rotates it on its own schedule. We populate the IDE token cache
+///    independently of the user-pasted layer; [`resolve_cursor_auth`]
+///    treats it as the lowest-priority fallback so an explicit user
+///    paste always wins. When this is the *only* credential available
+///    we additionally mark the storage backend as `IdeAuto` so the UI
+///    can surface "Connected via Cursor IDE" instead of "Not connected".
+///
+/// Failures are silent — a missing/locked keychain or absent Cursor IDE
+/// just leaves the corresponding layer empty.
+pub fn prime_cursor_auth_from_disk(app: &AppHandle) {
+    let user_secret_loaded = match secrets::cursor::load(app) {
+        Some((value, backend)) => {
+            let _ = crate::usage::parser::set_cursor_auth_config(Some(value), backend);
+            true
+        }
+        None => false,
+    };
+
+    // Always try priming the IDE token, even if a user secret was loaded:
+    // the user might later clear their pasted token via the Disconnect
+    // button, at which point we want to silently fall through to IDE auth
+    // without a restart.
+    let ide_token_present = crate::usage::parser::prime_ide_access_token();
+
+    if !user_secret_loaded && ide_token_present {
+        // No user-pasted secret, but the IDE has a token — surface the
+        // "auto-detected" backend so the Settings UI can render a
+        // "Connected via Cursor IDE" badge without persisting anything.
+        let _ =
+            crate::usage::parser::set_cursor_auth_config(None, secrets::StorageBackend::IdeAuto);
+    }
 }
 
 /// Outcome of the one-time interactive Keychain prompt. Surfaced to the
@@ -307,4 +431,10 @@ pub async fn get_last_usage_debug(
 #[tauri::command]
 pub async fn get_exchange_rates() -> Result<std::collections::HashMap<String, f64>, String> {
     Ok(crate::usage::exchange_rates::get_all_rates())
+}
+
+#[tauri::command]
+pub async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.exit(0);
+    Ok(())
 }

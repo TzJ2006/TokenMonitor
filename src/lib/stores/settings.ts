@@ -48,6 +48,8 @@ export interface Settings {
    * to `true` to preserve current behavior.
    */
   rateLimitsEnabled: boolean;
+  /** Optional Cursor Admin/Analytics API key. Stored locally and never logged. */
+  cursorApiKey: string;
   /** Set once the user has seen (and dismissed) the first-launch welcome. */
   hasSeenWelcome: boolean;
   /**
@@ -102,6 +104,7 @@ const DEFAULTS: Settings = {
   sshHosts: [],
   debugLogging: false,
   rateLimitsEnabled: false,
+  cursorApiKey: "",
   hasSeenWelcome: false,
   keychainAccessRequested: false,
 };
@@ -140,6 +143,10 @@ function normalizeCurrency(value: unknown): string {
   if (typeof value !== "string") return DEFAULTS.currency;
   const normalized = value.trim().toUpperCase();
   return normalizeStringChoice(normalized, SUPPORTED_CURRENCIES, DEFAULTS.currency);
+}
+
+function normalizeSecretString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function normalizeCostAlertThreshold(value: unknown): number {
@@ -297,6 +304,7 @@ export function normalizeSettings(saved?: Partial<Settings> | null): Settings {
     sshHosts: normalizeSshHosts(saved?.sshHosts),
     debugLogging: normalizeBoolean(saved?.debugLogging, DEFAULTS.debugLogging),
     rateLimitsEnabled: normalizeBoolean(saved?.rateLimitsEnabled, DEFAULTS.rateLimitsEnabled),
+    cursorApiKey: normalizeSecretString(saved?.cursorApiKey),
     hasSeenWelcome: normalizeBoolean(saved?.hasSeenWelcome, DEFAULTS.hasSeenWelcome),
     keychainAccessRequested: normalizeBoolean(
       saved?.keychainAccessRequested,
@@ -376,7 +384,10 @@ export async function updateSetting<K extends keyof Settings>(
   key: K,
   value: Settings[K],
 ) {
-  logger.info("settings", `Changed: ${key}=${JSON.stringify(value)}`);
+  const safeValue = key.toLowerCase().includes("key") || key.toLowerCase().includes("token")
+    ? "[redacted]"
+    : JSON.stringify(value);
+  logger.info("settings", `Changed: ${key}=${safeValue}`);
   const updated = normalizeSettings({ ...get(settings), [key]: value });
   settings.set(updated);
 

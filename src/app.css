@@ -137,6 +137,18 @@
   --provider-bg: rgba(46,126,181,0.05);
 }
 
+/* ── Provider: Cursor (indigo) ── */
+[data-provider="cursor"] {
+  --accent: #6C7BDB;
+  --accent-soft: rgba(108,123,219,0.14);
+  --provider-bg: rgba(108,123,219,0.05);
+}
+[data-theme="light"][data-provider="cursor"] {
+  --accent: #4D5EBE;
+  --accent-soft: rgba(77,94,190,0.14);
+  --provider-bg: rgba(77,94,190,0.06);
+}
+
 /* ── System theme: follow OS preference ── */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
@@ -178,6 +190,11 @@
     --accent: #2E7EB5;
     --accent-soft: rgba(46,126,181,0.14);
     --provider-bg: rgba(46,126,181,0.05);
+  }
+  :root:not([data-theme])[data-provider="cursor"] {
+    --accent: #4D5EBE;
+    --accent-soft: rgba(77,94,190,0.14);
+    --provider-bg: rgba(77,94,190,0.06);
   }
 }
 
@@ -233,6 +250,9 @@
   :root[data-glass="true"]:not([data-theme])[data-provider="codex"] {
     --accent: #2E7EB5;
   }
+  :root[data-glass="true"]:not([data-theme])[data-provider="cursor"] {
+    --accent: #4D5EBE;
+  }
 }
 
 /* Glass dark mode: deeper accent colors for contrast against blurred bg */
@@ -243,6 +263,10 @@
 :root[data-glass="true"][data-theme="dark"][data-provider="codex"],
 :root[data-glass="true"]:not([data-theme])[data-provider="codex"] {
   --accent: #3D93C8;
+}
+:root[data-glass="true"][data-theme="dark"][data-provider="cursor"],
+:root[data-glass="true"]:not([data-theme])[data-provider="cursor"] {
+  --accent: #5667CF;
 }
 
 @keyframes popIn {

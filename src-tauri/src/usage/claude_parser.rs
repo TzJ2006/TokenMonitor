@@ -309,6 +309,7 @@ fn extract_claude_tool_result_counts(
 pub(crate) type ClaudeParseResult = (Vec<ParsedEntry>, Vec<ParsedChangeEvent>, usize, bool);
 
 pub(crate) fn parse_claude_session_file(path: &Path) -> ClaudeParseResult {
+    tracing::debug!(path = %path.display(), "opening file (claude session)");
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(e) => {

@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { settings, updateSetting, type Settings as SettingsType } from "../stores/settings.js";
   import { clearUsageCache } from "../stores/usage.js";
   import { updaterStore, checkNow, setAutoCheck } from "../stores/updater.js";
@@ -26,6 +27,15 @@
   let current = $derived($settings as SettingsType);
   let appVersion = $state("");
   let checking = $state(false);
+  let cursorAuthStatus = $state<CursorAuthStatus | null>(null);
+  let cursorAuthMessage = $state<string | null>(null);
+
+  type CursorAuthStatus = {
+    source: string;
+    configured: boolean;
+    message: string;
+    lastWarning: string | null;
+  };
 
   type UpdateStatus = {
     label: string;
@@ -50,6 +60,7 @@
 
   onMount(() => {
     getVersion().then((v) => { appVersion = v; }).catch(() => {});
+    refreshCursorAuthStatus();
     isEnabled()
       .then((enabled) => {
         if (enabled !== current.launchAtLogin) {
@@ -61,6 +72,52 @@
 
   function handleCurrency(val: string) {
     updateSetting("currency", val as string);
+  }
+
+  function cursorStatusLabel(status: CursorAuthStatus | null): string {
+    if (!status?.configured) return "Not connected";
+    if (status.source === "official_api_key") return "Official API key";
+    return "Connected";
+  }
+
+  function cursorStatusTone(status: CursorAuthStatus | null): UpdateStatus["tone"] {
+    if (!status?.configured) return "warn";
+    return status.lastWarning ? "amber" : "ok";
+  }
+
+  async function refreshCursorAuthStatus() {
+    try {
+      cursorAuthStatus = await invoke<CursorAuthStatus>("get_cursor_auth_status");
+    } catch (error) {
+      cursorAuthStatus = null;
+      cursorAuthMessage = `Unable to read Cursor auth status: ${error}`;
+    }
+  }
+
+  async function syncCursorAuth(apiKey = current.cursorApiKey) {
+    cursorAuthStatus = await invoke<CursorAuthStatus>("set_cursor_auth_config", {
+      apiKey,
+    });
+    clearUsageCache();
+    await invoke("clear_payload_cache").catch(() => {});
+  }
+
+  async function handleCursorApiKeyInput(value: string) {
+    await updateSetting("cursorApiKey", value);
+    await syncCursorAuth(value);
+  }
+
+  async function openCursorDashboard() {
+    const url = "https://cursor.com/dashboard";
+    cursorAuthMessage = null;
+    logger.info("settings", `Opening Cursor Dashboard: ${url}`);
+    try {
+      await openUrl(url);
+    } catch (error) {
+      const message = `Unable to open Cursor Dashboard: ${error}`;
+      cursorAuthMessage = message;
+      logger.warn("settings", message);
+    }
   }
 
   async function handleDebugLogging(checked: boolean) {
@@ -184,6 +241,48 @@
     <SshHostsSettings />
 
     <div class="group">
+      <div class="group-label">Cursor Usage</div>
+      <div class="card">
+        <div class="row border">
+          <span class="label">Connection</span>
+          <span class="status status-{cursorStatusTone(cursorAuthStatus)}">
+            <span class="status-dot"></span>{cursorStatusLabel(cursorAuthStatus)}
+          </span>
+        </div>
+        <div class="cursor-section border">
+          <label class="label" for="cursor-api-key">Official API Key</label>
+          <input
+            id="cursor-api-key"
+            class="secret-input"
+            type="password"
+            autocomplete="off"
+            placeholder="key_..."
+            value={current.cursorApiKey}
+            oninput={(e) => handleCursorApiKeyInput((e.target as HTMLInputElement).value)}
+          />
+          <div class="hint">
+            Preferred path. Create an Admin API key in Cursor Dashboard settings, then paste it here.
+          </div>
+          <div class="cursor-actions">
+            <button
+              type="button"
+              class="secondary-btn"
+              onclick={openCursorDashboard}
+            >
+              click me to find your cursor API key
+            </button>
+          </div>
+          <div class="hint">
+            In Cursor Dashboard, open Settings → Advanced → Admin API Keys.
+          </div>
+          {#if cursorAuthMessage || cursorAuthStatus?.lastWarning}
+            <div class="cursor-message">{cursorAuthMessage ?? cursorAuthStatus?.lastWarning}</div>
+          {/if}
+        </div>
+      </div>
+    </div>
+
+    <div class="group">
       <div class="group-label">Privacy & Permissions</div>
       <PermissionDisclosure mode="settings" />
     </div>
@@ -302,6 +401,12 @@
     <div class="update-bottom">
       <UpdateBanner />
     </div>
+
+    <div class="quit-section">
+      <button type="button" class="quit-btn" onclick={() => invoke("quit_app")}>
+        Quit TokenMonitor
+      </button>
+    </div>
   </div>
 </div>
 
@@ -373,6 +478,43 @@
   }
   .row.center {
     justify-content: center;
+  }
+
+  .cursor-section {
+    padding: 8px 10px;
+  }
+  .cursor-section.border {
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .secret-input {
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 6px;
+    background: var(--surface-hover);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 6px 7px;
+    font: 400 10px/1 'Inter', sans-serif;
+    color: var(--t1);
+    outline: none;
+  }
+  .secret-input:focus {
+    border-color: color-mix(in srgb, var(--accent, #6366f1) 55%, var(--border));
+  }
+  .hint {
+    margin-top: 5px;
+    font: 400 8.5px/1.35 'Inter', sans-serif;
+    color: var(--t4);
+  }
+  .cursor-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .cursor-message {
+    margin-top: 6px;
+    font: 400 8.5px/1.35 'Inter', sans-serif;
+    color: #E8A060;
   }
 
   .actions {
@@ -476,10 +618,48 @@
   .reset-btn.error {
     color: var(--ch-minus);
   }
+  .secondary-btn {
+    background: none;
+    border: 1px solid var(--border-subtle);
+    border-radius: 5px;
+    font: 400 9px/1 'Inter', sans-serif;
+    color: var(--t3);
+    cursor: pointer;
+    padding: 5px 7px;
+  }
+  .secondary-btn:hover:not(:disabled) {
+    color: var(--t1);
+    background: var(--surface-hover);
+  }
+  .secondary-btn:disabled {
+    opacity: .55;
+    cursor: default;
+  }
 
   .update-bottom :global(.banner) {
     border-bottom: none;
     border-top: 1px solid var(--border-subtle);
     border-radius: 0 0 8px 8px;
+  }
+
+  .quit-section {
+    display: flex;
+    justify-content: center;
+    padding: 12px 0 4px;
+  }
+
+  .quit-btn {
+    background: none;
+    border: 1px solid var(--ch-minus);
+    border-radius: 6px;
+    font: 500 10px/1 'Inter', sans-serif;
+    color: var(--ch-minus);
+    cursor: pointer;
+    padding: 6px 20px;
+    transition: background 120ms ease, color 120ms ease;
+  }
+  .quit-btn:hover {
+    background: var(--ch-minus);
+    color: #fff;
   }
 </style>

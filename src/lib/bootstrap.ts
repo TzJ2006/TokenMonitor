@@ -73,6 +73,9 @@ export async function initializeRuntimeFromSettings(
     invokeFn("set_refresh_interval", { interval: saved.refreshInterval }),
     invokeFn("set_usage_access_enabled", { enabled: saved.hasSeenWelcome }),
     invokeFn("set_rate_limits_enabled", { enabled: saved.rateLimitsEnabled }),
+    invokeFn("set_cursor_auth_config", {
+      apiKey: saved.cursorApiKey,
+    }),
     syncTrayConfig(saved.trayConfig, null, invokeFn),
   ];
   if (saved.sshHosts.length > 0) {
