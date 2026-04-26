@@ -387,6 +387,7 @@ pub async fn get_rate_limits(
         None | Some("all") => crate::rate_limits::RateLimitSelection::All,
         Some("claude") => crate::rate_limits::RateLimitSelection::Claude,
         Some("codex") => crate::rate_limits::RateLimitSelection::Codex,
+        Some("cursor") => crate::rate_limits::RateLimitSelection::Cursor,
         Some(other) => return Err(format!("Invalid provider for rate limits: {other}")),
     };
 
@@ -402,6 +403,7 @@ pub async fn get_rate_limits(
             .unwrap_or(RateLimitsPayload {
                 claude: None,
                 codex: None,
+                cursor: None,
             }));
     }
 

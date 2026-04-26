@@ -16,6 +16,7 @@ export const chartMode = writable<"bar" | "line" | "pie">("bar");
 export const chartSegmentMode = writable<"model" | "device">("model");
 export const usageData = writable<UsagePayload | null>(null);
 export const isLoading = writable(false);
+export const isPlaceholderLoading = writable(false);
 
 function emptyPayload(): UsagePayload {
   return {
@@ -142,6 +143,7 @@ function invalidateMatchingUsageCache(
   currentCacheEpoch += 1;
   currentRequestId += 1;
   isLoading.set(false);
+  isPlaceholderLoading.set(false);
 }
 
 function requestUsagePayload(
@@ -167,6 +169,7 @@ function applyUsageDataIfCurrent(requestId: number, data: UsagePayload): boolean
     if (current === null || !shallowPayloadEqual(current, data)) {
       usageData.set(data);
     }
+    isPlaceholderLoading.set(false);
   }
   return appliedToUi;
 }
@@ -282,6 +285,7 @@ export async function fetchData(
       usageData.set(cached.data);
     }
     isLoading.set(false);
+    isPlaceholderLoading.set(false);
     logger.debug("usage", `Cache hit: ${key}`);
     logResizeDebug("usage:frontend-cache-hit", { ...ctx, cacheAgeMs: Date.now() - cached.at });
     // Silent background refresh — no loading indicator
@@ -301,8 +305,10 @@ export async function fetchData(
   // ── Cold path: no cache — show loading indicator ──
   if (cached) {
     usageData.set(cached.data);
+    isPlaceholderLoading.set(false);
   } else {
     usageData.set(emptyPayload());
+    isPlaceholderLoading.set(true);
   }
   isLoading.set(true);
   try {
@@ -326,6 +332,7 @@ export async function fetchData(
   } finally {
     if (requestId === currentRequestId) {
       isLoading.set(false);
+      isPlaceholderLoading.set(false);
     }
   }
 }

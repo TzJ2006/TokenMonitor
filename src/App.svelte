@@ -11,6 +11,7 @@
     activeOffset,
     usageData,
     isLoading,
+    isPlaceholderLoading,
     fetchData,
     warmCache,
     warmAllPeriods,
@@ -95,6 +96,7 @@
   let offset = $state(0);
   let data = $state($usageData);
   let loading = $state(false);
+  let placeholderLoading = $state(false);
   let showRefresh = $state(false);
   let rateLimits = $state<RateLimitsPayload | null>(null);
   let rateLimitsRequest = $state({
@@ -142,6 +144,7 @@
   $effect(() => {
     const unsub1 = usageData.subscribe((v) => { if (deviceToggleGuard === 0) data = v; });
     const unsub2 = isLoading.subscribe((v) => (loading = v));
+    const unsubPL = isPlaceholderLoading.subscribe((v) => (placeholderLoading = v));
     const unsub3 = settings.subscribe((s) => {
       brandTheming = s.brandTheming;
       if (!areHeaderTabsEqual(headerTabs, s.headerTabs)) {
@@ -150,7 +153,7 @@
     });
     const unsub4 = rateLimitsData.subscribe((v) => (rateLimits = v));
     const unsub5 = rateLimitsRequestState.subscribe((v) => (rateLimitsRequest = v));
-    return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5(); };
+    return () => { unsub1(); unsub2(); unsubPL(); unsub3(); unsub4(); unsub5(); };
   });
 
   // Apply/remove data-provider attribute reactively
@@ -678,126 +681,133 @@
           onReset={handleOffsetReset}
         />
       {/if}
-      <MetricsRow {data} />
-      {#if data.usage_warning}
-        <div class="usage-warning">
-          <div class="usage-warning-title">Usage warning</div>
-          <div class="usage-warning-text">{data.usage_warning}</div>
+      {#if placeholderLoading}
+        <div class="loading">
+          <div class="spinner"></div>
+          <div class="loading-text">Loading data...</div>
         </div>
-      {/if}
-      <div class="hr"></div>
+      {:else}
+        <MetricsRow {data} />
+        {#if data.usage_warning}
+          <div class="usage-warning">
+            <div class="usage-warning-title">Usage warning</div>
+            <div class="usage-warning-text">{data.usage_warning}</div>
+          </div>
+        {/if}
+        <div class="hr"></div>
 
-      {#if period === "5h" && showKeychainPermissionPanel && isMacOS() && !$settings.keychainAccessRequested}
-        <div class="rate-limit-permission" role="dialog" aria-labelledby="rate-limit-permission-title">
-          <div class="rate-limit-empty-title" id="rate-limit-permission-title">
-            Keychain fallback for live limits
+        {#if period === "5h" && showKeychainPermissionPanel && isMacOS() && !$settings.keychainAccessRequested}
+          <div class="rate-limit-permission" role="dialog" aria-labelledby="rate-limit-permission-title">
+            <div class="rate-limit-empty-title" id="rate-limit-permission-title">
+              Keychain fallback for live limits
+            </div>
+            <div class="rate-limit-empty-text">
+              TokenMonitor normally reads Claude live limits from your Claude
+              credentials file without any macOS prompt. If that file is missing
+              or unreadable, you can allow a one-time Keychain fallback.
+            </div>
+            <PermissionDisclosure mode="rate-limit" />
+            <div class="rate-limit-empty-text">
+              macOS may show a Keychain window after you continue. Choose
+              <strong>Always Allow</strong> if you want future fallback checks to stay silent.
+            </div>
+            <div class="rate-limit-actions">
+              <button
+                type="button"
+                class="rate-limit-secondary"
+                onclick={handleSkipKeychainForRateLimits}
+                disabled={keychainPermissionBusy}
+              >
+                Do not use Keychain
+              </button>
+              <button
+                type="button"
+                class="rate-limit-cta"
+                onclick={handleAllowKeychainForRateLimits}
+                disabled={keychainPermissionBusy}
+              >
+                Allow Keychain access
+              </button>
+            </div>
           </div>
-          <div class="rate-limit-empty-text">
-            TokenMonitor normally reads Claude live limits from your Claude
-            credentials file without any macOS prompt. If that file is missing
-            or unreadable, you can allow a one-time Keychain fallback.
-          </div>
-          <PermissionDisclosure mode="rate-limit" />
-          <div class="rate-limit-empty-text">
-            macOS may show a Keychain window after you continue. Choose
-            <strong>Always Allow</strong> if you want future fallback checks to stay silent.
-          </div>
-          <div class="rate-limit-actions">
-            <button
-              type="button"
-              class="rate-limit-secondary"
-              onclick={handleSkipKeychainForRateLimits}
-              disabled={keychainPermissionBusy}
-            >
-              Do not use Keychain
-            </button>
+        {:else if period === "5h" && $settings.rateLimitsEnabled && visibleUsableRateLimitProviders.length > 0}
+          {#each visibleUsableRateLimitProviders as rateLimitProvider, index}
+            <UsageBars
+              providerLabel={provider === ALL_USAGE_PROVIDER_ID ? getUsageProviderLabel(rateLimitProvider) : undefined}
+              rateLimits={providerPayload(rateLimits, rateLimitProvider)!}
+            />
+            {#if index < visibleUsableRateLimitProviders.length - 1}
+              <div class="hr"></div>
+            {/if}
+          {/each}
+        {:else if period === "5h" && shouldShowFiveHourUsageFallback}
+          {#if !$settings.rateLimitsEnabled}
+            <div class="rate-limit-note">
+              Live rate-limit percentages are off. Showing local 5h usage.
+            </div>
+          {:else if rateLimitsRequest.error}
+            <div class="rate-limit-note">
+              Live rate-limit percentages unavailable: {rateLimitsRequest.error} Showing local 5h usage.
+            </div>
+          {/if}
+          <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} deviceBuckets={data.device_chart_buckets} />
+        {:else if period === "5h" && !$settings.rateLimitsEnabled}
+          <div class="rate-limit-empty">
+            <div class="rate-limit-empty-title">Live rate limits are off</div>
+            <div class="rate-limit-empty-text">
+              Turn this on to see live 5h and weekly rate-limit percentages.
+              TokenMonitor uses your Claude credentials file first and does not open Keychain from this button.
+            </div>
             <button
               type="button"
               class="rate-limit-cta"
-              onclick={handleAllowKeychainForRateLimits}
+              onclick={handleEnableRateLimits}
               disabled={keychainPermissionBusy}
             >
-              Allow Keychain access
+              Enable rate limits
             </button>
           </div>
-        </div>
-      {:else if period === "5h" && $settings.rateLimitsEnabled && visibleUsableRateLimitProviders.length > 0}
-        {#each visibleUsableRateLimitProviders as rateLimitProvider, index}
-          <UsageBars
-            providerLabel={provider === ALL_USAGE_PROVIDER_ID ? getUsageProviderLabel(rateLimitProvider) : undefined}
-            rateLimits={providerPayload(rateLimits, rateLimitProvider)!}
-          />
-          {#if index < visibleUsableRateLimitProviders.length - 1}
-            <div class="hr"></div>
-          {/if}
-        {/each}
-      {:else if period === "5h" && shouldShowFiveHourUsageFallback}
-        {#if !$settings.rateLimitsEnabled}
-          <div class="rate-limit-note">
-            Live rate-limit percentages are off. Showing local 5h usage.
-          </div>
-        {:else if rateLimitsRequest.error}
-          <div class="rate-limit-note">
-            Live rate-limit percentages unavailable: {rateLimitsRequest.error} Showing local 5h usage.
-          </div>
-        {/if}
-        <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} deviceBuckets={data.device_chart_buckets} />
-      {:else if period === "5h" && !$settings.rateLimitsEnabled}
-        <div class="rate-limit-empty">
-          <div class="rate-limit-empty-title">Live rate limits are off</div>
-          <div class="rate-limit-empty-text">
-            Turn this on to see live 5h and weekly rate-limit percentages.
-            TokenMonitor uses your Claude credentials file first and does not open Keychain from this button.
-          </div>
-          <button
-            type="button"
-            class="rate-limit-cta"
-            onclick={handleEnableRateLimits}
-            disabled={keychainPermissionBusy}
-          >
-            Enable rate limits
-          </button>
-        </div>
-      {:else if period === "5h" && rateLimitsRequest.loading}
-        <div class="loading-bars"><div class="spinner"></div></div>
-      {:else if period === "5h"}
-        <div class="rate-limit-empty">
-          <div class="rate-limit-empty-title">Rate limits unavailable</div>
-          <div class="rate-limit-empty-text">
-            {#if isRateLimitProvider(provider) && (data.total_tokens > 0 || data.total_cost > 0)}
-              {getRateLimitIdleSummary(provider)}
-            {:else}
-              {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
+        {:else if period === "5h" && rateLimitsRequest.loading}
+          <div class="loading-bars"><div class="spinner"></div></div>
+        {:else if period === "5h"}
+          <div class="rate-limit-empty">
+            <div class="rate-limit-empty-title">Rate limits unavailable</div>
+            <div class="rate-limit-empty-text">
+              {#if isRateLimitProvider(provider) && (data.total_tokens > 0 || data.total_cost > 0)}
+                {getRateLimitIdleSummary(provider)}
+              {:else}
+                {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
+              {/if}
+            </div>
+            {#if isMacOS() && !$settings.keychainAccessRequested}
+              <button
+                type="button"
+                class="rate-limit-secondary"
+                onclick={handleShowKeychainFallback}
+                disabled={keychainPermissionBusy}
+              >
+                Review Keychain fallback
+              </button>
             {/if}
           </div>
-          {#if isMacOS() && !$settings.keychainAccessRequested}
-            <button
-              type="button"
-              class="rate-limit-secondary"
-              onclick={handleShowKeychainFallback}
-              disabled={keychainPermissionBusy}
-            >
-              Review Keychain fallback
-            </button>
-          {/if}
-        </div>
-      {:else if data.total_cost === 0 && data.total_tokens === 0}
-        <div class="empty-period">{emptyPeriodLabel(period, offset)}</div>
-      {:else}
-        <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} deviceBuckets={data.device_chart_buckets} />
-      {/if}
+        {:else if data.total_cost === 0 && data.total_tokens === 0}
+          <div class="empty-period">{emptyPeriodLabel(period, offset)}</div>
+        {:else}
+          <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} deviceBuckets={data.device_chart_buckets} />
+        {/if}
 
-      {#if (period !== "5h" && data.model_breakdown.length > 0) || data.subagent_stats || (data.device_breakdown && data.device_breakdown.length > 0)}
-        <div class="hr"></div>
-        <Breakdown
-          models={period !== "5h" ? data.model_breakdown : []}
-          onAccordionToggle={(detail) => resizeOrch?.handleBreakdownAccordionToggle(detail)}
-          subagentStats={data.subagent_stats}
-          deviceBreakdown={data.device_breakdown}
-          onDeviceSelect={handleDeviceSelect}
-          onShowAllDevices={() => { showDevices = true; }}
-          onToggleDeviceStats={handleToggleDeviceStats}
-        />
+        {#if (period !== "5h" && data.model_breakdown.length > 0) || data.subagent_stats || (data.device_breakdown && data.device_breakdown.length > 0)}
+          <div class="hr"></div>
+          <Breakdown
+            models={period !== "5h" ? data.model_breakdown : []}
+            onAccordionToggle={(detail) => resizeOrch?.handleBreakdownAccordionToggle(detail)}
+            subagentStats={data.subagent_stats}
+            deviceBreakdown={data.device_breakdown}
+            onDeviceSelect={handleDeviceSelect}
+            onShowAllDevices={() => { showDevices = true; }}
+            onToggleDeviceStats={handleToggleDeviceStats}
+          />
+        {/if}
       {/if}
       <Footer {data} {provider} {period} {rateLimits} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} onDevices={() => { showDevices = true; }} />
     {:else}
