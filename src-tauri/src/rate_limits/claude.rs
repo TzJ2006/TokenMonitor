@@ -143,6 +143,7 @@ pub(super) fn prime_token_from_keychain_interactive() -> Result<(), String> {
 }
 
 fn read_token_from_credentials_path(cred_path: &Path) -> Result<String, String> {
+    tracing::debug!(path = %cred_path.display(), "reading file (claude credentials)");
     let raw = std::fs::read_to_string(cred_path)
         .map_err(|e| format!("Failed to read {}: {e}", cred_path.display()))?;
 

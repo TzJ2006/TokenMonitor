@@ -20,6 +20,7 @@ const DEFAULT_HEADER_TABS = {
   all: { label: "All", enabled: true },
   claude: { label: "Claude", enabled: true },
   codex: { label: "Codex", enabled: true },
+  cursor: { label: "Cursor", enabled: true },
 } as const;
 
 function makePersistedStore(saved: Partial<Settings> | null = {}) {
@@ -98,6 +99,7 @@ describe("loadSettings", () => {
       taskbarPanel: false,
       sshHosts: [],
       debugLogging: false,
+      cursorApiKey: "",
       // Existing installs (non-empty saved settings) migrate to rate-limits
       // on, welcome-seen, AND keychain-prompt-already-shown so we don't pop
       // a tutorial on someone who's been using the app for months.
@@ -151,6 +153,7 @@ describe("loadSettings", () => {
       taskbarPanel: false,
       sshHosts: [],
       debugLogging: false,
+      cursorApiKey: "",
       // Failure path goes through pure defaults (no migration), so the
       // opt-in flags stay off.
       rateLimitsEnabled: false,
@@ -227,6 +230,7 @@ describe("loadSettings migration", () => {
         all: { label: "Overview", enabled: false },
         claude: { label: "Claude Code", enabled: true },
         codex: { label: "Codex", enabled: false },
+        cursor: { label: "Cursor", enabled: true },
       },
     });
     mockLoad.mockResolvedValueOnce(store);
@@ -239,6 +243,7 @@ describe("loadSettings migration", () => {
       all: { label: "Overview", enabled: false },
       claude: { label: "Claude Code", enabled: true },
       codex: { label: "Codex", enabled: false },
+      cursor: { label: "Cursor", enabled: true },
     });
   });
 
@@ -256,6 +261,7 @@ describe("loadSettings migration", () => {
         all: { label: "   ", enabled: false },
         claude: { label: "Claude Claude Claude", enabled: false },
         codex: { label: "Codex", enabled: false },
+        cursor: { label: "Cursor", enabled: false },
       },
       brandTheming: "yes" as unknown as Settings["brandTheming"],
       trayConfig: {
@@ -300,6 +306,7 @@ describe("loadSettings migration", () => {
         enabled: false,
       },
       codex: { label: "Codex", enabled: false },
+      cursor: { label: "Cursor", enabled: false },
     });
     expect(loaded.headerTabs.claude.label).toHaveLength(MAX_HEADER_TAB_LABEL_LENGTH);
   });
@@ -314,6 +321,7 @@ describe("header tab helpers", () => {
         all: { label: "All", enabled: true },
         claude: { label: "Claude", enabled: true },
         codex: { label: "Codex", enabled: true },
+        cursor: { label: "Cursor", enabled: true },
       }),
     ).toBe(true);
   });
@@ -326,6 +334,7 @@ describe("header tab helpers", () => {
         all: { label: "Overview", enabled: true },
         claude: { label: "Claude", enabled: true },
         codex: { label: "Codex", enabled: true },
+        cursor: { label: "Cursor", enabled: true },
       }),
     ).toBe(false);
 
@@ -334,6 +343,7 @@ describe("header tab helpers", () => {
         all: { label: "All", enabled: true },
         claude: { label: "Claude", enabled: false },
         codex: { label: "Codex", enabled: true },
+        cursor: { label: "Cursor", enabled: true },
       }),
     ).toBe(false);
   });
@@ -345,12 +355,14 @@ describe("header tab helpers", () => {
       all: { label: "Overview", enabled: false },
       claude: { label: "Claude Code", enabled: false },
       codex: { label: "Codex", enabled: false },
+      cursor: { label: "Cursor", enabled: false },
     });
 
     expect(normalized).toEqual({
       all: { label: "Overview", enabled: true },
       claude: { label: "Claude Code", enabled: false },
       codex: { label: "Codex", enabled: false },
+      cursor: { label: "Cursor", enabled: false },
     });
     expect(resolveVisibleProvider("codex", normalized)).toBe("all");
   });
@@ -444,6 +456,7 @@ describe("updateSetting", () => {
       all: { label: "Overview", enabled: true },
       claude: { label: "Claude Code", enabled: false },
       codex: { label: "Codex", enabled: false },
+      cursor: { label: "Cursor", enabled: true },
     });
 
     expect(get(settings).defaultProvider).toBe("all");
@@ -455,6 +468,7 @@ describe("updateSetting", () => {
           all: { label: "Overview", enabled: true },
           claude: { label: "Claude Code", enabled: false },
           codex: { label: "Codex", enabled: false },
+          cursor: { label: "Cursor", enabled: true },
         },
       }),
     );

@@ -36,6 +36,7 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
       all: { label: "All", enabled: true },
       claude: { label: "Claude", enabled: true },
       codex: { label: "Codex", enabled: true },
+      cursor: { label: "Cursor", enabled: true },
     },
     brandTheming: true,
     trayConfig: {
@@ -52,6 +53,7 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     taskbarPanel: false,
     sshHosts: [],
     debugLogging: false,
+    cursorApiKey: "",
     rateLimitsEnabled: false,
     hasSeenWelcome: true,
     keychainAccessRequested: true,
@@ -97,6 +99,9 @@ describe("initializeRuntimeFromSettings", () => {
     expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith(invokeFn, true);
     expect(invokeFn).toHaveBeenCalledWith("set_refresh_interval", { interval: 300 });
     expect(invokeFn).toHaveBeenCalledWith("set_usage_access_enabled", { enabled: true });
+    expect(invokeFn).toHaveBeenCalledWith("set_cursor_auth_config", {
+      apiKey: "",
+    });
     expect(invokeFn).toHaveBeenCalledWith("set_tray_config", {
       config: expect.objectContaining({ showCost: true }),
       claudeUtil: null,
@@ -156,6 +161,26 @@ describe("initializeRuntimeFromSettings", () => {
     expect(invokeFn).toHaveBeenCalledWith("set_usage_access_enabled", { enabled: false });
   });
 
+  it("forwards stored Cursor auth config on startup", async () => {
+    const invokeFn = vi.fn().mockResolvedValue(undefined);
+    const applyGlassFn = vi.fn();
+    const applyThemeFn = vi.fn();
+    const syncNativeWindowThemeFn = vi.fn().mockResolvedValue(undefined);
+    const syncNativeWindowSurfaceFn = vi.fn().mockResolvedValue(undefined);
+
+    await initializeRuntimeFromSettings(makeSettings({ cursorApiKey: "key_test" }), {
+      invokeFn,
+      applyThemeFn,
+      applyGlassFn,
+      syncNativeWindowThemeFn,
+      syncNativeWindowSurfaceFn,
+    });
+
+    expect(invokeFn).toHaveBeenCalledWith("set_cursor_auth_config", {
+      apiKey: "key_test",
+    });
+  });
+
   it("falls back to a visible provider when the saved default tab is hidden", async () => {
     const invokeFn = vi.fn().mockResolvedValue(undefined);
     const applyGlassFn = vi.fn();
@@ -170,6 +195,7 @@ describe("initializeRuntimeFromSettings", () => {
           all: { label: "Overview", enabled: true },
           claude: { label: "Claude", enabled: false },
           codex: { label: "Codex", enabled: false },
+          cursor: { label: "Cursor", enabled: true },
         },
       }),
       { invokeFn, applyThemeFn, applyGlassFn, syncNativeWindowThemeFn, syncNativeWindowSurfaceFn },

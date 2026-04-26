@@ -679,6 +679,12 @@
         />
       {/if}
       <MetricsRow {data} />
+      {#if data.usage_warning}
+        <div class="usage-warning">
+          <div class="usage-warning-title">Usage warning</div>
+          <div class="usage-warning-text">{data.usage_warning}</div>
+        </div>
+      {/if}
       <div class="hr"></div>
 
       {#if period === "5h" && showKeychainPermissionPanel && isMacOS() && !$settings.keychainAccessRequested}
@@ -863,6 +869,22 @@
     margin: 6px 14px 0;
     font: 400 9px/1.35 'Inter', sans-serif;
     color: var(--t3);
+  }
+  .usage-warning {
+    margin: 8px 14px 0;
+    padding: 8px 9px;
+    border-radius: 8px;
+    background: color-mix(in srgb, #d88d31 12%, transparent);
+    border: 1px solid color-mix(in srgb, #d88d31 30%, transparent);
+  }
+  .usage-warning-title {
+    font: 600 9px/1.2 'Inter', sans-serif;
+    color: var(--t1);
+    margin-bottom: 3px;
+  }
+  .usage-warning-text {
+    font: 400 8.5px/1.35 'Inter', sans-serif;
+    color: var(--t2);
   }
   .rate-limit-cta {
     margin-top: 10px;

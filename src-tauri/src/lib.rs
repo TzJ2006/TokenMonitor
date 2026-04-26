@@ -4,6 +4,7 @@ mod models;
 mod paths;
 mod platform;
 mod rate_limits;
+mod secrets;
 mod stats;
 mod tray;
 mod updater;
@@ -327,6 +328,13 @@ pub fn run() {
                 }
             }
 
+            // Hydrate the in-memory Cursor secret cache from keyring (or
+            // file fallback) so the first usage refresh after launch can
+            // hit the remote API without waiting for the frontend to
+            // round-trip a `set_cursor_auth_config` call. Best-effort: a
+            // missing/locked keychain just leaves the cache empty.
+            commands::config::prime_cursor_auth_from_disk(app.handle());
+
             // Load persisted updater state
             {
                 let state = app.state::<commands::AppState>();
@@ -357,6 +365,9 @@ pub fn run() {
             commands::config::set_refresh_interval,
             commands::config::set_rate_limits_enabled,
             commands::config::set_usage_access_enabled,
+            commands::config::set_cursor_auth_config,
+            commands::config::clear_cursor_auth_config,
+            commands::config::get_cursor_auth_status,
             commands::config::request_claude_keychain_access,
             commands::tray::set_tray_config,
             commands::tray::get_status_widget_summary,
@@ -397,6 +408,7 @@ pub fn run() {
             commands::updater::updater_skip_version,
             commands::updater::updater_dismiss,
             commands::config::get_exchange_rates,
+            commands::config::quit_app,
         ])
         .run(tauri::generate_context!())
         .expect("error running TokenMonitor");
