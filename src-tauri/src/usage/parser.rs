@@ -5,14 +5,15 @@ use crate::models::{
 use crate::stats::change::FileCategory;
 use crate::stats::change::{classify_file, ChangeEventKind, ParsedChangeEvent};
 use crate::usage::integrations::{UsageIntegrationId, UsageIntegrationSelection};
-use chrono::{DateTime, Local, NaiveDate, Timelike};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
 #[cfg(test)]
@@ -116,6 +117,7 @@ struct CachedFileEntries {
 enum ProviderFileKind {
     Claude,
     Codex,
+    Cursor,
 }
 
 #[derive(Clone)]
@@ -133,6 +135,7 @@ impl UsageIntegrationConfig {
         match self.id {
             UsageIntegrationId::Claude => ProviderFileKind::Claude,
             UsageIntegrationId::Codex => ProviderFileKind::Codex,
+            UsageIntegrationId::Cursor => ProviderFileKind::Cursor,
         }
     }
 
@@ -144,11 +147,15 @@ impl UsageIntegrationConfig {
             UsageIntegrationId::Codex => {
                 "recursive-jsonl-glob+root-file-list-cache+parsed-file-cache+token-delta"
             }
+            UsageIntegrationId::Cursor => "workspace-chat-json+token-field-probe+cursor-remote-api",
         }
     }
 
     fn dedupe_entry_hashes(&self) -> bool {
-        matches!(self.id, UsageIntegrationId::Claude)
+        matches!(
+            self.id,
+            UsageIntegrationId::Claude | UsageIntegrationId::Cursor
+        )
     }
 
     fn dedupe_change_events(&self) -> bool {
@@ -199,9 +206,13 @@ pub(crate) fn glob_jsonl_files(dir: &Path) -> Vec<PathBuf> {
     if !dir.exists() {
         return results;
     }
+    tracing::debug!(path = %dir.display(), "read_dir (glob_jsonl_files)");
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(_) => return results,
+        Err(e) => {
+            tracing::debug!(path = %dir.display(), error = %e, "read_dir failed");
+            return results;
+        }
     };
     for entry in rd.flatten() {
         let Ok(file_type) = entry.file_type() else {
@@ -209,6 +220,7 @@ pub(crate) fn glob_jsonl_files(dir: &Path) -> Vec<PathBuf> {
         };
         let path = entry.path();
         if file_type.is_symlink() {
+            tracing::debug!(path = %path.display(), "skipping symlink");
             continue;
         }
         if file_type.is_dir() {
@@ -246,9 +258,13 @@ fn scan_jsonl_tree_into(
     // them so the walker stays on the volume the user originally opted into.
     let metadata = match fs::symlink_metadata(dir) {
         Ok(metadata) => metadata,
-        Err(_) => return,
+        Err(e) => {
+            tracing::debug!(path = %dir.display(), error = %e, "symlink_metadata failed");
+            return;
+        }
     };
     if metadata.file_type().is_symlink() {
+        tracing::debug!(path = %dir.display(), "skipping symlink dir");
         return;
     }
     let modified = match metadata.modified() {
@@ -260,9 +276,13 @@ fn scan_jsonl_tree_into(
         modified,
     });
 
+    tracing::debug!(path = %dir.display(), "read_dir (scan_jsonl_tree)");
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(_) => return,
+        Err(e) => {
+            tracing::debug!(path = %dir.display(), error = %e, "read_dir failed");
+            return;
+        }
     };
     for entry in rd.flatten() {
         let Ok(file_type) = entry.file_type() else {
@@ -270,6 +290,7 @@ fn scan_jsonl_tree_into(
         };
         let path = entry.path();
         if file_type.is_symlink() {
+            tracing::debug!(path = %path.display(), "skipping symlink");
             continue;
         }
         if file_type.is_dir() {
@@ -614,6 +635,7 @@ fn split_patch_by_file(patch: &str, paths: &[String]) -> Vec<(String, u64, u64)>
 type CodexParseResult = (Vec<ParsedEntry>, Vec<ParsedChangeEvent>, usize, bool);
 
 fn parse_codex_session_file(path: &Path) -> CodexParseResult {
+    tracing::debug!(path = %path.display(), "opening file (codex session)");
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(e) => {
@@ -1005,6 +1027,1025 @@ fn segment_map_to_model_summaries(map: &HashMap<String, (String, f64, u64)>) -> 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Cursor helpers (local probe + remote API)
+//
+// Three remote auth paths are supported, dispatched from the active credential:
+//
+//   • Admin API key (`key_…` prefix) → Basic auth against
+//     `https://api.cursor.com/teams/filtered-usage-events`. Enterprise admins
+//     only.
+//   • Dashboard session token (`WorkosCursorSessionToken` cookie value
+//     manually pasted by the user) → cookie auth against
+//     `https://cursor.com/api/dashboard/get-filtered-usage-events`.
+//     Works for individual Pro/Pro+/Ultra users.
+//   • IDE bearer token (auto-detected from `cursorAuth/accessToken` in
+//     Cursor IDE's `state.vscdb`) → Bearer auth against
+//     `https://api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents`
+//     (Connect-Web protocol). This is the **zero-config** path: as long as
+//     the user is signed into Cursor IDE on the same machine, no manual
+//     paste is required. Cursor IDE refreshes the access token on its own
+//     schedule; we just re-read state.vscdb before each remote call.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CURSOR_API_MAX_PAGES: usize = 20;
+const CURSOR_API_PAGE_SIZE: usize = 100;
+const CURSOR_OFFICIAL_API_BASE_URL: &str = "https://api.cursor.com";
+const CURSOR_DASHBOARD_API_BASE_URL: &str = "https://cursor.com";
+/// Cursor IDE's internal Connect-Web RPC host. Bearer-friendly (verified
+/// empirically against the production server in `path_a_smoke`).
+const CURSOR_IDE_API_BASE_URL: &str = "https://api2.cursor.sh";
+/// Backward-compatible env var. Originally only accepted Admin API keys but
+/// now accepts either form (admin `key_…` or dashboard session token); the
+/// concrete auth path is decided by [`classify_cursor_secret`].
+const CURSOR_API_KEY_ENV: &str = "CURSOR_API_KEY";
+/// Dedicated env var for dashboard session tokens. Wins over `CURSOR_API_KEY`
+/// when both are set, since users typically only set this one explicitly.
+const CURSOR_SESSION_TOKEN_ENV: &str = "CURSOR_SESSION_TOKEN";
+const CURSOR_USER_DIR_ENV: &str = "CURSOR_USER_DIR";
+/// Key inside Cursor IDE's `state.vscdb` `ItemTable` that stores the
+/// per-user access JWT. Cursor IDE writes a refreshed value here whenever
+/// it rotates its session.
+const CURSOR_IDE_ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
+
+static CURSOR_LAST_WARNING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// Holds whatever secret the user pasted via the Settings IPC (admin key or
+/// dashboard session token). Classification happens at use-time so the cell
+/// is auth-kind-agnostic.
+static CURSOR_SECRET_OVERRIDE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// Holds the Cursor IDE access token sniffed from `state.vscdb`. Always
+/// classified as [`CursorAuth::IdeBearer`]; lower priority than user-pasted
+/// secrets so an explicit choice always wins. Refreshed on every call to
+/// [`fetch_cursor_remote_entries`] to pick up Cursor IDE's automatic token
+/// rotation.
+static CURSOR_IDE_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// Tracks where the active in-memory secret came from on disk. Surfaced via
+/// [`CursorAuthStatus::storage_backend`] so the Settings UI can show a
+/// "Stored in Keychain / Local file / Auto-detected" badge.
+static CURSOR_STORAGE_BACKEND: OnceLock<Mutex<crate::secrets::StorageBackend>> = OnceLock::new();
+
+fn cursor_warning_cell() -> &'static Mutex<Option<String>> {
+    CURSOR_LAST_WARNING.get_or_init(|| Mutex::new(None))
+}
+
+fn cursor_secret_override_cell() -> &'static Mutex<Option<String>> {
+    CURSOR_SECRET_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+fn cursor_ide_token_cell() -> &'static Mutex<Option<String>> {
+    CURSOR_IDE_TOKEN.get_or_init(|| Mutex::new(None))
+}
+
+fn cursor_storage_backend_cell() -> &'static Mutex<crate::secrets::StorageBackend> {
+    CURSOR_STORAGE_BACKEND.get_or_init(|| Mutex::new(crate::secrets::StorageBackend::None))
+}
+
+fn normalize_optional_secret(value: Option<String>) -> Option<String> {
+    value
+        .map(|raw| raw.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Update the in-memory secret cache and tracked storage backend. Called
+/// from the IPC layer after persisting (or attempting to persist) the value.
+///
+/// The parameter is named `api_key` for historical reasons (it predates
+/// dashboard-token support); it now accepts any cursor secret form, with
+/// classification deferred to [`classify_cursor_secret`].
+pub(crate) fn set_cursor_auth_config(
+    api_key: Option<String>,
+    backend: crate::secrets::StorageBackend,
+) -> CursorAuthStatus {
+    if let Ok(mut guard) = cursor_secret_override_cell().lock() {
+        *guard = normalize_optional_secret(api_key);
+    }
+    if let Ok(mut guard) = cursor_storage_backend_cell().lock() {
+        *guard = backend;
+    }
+    // A fresh user-supplied secret deserves a clean diagnostic slate; any
+    // stale "expired token" message left over from the previous credential
+    // would only confuse the user.
+    set_cursor_warning(None);
+    cursor_auth_status()
+}
+
+fn set_cursor_warning(message: Option<String>) {
+    if let Ok(mut guard) = cursor_warning_cell().lock() {
+        *guard = message;
+    }
+}
+
+pub(crate) fn cursor_last_warning() -> Option<String> {
+    cursor_warning_cell()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorAuthStatus {
+    pub source: String,
+    pub configured: bool,
+    pub message: String,
+    pub last_warning: Option<String>,
+    /// Where the active secret currently lives on disk. Informational —
+    /// the parser doesn't behave differently per backend, but the Settings
+    /// UI uses this to render a "Stored in: …" badge.
+    pub storage_backend: crate::secrets::StorageBackend,
+}
+
+/// Concrete credential the parser uses to call Cursor servers. Each variant
+/// maps to a different base URL + auth header (see `cursor_request_url` /
+/// `apply_cursor_auth`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CursorAuth {
+    /// Enterprise admin API key (Basic auth against `api.cursor.com`).
+    /// Recognized by the `key_` prefix on user-supplied secrets.
+    Admin(String),
+    /// Dashboard session token (cookie auth against `cursor.com/api/dashboard`).
+    /// Manually pasted by the user from cursor.com browser cookies.
+    Dashboard(String),
+    /// Cursor IDE access token auto-detected from `state.vscdb`. Bearer auth
+    /// against `api2.cursor.sh/aiserver.v1.DashboardService`. Zero-config:
+    /// no user paste required as long as Cursor IDE is signed in on the
+    /// same machine.
+    IdeBearer(String),
+}
+
+/// Mirror enum without payload, used by helpers that need to dispatch on the
+/// auth path without holding the secret. Missing-credentials state is
+/// represented as `Option<CursorAuth>` at call sites, not a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorAuthKind {
+    Admin,
+    Dashboard,
+    IdeBearer,
+}
+
+impl CursorAuth {
+    fn kind(&self) -> CursorAuthKind {
+        match self {
+            CursorAuth::Admin(_) => CursorAuthKind::Admin,
+            CursorAuth::Dashboard(_) => CursorAuthKind::Dashboard,
+            CursorAuth::IdeBearer(_) => CursorAuthKind::IdeBearer,
+        }
+    }
+}
+
+/// Map a *user-supplied* raw secret string to the auth path it implies, or
+/// `None` if blank.
+///
+/// Cursor admin API keys are always issued with the `key_` prefix, while
+/// dashboard session tokens are WorkOS-style identifiers (typically
+/// `<userId>::<JWT>`). When the prefix doesn't match we conservatively assume
+/// dashboard-session, since that's the path a manual-paste user is on.
+///
+/// **`IdeBearer` is intentionally not produced by this function** — IDE
+/// tokens are sniffed from `state.vscdb` via [`read_cursor_ide_access_token`]
+/// and never come from user paste. Mixing the two would mis-classify a
+/// pasted IDE token as `Dashboard`, since both are JWTs without the `key_`
+/// prefix.
+fn classify_cursor_secret(secret: &str) -> Option<CursorAuth> {
+    let trimmed = secret.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("key_") {
+        Some(CursorAuth::Admin(trimmed.to_string()))
+    } else {
+        Some(CursorAuth::Dashboard(trimmed.to_string()))
+    }
+}
+
+/// Resolve the active credential. Priority (highest first):
+///   1. `secret_override` — Settings UI paste, classified by prefix.
+///   2. `session_token_env` — `CURSOR_SESSION_TOKEN` env var.
+///   3. `api_key_env`      — `CURSOR_API_KEY` env var (legacy).
+///   4. `ide_token`        — auto-detected from Cursor IDE's state.vscdb;
+///      always `IdeBearer`, never re-classified by prefix.
+///
+/// Explicit user choices always win over auto-discovery so a user who has
+/// pasted a different account's session can still query that account's
+/// usage even while signed into a different account in the IDE.
+fn choose_cursor_auth(
+    api_key_env: Option<&str>,
+    session_token_env: Option<&str>,
+    secret_override: Option<&str>,
+    ide_token: Option<&str>,
+) -> Option<CursorAuth> {
+    secret_override
+        .and_then(classify_cursor_secret)
+        .or_else(|| session_token_env.and_then(classify_cursor_secret))
+        .or_else(|| api_key_env.and_then(classify_cursor_secret))
+        .or_else(|| {
+            let trimmed = ide_token?.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(CursorAuth::IdeBearer(trimmed.to_string()))
+            }
+        })
+}
+
+pub(crate) fn cursor_auth_status() -> CursorAuthStatus {
+    let last_warning = cursor_last_warning();
+    let storage_backend = cursor_storage_backend_cell()
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or_default();
+    match resolve_cursor_auth() {
+        Some(CursorAuth::Admin(_)) => CursorAuthStatus {
+            source: String::from("admin_api_key"),
+            configured: true,
+            message: String::from(
+                "Cursor Enterprise admin API key is configured. Detailed events come from api.cursor.com.",
+            ),
+            last_warning,
+            storage_backend,
+        },
+        Some(CursorAuth::Dashboard(_)) => CursorAuthStatus {
+            source: String::from("dashboard_session"),
+            configured: true,
+            message: String::from(
+                "Cursor dashboard session token is configured. Detailed events come from cursor.com/api/dashboard.",
+            ),
+            last_warning,
+            storage_backend,
+        },
+        Some(CursorAuth::IdeBearer(_)) => CursorAuthStatus {
+            source: String::from("ide_bearer"),
+            configured: true,
+            message: String::from(
+                "Auto-detected from your Cursor IDE login. Detailed events come from api2.cursor.sh; the access token refreshes silently as long as Cursor IDE stays signed in.",
+            ),
+            last_warning,
+            storage_backend,
+        },
+        None => CursorAuthStatus {
+            source: String::from("missing"),
+            configured: false,
+            message: String::from(
+                "No Cursor credentials available. Sign into Cursor IDE on this machine for zero-config access, or paste a dashboard session token / Enterprise admin API key.",
+            ),
+            last_warning,
+            // When there's no secret in-memory the backend should always be
+            // `None`, but read from the cell anyway so we don't lie to the
+            // UI in the (impossible) case of out-of-sync state.
+            storage_backend,
+        },
+    }
+}
+
+fn parse_u64_value(value: Option<&Value>) -> u64 {
+    match value {
+        Some(Value::Number(num)) => num.as_u64().unwrap_or(0),
+        Some(Value::String(text)) => text.trim().parse::<u64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn parse_cursor_timestamp(value: Option<&Value>) -> Option<DateTime<Local>> {
+    match value {
+        Some(Value::Number(num)) => {
+            let raw = num.as_i64()?;
+            let (seconds, nanos) = if raw > 10_000_000_000 {
+                (raw / 1_000, ((raw % 1_000) * 1_000_000) as u32)
+            } else {
+                (raw, 0)
+            };
+            let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos)?;
+            Some(utc.with_timezone(&Local))
+        }
+        Some(Value::String(text)) => {
+            if let Ok(raw) = text.trim().parse::<i64>() {
+                return parse_cursor_timestamp(Some(&Value::Number(raw.into())));
+            }
+            chrono::DateTime::parse_from_rfc3339(text)
+                .map(|dt| dt.with_timezone(&Local))
+                .ok()
+        }
+        _ => None,
+    }
+}
+
+fn parse_cursor_usage_from_object(
+    map: &serde_json::Map<String, Value>,
+) -> Option<(u64, u64, u64, u64)> {
+    let input = parse_u64_value(
+        map.get("inputTokens")
+            .or_else(|| map.get("input_tokens"))
+            .or_else(|| map.get("promptTokens"))
+            .or_else(|| map.get("prompt_tokens")),
+    );
+    let output = parse_u64_value(
+        map.get("outputTokens")
+            .or_else(|| map.get("output_tokens"))
+            .or_else(|| map.get("completionTokens"))
+            .or_else(|| map.get("completion_tokens")),
+    );
+    let cache_read = parse_u64_value(
+        map.get("cacheReadTokens")
+            .or_else(|| map.get("cache_read_tokens"))
+            .or_else(|| map.get("cached_input_tokens")),
+    );
+    let cache_write = parse_u64_value(
+        map.get("cacheWriteTokens")
+            .or_else(|| map.get("cache_write_tokens"))
+            .or_else(|| map.get("cache_creation_input_tokens")),
+    );
+
+    if input == 0 && output == 0 && cache_read == 0 && cache_write == 0 {
+        None
+    } else {
+        Some((input, output, cache_read, cache_write))
+    }
+}
+
+fn collect_cursor_entries_from_value(
+    value: &Value,
+    session_key: &str,
+    entries: &mut Vec<ParsedEntry>,
+) {
+    match value {
+        Value::Object(map) => {
+            let usage_map = map
+                .get("tokenUsage")
+                .and_then(Value::as_object)
+                .or_else(|| map.get("usage").and_then(Value::as_object))
+                .or(Some(map));
+
+            if let Some(tokens_obj) = usage_map {
+                if let Some((input, output, cache_read, cache_write)) =
+                    parse_cursor_usage_from_object(tokens_obj)
+                {
+                    let timestamp = parse_cursor_timestamp(
+                        map.get("timestamp")
+                            .or_else(|| map.get("time"))
+                            .or_else(|| map.get("createdAt"))
+                            .or_else(|| map.get("created_at")),
+                    )
+                    .unwrap_or_else(Local::now);
+                    let model = map
+                        .get("model")
+                        .or_else(|| map.get("modelName"))
+                        .or_else(|| map.get("model_name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("cursor-unknown")
+                        .to_string();
+                    let unique_hash = map
+                        .get("id")
+                        .or_else(|| map.get("eventId"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    entries.push(ParsedEntry {
+                        timestamp,
+                        model,
+                        input_tokens: input,
+                        output_tokens: output,
+                        cache_creation_5m_tokens: 0,
+                        cache_creation_1h_tokens: cache_write,
+                        cache_read_tokens: cache_read,
+                        web_search_requests: 0,
+                        unique_hash,
+                        session_key: session_key.to_string(),
+                        agent_scope: crate::stats::subagent::AgentScope::Main,
+                    });
+                }
+            }
+
+            for (key, nested) in map {
+                if key == "tokenUsage" || key == "usage" {
+                    continue;
+                }
+                collect_cursor_entries_from_value(nested, session_key, entries);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                collect_cursor_entries_from_value(nested, session_key, entries);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_cursor_session_file(path: &Path) -> CodexParseResult {
+    tracing::debug!(path = %path.display(), "opening file (cursor session)");
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(
+                path = %path_to_string(path),
+                error = %error,
+                "Failed to open Cursor chat session file"
+            );
+            return (Vec::new(), Vec::new(), 0, false);
+        }
+    };
+    let reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut lines_read = 0usize;
+    for line in reader.lines() {
+        lines_read += 1;
+        match line {
+            Ok(content) => lines.push(content),
+            Err(error) => {
+                tracing::warn!(
+                    path = %path_to_string(path),
+                    error = %error,
+                    "Failed to read a line from Cursor chat session file"
+                );
+            }
+        }
+    }
+    let content = lines.join("\n");
+    let session_key = format!("cursor-file:{}", path_to_string(path));
+
+    let mut entries = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(&content) {
+        collect_cursor_entries_from_value(&value, &session_key, &mut entries);
+    } else {
+        let mut parsed_lines = 0usize;
+        for line in lines {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                parsed_lines += 1;
+                collect_cursor_entries_from_value(&value, &session_key, &mut entries);
+            }
+        }
+        if parsed_lines == 0 && lines_read > 0 {
+            tracing::warn!(
+                path = %path_to_string(path),
+                lines_read,
+                "Cursor chat session file could not be parsed as JSON"
+            );
+        }
+    }
+
+    (entries, Vec::new(), lines_read, true)
+}
+
+fn glob_cursor_chat_session_files(dir: &Path) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    if !dir.exists() {
+        return results;
+    }
+    tracing::debug!(path = %dir.display(), "read_dir (glob_cursor_chat_session_files)");
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(error) => {
+            tracing::warn!(
+                path = %path_to_string(dir),
+                error = %error,
+                "Failed to read Cursor workspace storage directory"
+            );
+            return results;
+        }
+    };
+    for entry in rd.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            tracing::debug!(path = %entry.path().display(), "skipping symlink");
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            if path.file_name().is_some_and(|name| name == "chatSessions") {
+                let chat_rd = match fs::read_dir(&path) {
+                    Ok(chat_rd) => chat_rd,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path_to_string(&path),
+                            error = %error,
+                            "Failed to read Cursor chatSessions directory"
+                        );
+                        continue;
+                    }
+                };
+                for chat_entry in chat_rd.flatten() {
+                    let Ok(chat_ft) = chat_entry.file_type() else {
+                        continue;
+                    };
+                    if chat_ft.is_symlink() || !chat_ft.is_file() {
+                        continue;
+                    }
+                    let chat_path = chat_entry.path();
+                    if chat_path.extension().is_some_and(|ext| ext == "json") {
+                        results.push(chat_path);
+                    }
+                }
+            } else {
+                results.extend(glob_cursor_chat_session_files(&path));
+            }
+        }
+    }
+    results.sort();
+    results
+}
+
+fn cursor_global_state_path_from_env() -> Option<PathBuf> {
+    let raw = std::env::var(CURSOR_USER_DIR_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    if path.file_name().is_some_and(|name| name == "state.vscdb") {
+        return Some(path);
+    }
+    if path.file_name().is_some_and(|name| name == "globalStorage") {
+        return Some(path.join("state.vscdb"));
+    }
+    if path.file_name().is_some_and(|name| name == "User") {
+        return Some(path.join("globalStorage").join("state.vscdb"));
+    }
+    Some(path.join("User").join("globalStorage").join("state.vscdb"))
+}
+
+fn read_cursor_state_value_from_sqlite3(
+    db_path: &Path,
+    key: &str,
+) -> Result<Option<String>, String> {
+    if !db_path.is_file() {
+        return Err(format!(
+            "Cursor state DB not found at {}",
+            path_to_string(db_path)
+        ));
+    }
+    let query = format!("SELECT value FROM ItemTable WHERE key = '{key}' LIMIT 1;");
+    let output = Command::new("sqlite3")
+        .arg(db_path)
+        .arg(&query)
+        .output()
+        .map_err(|e| {
+            format!(
+                "Failed to run sqlite3 for Cursor state DB {}: {e}",
+                path_to_string(db_path)
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "sqlite3 failed reading Cursor state DB {} with status {}{}",
+            path_to_string(db_path),
+            output.status,
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        ));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|e| {
+        format!(
+            "Cursor state DB token output was not valid UTF-8 at {}: {e}",
+            path_to_string(db_path)
+        )
+    })?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn read_cursor_cached_email() -> Option<String> {
+    let path = cursor_global_state_path_from_env()
+        .or_else(crate::paths::cursor_global_state_vscdb_default)?;
+    read_cursor_state_value_from_sqlite3(&path, "cursorAuth/cachedEmail")
+        .ok()
+        .flatten()
+        .map(|email| email.trim().to_string())
+        .filter(|email| email.contains('@'))
+}
+
+fn resolve_cursor_auth() -> Option<CursorAuth> {
+    let api_key_env = std::env::var(CURSOR_API_KEY_ENV).ok();
+    let session_token_env = std::env::var(CURSOR_SESSION_TOKEN_ENV).ok();
+    let secret_override = cursor_secret_override_cell()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let ide_token = cursor_ide_token_cell()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    choose_cursor_auth(
+        api_key_env.as_deref(),
+        session_token_env.as_deref(),
+        secret_override.as_deref(),
+        ide_token.as_deref(),
+    )
+}
+
+/// Read Cursor IDE's current access token from `state.vscdb`. Best-effort:
+/// returns `None` if the DB is missing, the key is absent, the value is
+/// blank, or sqlite3 fails for any reason.
+///
+/// Cursor IDE owns the token's lifecycle — it writes a refreshed JWT here
+/// whenever its own session refreshes, which we get for free without
+/// implementing the OAuth refresh flow ourselves.
+pub(crate) fn read_cursor_ide_access_token() -> Option<String> {
+    let path = cursor_global_state_path_from_env()
+        .or_else(crate::paths::cursor_global_state_vscdb_default)?;
+    let raw = read_cursor_state_value_from_sqlite3(&path, CURSOR_IDE_ACCESS_TOKEN_KEY)
+        .ok()
+        .flatten()?;
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Refresh the in-memory IDE token cache from `state.vscdb` *only if it
+/// was already primed at least once*. Skipping the refresh in unprimed
+/// contexts is deliberate: it gives unit tests (which don't go through
+/// [`commands::config::prime_cursor_auth_from_disk`]) a clean
+/// "no IDE auth available" environment by default, so they don't
+/// accidentally trigger SQLite reads or remote HTTP calls against the
+/// developer's real Cursor login.
+///
+/// Failures are silent — the previous cached value is preserved, since it
+/// might still be valid (e.g. Cursor IDE momentarily holds a write lock on
+/// the SQLite file). HTTP 401/403 from the actual fetch is the source of
+/// truth for token validity.
+fn refresh_cursor_ide_token() {
+    let was_primed = cursor_ide_token_cell()
+        .lock()
+        .ok()
+        .map(|g| g.is_some())
+        .unwrap_or(false);
+    if !was_primed {
+        return;
+    }
+    if let Some(token) = read_cursor_ide_access_token() {
+        if let Ok(mut guard) = cursor_ide_token_cell().lock() {
+            *guard = Some(token);
+        }
+    }
+}
+
+/// Public initializer used by the app setup hook. Performs an *unconditional*
+/// first read of `state.vscdb` so subsequent [`refresh_cursor_ide_token`]
+/// calls have something to refresh. Returns `true` if the cell now holds
+/// a non-empty token.
+///
+/// The gating between `prime` and `refresh` keeps unit tests clean: tests
+/// that don't go through the app setup hook never call this function, so
+/// the cell stays empty and `refresh` no-ops — no SQLite reads, no
+/// surprise HTTP calls against the developer's real Cursor login.
+pub(crate) fn prime_ide_access_token() -> bool {
+    if let Some(token) = read_cursor_ide_access_token() {
+        if let Ok(mut guard) = cursor_ide_token_cell().lock() {
+            *guard = Some(token);
+            return true;
+        }
+    }
+    false
+}
+
+fn cursor_api_time_range_ms(since: Option<NaiveDate>) -> (String, String) {
+    let now_local = Local::now();
+    let start_local = since
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .and_then(|dt| Local.from_local_datetime(&dt).single())
+        .unwrap_or_else(|| now_local - chrono::Duration::hours(24));
+    (
+        start_local.timestamp_millis().to_string(),
+        now_local.timestamp_millis().to_string(),
+    )
+}
+
+fn parsed_entry_from_cursor_event(
+    map: &serde_json::Map<String, Value>,
+    session_key: &str,
+    fallback_hash: Option<String>,
+) -> Option<ParsedEntry> {
+    let usage = map.get("tokenUsage").and_then(Value::as_object);
+    let input = parse_u64_value(usage.and_then(|u| u.get("inputTokens")));
+    let output = parse_u64_value(usage.and_then(|u| u.get("outputTokens")));
+    let cache_read = parse_u64_value(usage.and_then(|u| u.get("cacheReadTokens")));
+    let cache_write = parse_u64_value(usage.and_then(|u| u.get("cacheWriteTokens")));
+    if input == 0 && output == 0 && cache_read == 0 && cache_write == 0 {
+        return None;
+    }
+
+    let timestamp = parse_cursor_timestamp(map.get("timestamp")).unwrap_or_else(Local::now);
+    let model = map
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or("cursor-unknown")
+        .to_string();
+    let unique_hash = map
+        .get("id")
+        .or_else(|| map.get("eventId"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or(fallback_hash);
+    Some(ParsedEntry {
+        timestamp,
+        model,
+        input_tokens: input,
+        output_tokens: output,
+        cache_creation_5m_tokens: 0,
+        cache_creation_1h_tokens: cache_write,
+        cache_read_tokens: cache_read,
+        web_search_requests: 0,
+        unique_hash,
+        session_key: session_key.to_string(),
+        agent_scope: crate::stats::subagent::AgentScope::Main,
+    })
+}
+
+/// Parse a usage-events payload from any of the three remote variants.
+/// The three schemas differ only in the array key:
+///   • Admin / Dashboard cookie endpoints → `usageEvents`
+///   • IDE bearer (Connect-Web)          → `usageEventsDisplay`
+/// Each row carries the same `timestamp` / `model` / `tokenUsage{…}` shape,
+/// so [`parsed_entry_from_cursor_event`] handles them uniformly. Entries
+/// are tagged with `session_key` so downstream aggregation can attribute
+/// them to the correct source.
+fn parse_cursor_official_usage_events(
+    data: &Value,
+    since: Option<NaiveDate>,
+    session_key: &str,
+) -> Result<Vec<ParsedEntry>, String> {
+    let rows = data
+        .get("usageEvents")
+        .or_else(|| data.get("usageEventsDisplay"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "Cursor API payload missing usageEvents/usageEventsDisplay array (session_key={session_key})"
+            )
+        })?;
+    let mut entries = Vec::new();
+    for (idx, row) in rows.iter().enumerate() {
+        let Some(map) = row.as_object() else {
+            continue;
+        };
+        let fallback_hash = map
+            .get("timestamp")
+            .and_then(|value| match value {
+                Value::String(text) => Some(text.clone()),
+                Value::Number(num) => Some(num.to_string()),
+                _ => None,
+            })
+            .map(|timestamp| format!("{session_key}:{timestamp}:{idx}"));
+        let Some(entry) = parsed_entry_from_cursor_event(map, session_key, fallback_hash) else {
+            continue;
+        };
+        if since.is_some_and(|since_date| entry.timestamp.date_naive() < since_date) {
+            continue;
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Determine whether to fetch another page. Supports both pagination shapes
+/// observed in the wild:
+///   • Admin / Dashboard: `pagination.hasNextPage` boolean.
+///   • IDE bearer: `totalUsageEventsCount` integer (compared against
+///     `page * pageSize`); sometimes encoded as a string under
+///     Connect-Web's int64-as-string convention.
+fn cursor_response_has_next_page(data: &Value, page: usize, page_size: usize) -> bool {
+    if let Some(has_next) = data
+        .get("pagination")
+        .and_then(|p| p.get("hasNextPage"))
+        .and_then(Value::as_bool)
+    {
+        return has_next;
+    }
+    let total = data.get("totalUsageEventsCount").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+    });
+    match total {
+        Some(total) => (page as u64).saturating_mul(page_size as u64) < total,
+        None => false,
+    }
+}
+
+fn cursor_request_url(auth: &CursorAuth) -> String {
+    match auth {
+        CursorAuth::Admin(_) => {
+            format!("{CURSOR_OFFICIAL_API_BASE_URL}/teams/filtered-usage-events")
+        }
+        CursorAuth::Dashboard(_) => {
+            format!("{CURSOR_DASHBOARD_API_BASE_URL}/api/dashboard/get-filtered-usage-events")
+        }
+        CursorAuth::IdeBearer(_) => {
+            format!("{CURSOR_IDE_API_BASE_URL}/aiserver.v1.DashboardService/GetFilteredUsageEvents")
+        }
+    }
+}
+
+fn apply_cursor_auth(
+    request: reqwest::blocking::RequestBuilder,
+    auth: &CursorAuth,
+) -> reqwest::blocking::RequestBuilder {
+    match auth {
+        CursorAuth::Admin(api_key) => request.basic_auth(api_key, Some("")),
+        CursorAuth::Dashboard(token) => request.header(
+            reqwest::header::COOKIE,
+            format!("WorkosCursorSessionToken={token}"),
+        ),
+        CursorAuth::IdeBearer(token) => request.bearer_auth(token),
+    }
+}
+
+fn cursor_session_key_for(auth_kind: CursorAuthKind) -> &'static str {
+    match auth_kind {
+        CursorAuthKind::Admin => "cursor-admin",
+        CursorAuthKind::Dashboard => "cursor-dashboard",
+        CursorAuthKind::IdeBearer => "cursor-ide",
+    }
+}
+
+fn cursor_auth_label(auth_kind: CursorAuthKind) -> &'static str {
+    match auth_kind {
+        CursorAuthKind::Admin => "admin",
+        CursorAuthKind::Dashboard => "dashboard",
+        CursorAuthKind::IdeBearer => "ide",
+    }
+}
+
+fn build_cursor_usage_request_payload(
+    auth: &CursorAuth,
+    page: usize,
+    since: Option<NaiveDate>,
+) -> Value {
+    let (start_ms, end_ms) = cursor_api_time_range_ms(since);
+    let mut payload = match auth {
+        // Connect-Web's HTTP/JSON dialect requires int64 fields to be
+        // serialized as JSON strings. The IDE itself sends them this way;
+        // mirror it to avoid surprises on schema-strict deployments.
+        CursorAuth::IdeBearer(_) => serde_json::json!({
+            "startDate": start_ms,
+            "endDate": end_ms,
+            "page": page,
+            "pageSize": CURSOR_API_PAGE_SIZE,
+        }),
+        // Cookie + admin endpoints accept numeric timestamps (this matches
+        // the long-standing TokenMonitor behavior; don't break existing
+        // pasted-token users by switching to strings here).
+        _ => serde_json::json!({
+            "startDate": start_ms.parse::<i64>().unwrap_or_default(),
+            "endDate": end_ms.parse::<i64>().unwrap_or_default(),
+            "page": page,
+            "pageSize": CURSOR_API_PAGE_SIZE,
+        }),
+    };
+    // Admin endpoint optionally filters by `email`; dashboard / IDE
+    // endpoints identify the user via cookie / bearer respectively.
+    if matches!(auth, CursorAuth::Admin(_)) {
+        if let Some(email) = read_cursor_cached_email() {
+            payload["email"] = Value::String(email);
+        }
+    }
+    payload
+}
+
+fn fetch_cursor_usage_events(
+    auth: &CursorAuth,
+    since: Option<NaiveDate>,
+) -> Result<Vec<ParsedEntry>, String> {
+    let auth_kind = auth.kind();
+    let auth_label = cursor_auth_label(auth_kind);
+    let session_key = cursor_session_key_for(auth_kind);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|e| {
+            let message = format!("Failed to build Cursor HTTP client ({auth_label}): {e}");
+            tracing::error!(error = %message, "Cursor HTTP client initialization failed");
+            message
+        })?;
+
+    let url = cursor_request_url(auth);
+    let mut page = 1usize;
+    let mut entries = Vec::new();
+    loop {
+        let payload = build_cursor_usage_request_payload(auth, page, since);
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json");
+        // IDE bearer goes over Connect-Web; the protocol-version header
+        // is recommended by Connect spec and silently improves error
+        // diagnostics on the server side.
+        if auth_kind == CursorAuthKind::IdeBearer {
+            req = req.header("Connect-Protocol-Version", "1");
+        }
+        let request = apply_cursor_auth(req.json(&payload), auth);
+        let response = request.send().map_err(|e| {
+            let message = format!("Cursor {auth_label} API request failed: {e}");
+            tracing::warn!(page, auth = auth_label, error = %message, "Cursor request failed");
+            message
+        })?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            || response.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            tracing::warn!(
+                page,
+                auth = auth_label,
+                status = %response.status(),
+                "Cursor API rejected the configured credentials"
+            );
+            return Err(match auth_kind {
+                CursorAuthKind::Admin => format!(
+                    "Cursor admin API rejected the configured key with HTTP {}.",
+                    response.status()
+                ),
+                CursorAuthKind::Dashboard => format!(
+                    "Cursor dashboard rejected the configured session token with HTTP {}. The token may have expired — re-copy `WorkosCursorSessionToken` from cursor.com cookies.",
+                    response.status()
+                ),
+                CursorAuthKind::IdeBearer => format!(
+                    "Cursor api2 rejected the auto-detected IDE token with HTTP {}. Sign back into Cursor IDE on this machine to refresh the token (Cursor IDE will re-write `cursorAuth/accessToken` in state.vscdb).",
+                    response.status()
+                ),
+            });
+        }
+        if !response.status().is_success() {
+            tracing::warn!(
+                page,
+                auth = auth_label,
+                status = %response.status(),
+                "Cursor API returned a non-success status"
+            );
+            return Err(format!(
+                "Cursor {auth_label} API returned HTTP {}",
+                response.status()
+            ));
+        }
+
+        let data: Value = response.json().map_err(|e| {
+            let message = format!("Cursor {auth_label} API payload parse failed: {e}");
+            tracing::warn!(page, auth = auth_label, error = %message, "payload parse failed");
+            message
+        })?;
+        let mut next_entries = parse_cursor_official_usage_events(&data, since, session_key)?;
+        entries.append(&mut next_entries);
+        let has_next = cursor_response_has_next_page(&data, page, CURSOR_API_PAGE_SIZE);
+        if !has_next || page >= CURSOR_API_MAX_PAGES {
+            break;
+        }
+        page += 1;
+    }
+
+    tracing::info!(
+        since = ?since,
+        auth = auth_label,
+        entries = entries.len(),
+        "Loaded Cursor token usage entries from remote API"
+    );
+    Ok(entries)
+}
+
+/// Resolve auth, then dispatch to the correct remote endpoint.
+/// Returns `Ok(None)` when no credentials are configured (caller surfaces a
+/// "not configured" warning rather than treating it as an error).
+///
+/// The IDE token cell is refreshed from `state.vscdb` on every call so we
+/// never use a stale token if Cursor IDE has rotated theirs (Cursor IDE's
+/// default access-token TTL is on the order of an hour). The refresh is
+/// best-effort — failures preserve the previous cached value, since it
+/// might still be valid (e.g. Cursor IDE momentarily holds a write lock).
+fn fetch_cursor_remote_entries(
+    since: Option<NaiveDate>,
+) -> Result<Option<Vec<ParsedEntry>>, String> {
+    refresh_cursor_ide_token();
+    let Some(auth) = resolve_cursor_auth() else {
+        tracing::warn!(
+            "Cursor remote auth not configured (no admin key, dashboard token, or IDE access token)"
+        );
+        return Ok(None);
+    };
+    // `reqwest::blocking::Client` cannot be dropped from inside a tokio
+    // async context: its internal `wait::enter()` builds a temporary
+    // current-thread runtime in debug builds whose drop panics with
+    // "Cannot drop a runtime in a context where blocking is not allowed"
+    // when running on a tokio-rt-worker. `load_entries` is a sync function
+    // but is reached from async Tauri commands (`get_usage_data`, etc.),
+    // so we route the blocking call through a fresh OS thread that has no
+    // tokio scheduler context. `std::thread::scope` keeps the borrow of
+    // `auth` cheap (no clone) and guarantees the join before returning.
+    let result = std::thread::scope(|s| {
+        s.spawn(|| fetch_cursor_usage_events(&auth, since))
+            .join()
+            .unwrap_or_else(|_| Err(String::from("Cursor fetch thread panicked")))
+    });
+    result.map(Some)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // UsageParser
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1093,12 +2134,17 @@ fn default_usage_integration_configs() -> Vec<UsageIntegrationConfig> {
             UsageIntegrationId::Codex,
             UsageIntegrationId::Codex.detect_roots(),
         ),
+        UsageIntegrationConfig::new(
+            UsageIntegrationId::Cursor,
+            UsageIntegrationId::Cursor.detect_roots(),
+        ),
     ]
 }
 
 fn usage_integration_configs_with_overrides(
     claude_roots: Option<Vec<PathBuf>>,
     codex_roots: Option<Vec<PathBuf>>,
+    cursor_roots: Option<Vec<PathBuf>>,
 ) -> Vec<UsageIntegrationConfig> {
     vec![
         UsageIntegrationConfig::new(
@@ -1108,6 +2154,10 @@ fn usage_integration_configs_with_overrides(
         UsageIntegrationConfig::new(
             UsageIntegrationId::Codex,
             codex_roots.unwrap_or_else(|| UsageIntegrationId::Codex.detect_roots()),
+        ),
+        UsageIntegrationConfig::new(
+            UsageIntegrationId::Cursor,
+            cursor_roots.unwrap_or_else(|| UsageIntegrationId::Cursor.detect_roots()),
         ),
     ]
 }
@@ -1153,6 +2203,7 @@ impl UsageParser {
         Self::from_integrations(usage_integration_configs_with_overrides(
             Some(claude_dirs),
             None,
+            None,
         ))
     }
 
@@ -1162,6 +2213,7 @@ impl UsageParser {
         Self::from_integrations(usage_integration_configs_with_overrides(
             None,
             Some(vec![codex_dir]),
+            None,
         ))
     }
 
@@ -1183,6 +2235,7 @@ impl UsageParser {
         Self::from_integrations(usage_integration_configs_with_overrides(
             Some(vec![claude_dir]),
             Some(vec![codex_dir]),
+            None,
         ))
     }
 
@@ -1191,6 +2244,7 @@ impl UsageParser {
     #[allow(dead_code)]
     pub fn clear_cache(&self) {
         self.clear_payload_cache();
+        set_cursor_warning(None);
         if let Ok(mut c) = self.file_cache.lock() {
             c.clear();
         }
@@ -1388,6 +2442,7 @@ impl UsageParser {
                 let (e, ce, lr, op) = parse_codex_session_file(path);
                 (e, ce, lr, op)
             }
+            ProviderFileKind::Cursor => parse_cursor_session_file(path),
         };
         let earliest_date = earliest_entry_date(&entries);
         let entries: Arc<[ParsedEntry]> = entries.into();
@@ -1579,6 +2634,130 @@ impl UsageParser {
         (entries, change_events, report)
     }
 
+    fn load_cursor_local_entries_with_debug(
+        &self,
+        since: Option<NaiveDate>,
+    ) -> (Vec<ParsedEntry>, ProviderReadDebug) {
+        let config = self
+            .integration_config(UsageIntegrationId::Cursor)
+            .expect("cursor integration should be configured");
+        let root_dir = config.roots.first().cloned().unwrap_or_default();
+        let root_exists = root_dir.exists();
+        let mut report = ProviderReadDebug {
+            provider: String::from("cursor"),
+            root_dir: path_to_string(&root_dir),
+            root_exists,
+            since: since.map(|d| d.format("%Y-%m-%d").to_string()),
+            strategy: String::from("workspace-chat-json-token-probe"),
+            ..ProviderReadDebug::default()
+        };
+        if !root_exists {
+            tracing::warn!(
+                root_dir = %report.root_dir,
+                "Cursor workspace storage root does not exist"
+            );
+            return (Vec::new(), report);
+        }
+
+        let files = glob_cursor_chat_session_files(&root_dir);
+        report.discovered_paths = files.len();
+        if files.is_empty() {
+            tracing::warn!(
+                root_dir = %report.root_dir,
+                "No Cursor chat session files were discovered"
+            );
+        }
+        let mut entries = Vec::new();
+        for path in files {
+            report.attempted_paths += 1;
+            push_sample_path(&mut report.sample_paths, &path);
+            if let Some(since_date) = since {
+                if !modified_since(&path, since_date) {
+                    report.skipped_paths += 1;
+                    report.skipped_by_mtime += 1;
+                    push_sample_path(&mut report.sample_skipped_paths, &path);
+                    continue;
+                }
+            }
+
+            let (parsed_entries, _change_events, lines_read, opened) =
+                parse_cursor_session_file(&path);
+            report.lines_read += lines_read;
+            if opened {
+                report.opened_paths += 1;
+            } else {
+                report.failed_paths += 1;
+                continue;
+            }
+            for entry in parsed_entries {
+                if since.is_some_and(|since_date| entry.timestamp.date_naive() < since_date) {
+                    continue;
+                }
+                entries.push(entry);
+            }
+        }
+
+        entries.sort_by_key(|entry| entry.timestamp);
+        report.emitted_entries = entries.len();
+        if entries.is_empty() && report.opened_paths > 0 {
+            tracing::warn!(
+                root_dir = %report.root_dir,
+                discovered_paths = report.discovered_paths,
+                opened_paths = report.opened_paths,
+                lines_read = report.lines_read,
+                "Cursor chat session files were readable but contained no token usage entries"
+            );
+        }
+        (entries, report)
+    }
+
+    fn load_cursor_entries_with_debug(
+        &self,
+        since: Option<NaiveDate>,
+    ) -> (Vec<ParsedEntry>, Vec<ParsedChangeEvent>, ProviderReadDebug) {
+        let (local_entries, mut report) = self.load_cursor_local_entries_with_debug(since);
+        if !local_entries.is_empty() {
+            set_cursor_warning(None);
+            return (local_entries, Vec::new(), report);
+        }
+
+        match fetch_cursor_remote_entries(since) {
+            Ok(Some(entries)) => {
+                report.strategy = format!("{}+cursor-remote-api", report.strategy);
+                report.emitted_entries = entries.len();
+                if entries.is_empty() {
+                    set_cursor_warning(Some(String::from(
+                        "Cursor remote API returned no usage entries for the selected period.",
+                    )));
+                } else {
+                    set_cursor_warning(None);
+                }
+                (entries, Vec::new(), report)
+            }
+            Ok(None) => {
+                report.strategy = format!("{}+cursor-remote-api-not-configured", report.strategy);
+                let warning = String::from(
+                    "Cursor remote auth is not configured. Paste a `WorkosCursorSessionToken` from cursor.com cookies (recommended for Pro/Pro+/Ultra) — or, for Enterprise admins, paste a `key_…` Admin API Key from Cursor Dashboard → Settings → Advanced.",
+                );
+                set_cursor_warning(Some(warning));
+                (Vec::new(), Vec::new(), report)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Cursor remote API source failed"
+                );
+                push_sample_path(
+                    &mut report.sample_skipped_paths,
+                    Path::new(&format!("cursor-remote-api: {error}")),
+                );
+                report.strategy = format!("{}+cursor-remote-api-failed", report.strategy);
+                set_cursor_warning(Some(error));
+                (Vec::new(), Vec::new(), report)
+            }
+        }
+    }
+
     // ── Internal: load entries for a provider/since combination ──
 
     pub(crate) fn load_entries(
@@ -1643,6 +2822,20 @@ impl UsageParser {
                     change_events.extend(next_change_events);
                     reports.push(next_report);
                 }
+                UsageIntegrationId::Cursor => {
+                    let (next_entries, next_change_events, next_report) =
+                        self.load_cursor_entries_with_debug(since);
+
+                    if let Some(ref f) = frontier {
+                        entries.extend(next_entries.into_iter().filter(|e| {
+                            !f.covers(e.timestamp.date_naive(), e.timestamp.hour() as u8)
+                        }));
+                    } else {
+                        entries.extend(next_entries);
+                    }
+                    change_events.extend(next_change_events);
+                    reports.push(next_report);
+                }
             }
         }
 
@@ -1663,6 +2856,7 @@ impl UsageParser {
             .any(|integration_id| match integration_id {
                 UsageIntegrationId::Claude => self.has_claude_entries_before(before_date),
                 UsageIntegrationId::Codex => self.has_codex_entries_before(before_date),
+                UsageIntegrationId::Cursor => self.has_cursor_entries_before(before_date),
             })
     }
 
@@ -1714,6 +2908,24 @@ impl UsageParser {
         self.has_integration_entries_before(config, before_date)
     }
 
+    fn has_cursor_entries_before(&self, before_date: NaiveDate) -> bool {
+        let config = self
+            .integration_config(UsageIntegrationId::Cursor)
+            .expect("cursor integration should be configured");
+        for root_dir in &config.roots {
+            for path in glob_cursor_chat_session_files(root_dir) {
+                let (entries, _changes, _lines_read, _opened) = parse_cursor_session_file(&path);
+                if entries
+                    .iter()
+                    .any(|entry| entry.timestamp.date_naive() < before_date)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     // ── Internal: build model_breakdown across all entries ──
 
     #[allow(dead_code)]
@@ -1721,6 +2933,14 @@ impl UsageParser {
         let refs: Vec<&ParsedEntry> = entries.iter().collect();
         let map = build_segment_map(&refs);
         segment_map_to_model_summaries(&map)
+    }
+
+    fn provider_usage_warning(provider: &str) -> Option<String> {
+        if provider == UsageIntegrationId::Cursor.as_str() {
+            cursor_last_warning()
+        } else {
+            None
+        }
     }
 
     // ── Aggregation: daily ──
@@ -1804,7 +3024,7 @@ impl UsageParser {
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
             usage_source: UsageSource::Parser,
-            usage_warning: None,
+            usage_warning: Self::provider_usage_warning(provider),
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
@@ -1899,7 +3119,7 @@ impl UsageParser {
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
             usage_source: UsageSource::Parser,
-            usage_warning: None,
+            usage_warning: Self::provider_usage_warning(provider),
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
@@ -2007,7 +3227,7 @@ impl UsageParser {
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
             usage_source: UsageSource::Parser,
-            usage_warning: None,
+            usage_warning: Self::provider_usage_warning(provider),
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
@@ -2156,7 +3376,7 @@ impl UsageParser {
             last_updated: Local::now().to_rfc3339(),
             from_cache: false,
             usage_source: UsageSource::Parser,
-            usage_warning: None,
+            usage_warning: Self::provider_usage_warning(provider),
             period_label: String::new(),
             has_earlier_data: false,
             change_stats: None,
@@ -2228,6 +3448,327 @@ mod tests {
         assert!(files[0].ends_with("session.jsonl"));
         // The symlinked dir also must not appear in the directory-stamp list.
         assert!(!dirs.iter().any(|d| d.path.ends_with("link")));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Cursor parsing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_cursor_secret_recognizes_admin_prefix() {
+        assert_eq!(
+            classify_cursor_secret("key_abc123"),
+            Some(CursorAuth::Admin(String::from("key_abc123")))
+        );
+        // Whitespace stripped.
+        assert_eq!(
+            classify_cursor_secret("  key_xyz  "),
+            Some(CursorAuth::Admin(String::from("key_xyz")))
+        );
+    }
+
+    #[test]
+    fn classify_cursor_secret_falls_back_to_dashboard() {
+        let workos = "user_01ABCD::eyJhbGciOiJIUzI1NiJ9.payload.sig";
+        assert_eq!(
+            classify_cursor_secret(workos),
+            Some(CursorAuth::Dashboard(workos.to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_cursor_secret_rejects_blank() {
+        assert_eq!(classify_cursor_secret(""), None);
+        assert_eq!(classify_cursor_secret("   "), None);
+        assert_eq!(classify_cursor_secret("\n\t"), None);
+    }
+
+    #[test]
+    fn choose_cursor_auth_prefers_secret_override() {
+        // Override beats every other source.
+        let override_token = "user_01ABCD::session-token";
+        let auth = choose_cursor_auth(
+            Some("key_legacy_admin"),
+            Some("user_99XYZ::other-session"),
+            Some(override_token),
+            Some("ide_token_should_lose"),
+        )
+        .expect("override should produce a credential");
+        assert_eq!(auth, CursorAuth::Dashboard(override_token.to_string()));
+    }
+
+    #[test]
+    fn choose_cursor_auth_session_token_env_beats_api_key_env() {
+        // No override: CURSOR_SESSION_TOKEN wins over CURSOR_API_KEY because
+        // users typically only set the session-token var explicitly when
+        // they've deliberately switched to the dashboard path.
+        let auth = choose_cursor_auth(
+            Some("key_legacy_admin"),
+            Some("user_01ABCD::dashboard-session"),
+            None,
+            None,
+        )
+        .expect("env-supplied session token should produce a credential");
+        assert_eq!(
+            auth,
+            CursorAuth::Dashboard(String::from("user_01ABCD::dashboard-session"))
+        );
+    }
+
+    #[test]
+    fn choose_cursor_auth_falls_back_to_api_key_env() {
+        let auth = choose_cursor_auth(Some("key_admin_only"), None, None, None)
+            .expect("api-key env should produce a credential");
+        assert_eq!(auth, CursorAuth::Admin(String::from("key_admin_only")));
+    }
+
+    #[test]
+    fn choose_cursor_auth_falls_back_to_ide_token_when_nothing_else_set() {
+        let ide_token = "eyJhbGciOiJIUzI1NiJ9.payload.sig";
+        let auth = choose_cursor_auth(None, None, None, Some(ide_token))
+            .expect("ide token should produce a credential at the lowest tier");
+        assert_eq!(auth, CursorAuth::IdeBearer(ide_token.to_string()));
+    }
+
+    #[test]
+    fn choose_cursor_auth_user_secret_beats_ide_token() {
+        // Even an explicit but "weak" secret (no `key_` prefix → Dashboard)
+        // should win over the auto-detected IDE token. Users may have
+        // deliberately pasted a different account's session.
+        let pasted = "user_99ZZZ::pasted-by-hand";
+        let ide_token = "eyJhbGciOiJIUzI1NiJ9.different.user";
+        let auth = choose_cursor_auth(None, None, Some(pasted), Some(ide_token))
+            .expect("user paste should beat IDE auto-detect");
+        assert_eq!(auth, CursorAuth::Dashboard(pasted.to_string()));
+    }
+
+    #[test]
+    fn choose_cursor_auth_returns_none_when_all_blank() {
+        assert!(choose_cursor_auth(None, None, None, None).is_none());
+        assert!(choose_cursor_auth(Some(""), Some("   "), Some("\n"), Some("\t")).is_none());
+    }
+
+    #[test]
+    fn cursor_request_url_branches_by_auth_kind() {
+        assert!(
+            cursor_request_url(&CursorAuth::Admin(String::from("key_x")))
+                .contains("api.cursor.com/teams/filtered-usage-events")
+        );
+        assert!(
+            cursor_request_url(&CursorAuth::Dashboard(String::from("session")))
+                .contains("cursor.com/api/dashboard/get-filtered-usage-events")
+        );
+        assert!(
+            cursor_request_url(&CursorAuth::IdeBearer(String::from("eyJ.bearer.jwt")))
+                .contains("api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents")
+        );
+    }
+
+    #[test]
+    fn cursor_session_key_for_uses_distinct_prefixes_per_auth_kind() {
+        assert_eq!(
+            cursor_session_key_for(CursorAuthKind::Admin),
+            "cursor-admin"
+        );
+        assert_eq!(
+            cursor_session_key_for(CursorAuthKind::Dashboard),
+            "cursor-dashboard"
+        );
+        assert_eq!(
+            cursor_session_key_for(CursorAuthKind::IdeBearer),
+            "cursor-ide"
+        );
+    }
+
+    #[test]
+    fn parse_cursor_official_usage_events_extracts_token_usage_from_admin_payload() {
+        let data = serde_json::json!({
+            "usageEvents": [
+                {
+                    "timestamp": "1750979225854",
+                    "userEmail": "developer@example.com",
+                    "model": "claude-4.5-sonnet",
+                    "tokenUsage": {
+                        "inputTokens": 126,
+                        "outputTokens": 450,
+                        "cacheWriteTokens": 6112,
+                        "cacheReadTokens": 11964,
+                        "totalCents": 20.18232
+                    }
+                },
+                {
+                    "timestamp": "1750979173824",
+                    "model": "request-based",
+                    "isTokenBasedCall": false
+                }
+            ],
+            "pagination": { "hasNextPage": false }
+        });
+
+        let entries = parse_cursor_official_usage_events(&data, None, "cursor-admin").unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "claude-4.5-sonnet");
+        assert_eq!(entries[0].input_tokens, 126);
+        assert_eq!(entries[0].output_tokens, 450);
+        assert_eq!(entries[0].cache_creation_1h_tokens, 6112);
+        assert_eq!(entries[0].cache_read_tokens, 11964);
+        assert_eq!(entries[0].session_key, "cursor-admin");
+    }
+
+    #[test]
+    fn parse_cursor_official_usage_events_tags_dashboard_session_key() {
+        // Dashboard schema sample — same shape as admin, just tagged with a
+        // different session_key so downstream aggregation can disambiguate.
+        let data = serde_json::json!({
+            "usageEvents": [
+                {
+                    "timestamp": "1750979225854",
+                    "model": "gpt-5.4",
+                    "tokenUsage": {
+                        "inputTokens": 200,
+                        "outputTokens": 80,
+                        "cacheWriteTokens": 0,
+                        "cacheReadTokens": 50
+                    },
+                    "kind": "USAGE_EVENT_KIND_USAGE_BASED",
+                    "maxMode": false
+                }
+            ],
+            "pagination": { "hasNextPage": false }
+        });
+
+        let entries = parse_cursor_official_usage_events(&data, None, "cursor-dashboard").unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_key, "cursor-dashboard");
+        assert_eq!(entries[0].input_tokens, 200);
+        assert_eq!(entries[0].output_tokens, 80);
+        assert_eq!(entries[0].cache_read_tokens, 50);
+    }
+
+    #[test]
+    fn parse_cursor_official_usage_events_handles_ide_bearer_display_array() {
+        // The IDE-bearer Connect-Web endpoint uses `usageEventsDisplay`
+        // instead of `usageEvents`. Same per-row shape, with extra fields
+        // we ignore (kind, requestsCosts, chargedCents, owningUser, …).
+        // Pagination is communicated via `totalUsageEventsCount` (string-
+        // encoded int64 under Connect-Web's JSON convention).
+        let data = serde_json::json!({
+            "totalUsageEventsCount": "114",
+            "usageEventsDisplay": [
+                {
+                    "timestamp": "1777165184690",
+                    "model": "claude-opus-4-7-thinking-max",
+                    "kind": "USAGE_EVENT_KIND_INCLUDED_IN_PRO_PLUS",
+                    "maxMode": true,
+                    "requestsCosts": 133.7,
+                    "isTokenBasedCall": true,
+                    "tokenUsage": {
+                        "inputTokens": 22,
+                        "outputTokens": 20245,
+                        "cacheWriteTokens": 350245,
+                        "cacheReadTokens": 5301898,
+                        "totalCents": 534.6215249999999
+                    },
+                    "owningUser": "346002640",
+                    "chargedCents": 534.621525
+                }
+            ]
+        });
+
+        let entries = parse_cursor_official_usage_events(&data, None, "cursor-ide").unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_key, "cursor-ide");
+        assert_eq!(entries[0].model, "claude-opus-4-7-thinking-max");
+        assert_eq!(entries[0].input_tokens, 22);
+        assert_eq!(entries[0].output_tokens, 20245);
+        assert_eq!(entries[0].cache_creation_1h_tokens, 350245);
+        assert_eq!(entries[0].cache_read_tokens, 5301898);
+    }
+
+    #[test]
+    fn parse_cursor_official_usage_events_errors_when_neither_array_present() {
+        let data = serde_json::json!({"someOtherField": []});
+        match parse_cursor_official_usage_events(&data, None, "cursor-admin") {
+            Ok(_) => panic!("expected error when payload is missing the events array"),
+            Err(err) => assert!(
+                err.contains("usageEvents/usageEventsDisplay"),
+                "error should mention both array names so users can debug, got: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn cursor_response_has_next_page_uses_pagination_object_when_present() {
+        let with_more = serde_json::json!({"pagination": {"hasNextPage": true}});
+        let without_more = serde_json::json!({"pagination": {"hasNextPage": false}});
+        assert!(cursor_response_has_next_page(&with_more, 1, 100));
+        assert!(!cursor_response_has_next_page(&without_more, 1, 100));
+    }
+
+    #[test]
+    fn cursor_response_has_next_page_uses_total_count_for_ide_bearer_payloads() {
+        // 114 total, page 1 of 100 → still 14 more on page 2.
+        let p1 = serde_json::json!({"totalUsageEventsCount": "114"});
+        assert!(cursor_response_has_next_page(&p1, 1, 100));
+        // After page 2 we've covered 200 events, more than the total.
+        assert!(!cursor_response_has_next_page(&p1, 2, 100));
+        // Numeric encoding works too, in case a deployment stops string-
+        // encoding int64 fields.
+        let numeric = serde_json::json!({"totalUsageEventsCount": 250});
+        assert!(cursor_response_has_next_page(&numeric, 2, 100));
+        assert!(!cursor_response_has_next_page(&numeric, 3, 100));
+    }
+
+    #[test]
+    fn cursor_response_has_next_page_returns_false_with_no_pagination_info() {
+        let neither = serde_json::json!({"usageEvents": []});
+        assert!(!cursor_response_has_next_page(&neither, 1, 100));
+    }
+
+    #[test]
+    fn parse_cursor_session_file_extracts_token_usage() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.json");
+        write_file(
+            &path,
+            r#"{"messages":[{"id":"event-1","timestamp":"2026-03-15T12:00:00+00:00","model":"cursor-model","tokenUsage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":10}}]}"#,
+        );
+
+        let (entries, _change_events, lines_read, opened) = parse_cursor_session_file(&path);
+
+        assert!(opened);
+        assert_eq!(lines_read, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].input_tokens, 100);
+        assert_eq!(entries[0].output_tokens, 50);
+        assert_eq!(entries[0].cache_read_tokens, 25);
+        assert_eq!(entries[0].cache_creation_1h_tokens, 10);
+    }
+
+    #[test]
+    fn cursor_local_debug_reports_readable_files_without_usage_entries() {
+        let root = TempDir::new().unwrap();
+        let chat_dir = root.path().join("workspace-a").join("chatSessions");
+        fs::create_dir_all(&chat_dir).unwrap();
+        write_file(
+            &chat_dir.join("session.json"),
+            r#"{"messages":[{"id":"event-1","text":"hello"}]}"#,
+        );
+        let parser = UsageParser::from_integrations(usage_integration_configs_with_overrides(
+            None,
+            None,
+            Some(vec![root.path().to_path_buf()]),
+        ));
+
+        let (entries, report) = parser.load_cursor_local_entries_with_debug(None);
+
+        assert!(entries.is_empty());
+        assert_eq!(report.discovered_paths, 1);
+        assert_eq!(report.opened_paths, 1);
+        assert_eq!(report.emitted_entries, 0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3644,5 +5185,394 @@ mod debug_compare {
         println!("\n=== CODEX: ccusage ===");
         println!("  gpt-5.4: inp=231,247 out=7,338 reasoning=5,997 total=238,585 cost=$0.277788");
         println!("  (reasoning is informational; both parsers bill against token_count usage)");
+    }
+}
+
+#[cfg(test)]
+mod path_a_smoke {
+    //! Manual smoke probe for "Path A" — can we authenticate against
+    //! Cursor's remote APIs using the access token that Cursor IDE itself
+    //! stores locally in `state.vscdb`, instead of asking the user to
+    //! manually copy `WorkosCursorSessionToken` out of cursor.com cookies?
+    //!
+    //! If the dashboard endpoint accepts `Authorization: Bearer <token>`
+    //! where `<token>` comes from `cursorAuth/accessToken`, we can offer
+    //! a zero-configuration Cursor integration: install TokenMonitor →
+    //! it picks up the IDE's session automatically. If not, we fall back
+    //! to "Path B" (in-app webview login).
+    //!
+    //! This test:
+    //!   • is `#[ignore]` because it requires a logged-in Cursor IDE on
+    //!     the host AND hits the real cursor.com / api.cursor.com servers;
+    //!   • never asserts (so all four probes run regardless of which one
+    //!     succeeds — useful for one-shot diagnosis);
+    //!   • redacts the access token before printing.
+    //!
+    //! Run with:
+    //! ```bash
+    //! cargo test --lib path_a_smoke -- --ignored --nocapture
+    //! ```
+
+    use super::*;
+    use std::time::Duration;
+
+    fn redact(token: &str) -> String {
+        if token.len() <= 16 {
+            format!("[short, {} chars]", token.len())
+        } else {
+            format!(
+                "{}…{} ({} chars, {} JWT-style segments)",
+                &token[..8],
+                &token[token.len() - 8..],
+                token.len(),
+                token.matches('.').count() + 1,
+            )
+        }
+    }
+
+    fn print_response(label: &str, resp: reqwest::blocking::Response) {
+        let status = resp.status();
+        let headers_summary = format!(
+            "content-type={:?} content-length={:?}",
+            resp.headers().get("content-type"),
+            resp.headers().get("content-length"),
+        );
+        let body = resp
+            .text()
+            .unwrap_or_else(|e| format!("[body read error: {e}]"));
+        let preview_len = body.len().min(800);
+        eprintln!("\n=== {label} ===");
+        eprintln!("status:  {status}");
+        eprintln!("headers: {headers_summary}");
+        eprintln!("body (first {preview_len} chars):");
+        eprintln!("{}", &body[..preview_len]);
+        if body.len() > preview_len {
+            eprintln!("[... {} more chars omitted ...]", body.len() - preview_len);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual: requires a logged-in Cursor IDE on host + real network"]
+    fn probe_cursor_ide_access_token_against_remote_endpoints() {
+        let Some(db_path) = cursor_global_state_path_from_env()
+            .or_else(crate::paths::cursor_global_state_vscdb_default)
+        else {
+            eprintln!("Could not locate state.vscdb on this host. Is Cursor IDE installed?");
+            return;
+        };
+        eprintln!("state.vscdb: {}", db_path.display());
+
+        let access_token =
+            match read_cursor_state_value_from_sqlite3(&db_path, "cursorAuth/accessToken") {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    eprintln!(
+                        "cursorAuth/accessToken not present in {} — sign into Cursor IDE first.",
+                        db_path.display()
+                    );
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("sqlite3 read failed: {e}");
+                    return;
+                }
+            };
+        let refresh_token =
+            read_cursor_state_value_from_sqlite3(&db_path, "cursorAuth/refreshToken")
+                .ok()
+                .flatten();
+        let email = read_cursor_cached_email();
+        let subscription =
+            read_cursor_state_value_from_sqlite3(&db_path, "cursorAuth/stripeMembershipType")
+                .ok()
+                .flatten();
+
+        eprintln!("\n--- Local Cursor IDE state ---");
+        eprintln!("email:                {email:?}");
+        eprintln!("subscription:         {subscription:?}");
+        eprintln!("access_token:         {}", redact(&access_token));
+        eprintln!("refresh_token found:  {}", refresh_token.is_some());
+
+        let payload = serde_json::json!({
+            "page": 1,
+            "pageSize": 5,
+            "startDate": 0_i64,
+            "endDate": chrono::Local::now().timestamp_millis(),
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client build");
+
+        // Common browser-ish headers added on every probe so we don't
+        // accidentally fail Origin/Referer-style WAF checks.
+        let with_browser_headers = |req: reqwest::blocking::RequestBuilder| {
+            req.header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("User-Agent", "TokenMonitor/smoke-test")
+        };
+
+        // Probe 1: THE big question — Bearer auth against the dashboard
+        // endpoint that powers cursor.com/dashboard/usage in the browser.
+        let resp = with_browser_headers(
+            client
+                .post("https://cursor.com/api/dashboard/get-filtered-usage-events")
+                .bearer_auth(&access_token)
+                .header("Origin", "https://cursor.com")
+                .header("Referer", "https://cursor.com/dashboard"),
+        )
+        .json(&payload)
+        .send();
+        match resp {
+            Ok(r) => print_response("Probe 1: Bearer @ cursor.com dashboard endpoint", r),
+            Err(e) => eprintln!("\n=== Probe 1 ===\nERROR: {e}"),
+        }
+
+        // Probe 2: same endpoint but the access token in the
+        // WorkosCursorSessionToken cookie slot. The expected cookie
+        // format is `<userId>::<JWT>`, so this almost certainly fails;
+        // included to rule out a permissive server-side parser.
+        let resp = with_browser_headers(
+            client
+                .post("https://cursor.com/api/dashboard/get-filtered-usage-events")
+                .header(
+                    reqwest::header::COOKIE,
+                    format!("WorkosCursorSessionToken={access_token}"),
+                )
+                .header("Origin", "https://cursor.com")
+                .header("Referer", "https://cursor.com/dashboard"),
+        )
+        .json(&payload)
+        .send();
+        match resp {
+            Ok(r) => print_response(
+                "Probe 2: Cookie WorkosCursorSessionToken=<accessToken> @ dashboard endpoint",
+                r,
+            ),
+            Err(e) => eprintln!("\n=== Probe 2 ===\nERROR: {e}"),
+        }
+
+        // Probe 3: Enterprise admin endpoint with Bearer. Almost certainly
+        // 401/403 for non-Enterprise users (they don't have admin scope),
+        // but useful as a control: confirms the token isn't *accidentally*
+        // a valid admin key.
+        let resp = with_browser_headers(
+            client
+                .post("https://api.cursor.com/teams/filtered-usage-events")
+                .bearer_auth(&access_token),
+        )
+        .json(&payload)
+        .send();
+        match resp {
+            Ok(r) => print_response("Probe 3: Bearer @ api.cursor.com admin endpoint", r),
+            Err(e) => eprintln!("\n=== Probe 3 ===\nERROR: {e}"),
+        }
+
+        // Probe 4: sanity check — does the access token authenticate at
+        // all? `/api/auth/me` is a generic user-info endpoint the IDE
+        // itself calls. If THIS returns 200 but Probe 1 doesn't, the
+        // dashboard endpoint specifically locks to cookie auth and we
+        // need Path B. If THIS also 401s, the token might be stale or
+        // the path/header convention is wrong on this account.
+        let resp = with_browser_headers(
+            client
+                .get("https://cursor.com/api/auth/me")
+                .bearer_auth(&access_token),
+        )
+        .send();
+        match resp {
+            Ok(r) => print_response("Probe 4: GET /api/auth/me with Bearer (sanity)", r),
+            Err(e) => eprintln!("\n=== Probe 4 ===\nERROR: {e}"),
+        }
+
+        // ── Path A' probes — find IDE-Bearer-friendly usage endpoints ────
+        //
+        // The dashboard endpoint above forces WorkOS cookie auth, but Cursor
+        // IDE itself displays in-app token counts and subscription state, so
+        // *some* Bearer-friendly endpoint must exist. The four below are the
+        // most likely candidates per community reverse-engineering of the
+        // IDE's network traffic. If any returns 200 with usable data, we can
+        // drop the cookie requirement entirely.
+
+        // Probe 5: `auth/full_stripe_profile` is what the Cursor IDE
+        // settings panel calls to render "Pro+ — $X used this month". If
+        // it includes a per-event breakdown, we can use it as the primary
+        // usage source for detailed view.
+        let resp = with_browser_headers(
+            client
+                .get("https://api2.cursor.sh/auth/full_stripe_profile")
+                .bearer_auth(&access_token),
+        )
+        .send();
+        match resp {
+            Ok(r) => print_response(
+                "Probe 5: GET api2.cursor.sh/auth/full_stripe_profile with Bearer",
+                r,
+            ),
+            Err(e) => eprintln!("\n=== Probe 5 ===\nERROR: {e}"),
+        }
+
+        // Probes 6-9 below target the *real* Connect-Web service the IDE
+        // uses, recovered by grepping the bundled Cursor IDE JS:
+        //   • Service:  `aiserver.v1.DashboardService`  (NOT UsageService)
+        //   • Methods:  `GetCurrentPeriodUsage`, `GetFilteredUsageEvents`,
+        //               `GetTokenUsage`, `GetUsageBasedPremiumRequests`,
+        //               `GetPlanInfo`, `GetAggregatedUsageEvents`, …
+        //   • Host:     `api2.cursor.sh` (Probe 5 confirmed Bearer-friendly)
+        //               with `api3.cursor.sh` as a fallback host the bundle
+        //               also references.
+        // The Connect-Web HTTP/JSON dialect accepts plain JSON request
+        // bodies; for messages with no required fields, `{}` is valid.
+
+        let connect_post = |url: &str, body: &str| {
+            client
+                .post(url)
+                .bearer_auth(&access_token)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("Connect-Protocol-Version", "1")
+                .header("User-Agent", "TokenMonitor/smoke-test")
+                .body(body.to_string())
+                .send()
+        };
+
+        // Probe 6: GetCurrentPeriodUsage — the call the IDE makes on
+        // every prefetch. Returns aggregate spend + plan info for the
+        // current billing period, NOT per-event detail.
+        match connect_post(
+            "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+            "{}",
+        ) {
+            Ok(r) => print_response(
+                "Probe 6: POST api2 DashboardService.GetCurrentPeriodUsage (Bearer)",
+                r,
+            ),
+            Err(e) => eprintln!("\n=== Probe 6 ===\nERROR: {e}"),
+        }
+
+        // Probe 7: THE BIG ONE — GetFilteredUsageEvents over Bearer.
+        // Same method name as the cookie endpoint but reached via the
+        // IDE's Connect-Web RPC layer. If this returns 200 with detailed
+        // events, we have a fully zero-config integration path.
+        let detailed_body = serde_json::json!({
+            "pageSize": 5,
+            "page": 1,
+            "startDate": "0",
+            "endDate": chrono::Local::now().timestamp_millis().to_string(),
+        })
+        .to_string();
+        match connect_post(
+            "https://api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents",
+            &detailed_body,
+        ) {
+            Ok(r) => print_response(
+                "Probe 7: POST api2 DashboardService.GetFilteredUsageEvents (Bearer)",
+                r,
+            ),
+            Err(e) => eprintln!("\n=== Probe 7 ===\nERROR: {e}"),
+        }
+
+        // Probe 8: GetTokenUsage — per-token breakdown candidate.
+        match connect_post(
+            "https://api2.cursor.sh/aiserver.v1.DashboardService/GetTokenUsage",
+            "{}",
+        ) {
+            Ok(r) => print_response(
+                "Probe 8: POST api2 DashboardService.GetTokenUsage (Bearer)",
+                r,
+            ),
+            Err(e) => eprintln!("\n=== Probe 8 ===\nERROR: {e}"),
+        }
+
+        // Probe 9: same big endpoint but on the api3 host the bundle
+        // also references. If api2 is locked down but api3 isn't (or
+        // vice versa), this catches it cheaply.
+        match connect_post(
+            "https://api3.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents",
+            &detailed_body,
+        ) {
+            Ok(r) => print_response(
+                "Probe 9: POST api3 DashboardService.GetFilteredUsageEvents (Bearer)",
+                r,
+            ),
+            Err(e) => eprintln!("\n=== Probe 9 ===\nERROR: {e}"),
+        }
+
+        eprintln!(
+            "\n--- Interpretation guide ---\n\
+             Probe 1 → 200 with `usageEvents`: GREAT. Path A works as-is. Wire up\n  \
+                       a `CursorAuth::IdeBearer` variant and prime it from state.vscdb.\n\
+             Probe 1 → 401/403 BUT Probe 4 → 200: token is valid but dashboard locks\n  \
+                       to cookie auth. Path A blocked → fall back to Path B (webview).\n\
+             Probe 1 → 401/403 AND Probe 4 → 401: token may be expired. Re-sign-in to\n  \
+                       Cursor IDE (which forces a refresh) and re-run.\n\
+             Probe 2 → 200: surprising; would mean the cookie value doesn't need the\n  \
+                       `<userId>::<JWT>` format. Sanity-double-check before relying on it.\n\
+             Probe 3 → 401/403: expected for non-Enterprise users.\n\
+             ── Path A' (DashboardService over Bearer) ─────────────────────────────\n\
+             Probe 5 → 200 with subscription JSON: confirmed Bearer works on api2.\n\
+             Probe 6 → 200 with current-period usage: aggregate-only fallback, but\n  \
+                       enough to render the existing TM 'monthly spend' UI silently.\n\
+             Probe 7 → 200 with `usageEvents`: JACKPOT — silent zero-config detailed\n  \
+                       events. Drop the cookie requirement, prime auth from state.vscdb.\n\
+             Probe 7 → 401/403 BUT Probe 6 → 200: same service, different ACL. Detailed\n  \
+                       events lock to admin/cookie auth. Use aggregate as 'better than\n  \
+                       nothing' fallback when the user hasn't pasted a cookie.\n\
+             Probe 8 → 200: token-level breakdown — could complement detailed events.\n\
+             Probe 9 → 200: api3 is the real host (api2 redirects?) — pivot accordingly.\n"
+        );
+    }
+
+    /// End-to-end smoke test of the production Path A integration: prime
+    /// the IDE token from `state.vscdb`, then go through the same
+    /// `fetch_cursor_remote_entries` code path that the live usage refresh
+    /// uses. If this returns parsed entries, the integration is healthy
+    /// from `state.vscdb` all the way through to `ParsedEntry`.
+    #[test]
+    #[ignore = "manual: requires logged-in Cursor IDE + real network"]
+    fn ide_bearer_end_to_end_through_production_pipeline() {
+        if !prime_ide_access_token() {
+            eprintln!(
+                "Could not prime IDE access token — Cursor IDE may not be installed/logged-in."
+            );
+            return;
+        }
+
+        let auth = resolve_cursor_auth().expect("resolve_cursor_auth should return IdeBearer");
+        eprintln!("Resolved auth kind: {:?}", auth.kind());
+        assert_eq!(
+            auth.kind(),
+            CursorAuthKind::IdeBearer,
+            "no user-pasted secret should be present in this test run"
+        );
+
+        let result = fetch_cursor_remote_entries(None);
+        match result {
+            Ok(Some(entries)) => {
+                eprintln!(
+                    "Got {} parsed entries from production pipeline",
+                    entries.len()
+                );
+                if let Some(first) = entries.first() {
+                    eprintln!("First entry:");
+                    eprintln!("  timestamp:    {}", first.timestamp);
+                    eprintln!("  model:        {}", first.model);
+                    eprintln!("  input:        {}", first.input_tokens);
+                    eprintln!("  output:       {}", first.output_tokens);
+                    eprintln!("  cache_read:   {}", first.cache_read_tokens);
+                    eprintln!("  cache_write:  {}", first.cache_creation_1h_tokens);
+                    eprintln!("  session_key:  {}", first.session_key);
+                    assert_eq!(
+                        first.session_key, "cursor-ide",
+                        "entries should be tagged with the IDE-bearer session key"
+                    );
+                } else {
+                    eprintln!("No entries — billing cycle may be empty.");
+                }
+            }
+            Ok(None) => eprintln!("fetch_cursor_remote_entries returned Ok(None) — auth missing?"),
+            Err(e) => eprintln!("ERROR: {e}"),
+        }
     }
 }

@@ -38,6 +38,7 @@ pub(super) fn extract_codex_rate_limits(codex_dir: &Path) -> Result<ProviderRate
         .ok_or_else(|| "No Codex session files found".to_string())?;
 
     // Read from the end looking for rate_limits
+    tracing::debug!(path = %file_path.display(), "opening file (codex rate limits)");
     let file =
         std::fs::File::open(&file_path).map_err(|e| format!("Failed to open Codex file: {e}"))?;
     let reader = BufReader::new(file);
@@ -114,9 +115,13 @@ fn find_newest_jsonl(
     if depth > 5 {
         return;
     }
+    tracing::debug!(path = %dir.display(), depth, "read_dir (codex find_newest_jsonl)");
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            tracing::debug!(path = %dir.display(), error = %e, "read_dir failed");
+            return;
+        }
     };
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
