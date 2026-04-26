@@ -108,6 +108,7 @@ fn common_claude_cli_paths() -> Vec<PathBuf> {
                     .unwrap_or_else(|_| home.join("AppData").join("Roaming").join("nvm"))
             });
 
+        tracing::debug!(path = %nvm_dir.display(), "read_dir (nvm node versions)");
         if let Ok(entries) = std::fs::read_dir(nvm_dir) {
             let mut versions: Vec<PathBuf> = entries
                 .flatten()

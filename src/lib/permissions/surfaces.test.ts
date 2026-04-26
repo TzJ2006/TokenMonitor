@@ -17,6 +17,7 @@ function settings(overrides: Partial<Settings> = {}): Settings {
       all: { label: "All", enabled: true },
       claude: { label: "Claude", enabled: true },
       codex: { label: "Codex", enabled: true },
+      cursor: { label: "Cursor", enabled: true },
     },
     brandTheming: true,
     trayConfig: {
@@ -33,6 +34,7 @@ function settings(overrides: Partial<Settings> = {}): Settings {
     taskbarPanel: false,
     sshHosts: [],
     debugLogging: false,
+    cursorApiKey: "",
     rateLimitsEnabled: false,
     hasSeenWelcome: false,
     keychainAccessRequested: false,
