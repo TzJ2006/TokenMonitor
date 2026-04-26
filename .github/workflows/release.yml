@@ -125,12 +125,15 @@ jobs:
 
       # ── Set up updater signing key ──────────────────────────────────────
       - name: Set up updater signing key
-        if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
         shell: bash
         env:
           RAW_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           RAW_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          if [ -z "$RAW_KEY" ]; then
+            echo "::notice::No TAURI_SIGNING_PRIVATE_KEY set — updater signing disabled"
+            exit 0
+          fi
           if [[ "$RAW_KEY" == untrusted\ comment:* ]]; then
             FINAL_KEY="$RAW_KEY"
           else
