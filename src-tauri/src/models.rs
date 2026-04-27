@@ -37,6 +37,7 @@ pub struct UsagePayload {
     pub subagent_stats: Option<crate::stats::subagent::SubagentStats>,
     pub device_breakdown: Option<Vec<DeviceSummary>>,
     pub device_chart_buckets: Option<Vec<ChartBucket>>,
+    pub provider_detected: Option<bool>,
 }
 
 impl Default for UsagePayload {
@@ -65,6 +66,7 @@ impl Default for UsagePayload {
             subagent_stats: None,
             device_breakdown: None,
             device_chart_buckets: None,
+            provider_detected: None,
         }
     }
 }
@@ -163,11 +165,20 @@ pub struct ExtraUsageInfo {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct CreditsInfo {
+    pub balance: Option<f64>,
+    pub has_credits: bool,
+    pub unlimited: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderRateLimits {
     pub provider: String,
     pub plan_tier: Option<String>,
     pub windows: Vec<RateLimitWindow>,
     pub extra_usage: Option<ExtraUsageInfo>,
+    pub credits: Option<CreditsInfo>,
     pub stale: bool,
     pub error: Option<String>,
     pub retry_after_seconds: Option<u64>,

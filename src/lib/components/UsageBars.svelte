@@ -161,7 +161,7 @@
             {#if pace}
               <span class="ub-pace-badge" style="color: {paceColor(w, hours)}">{pace}</span>
             {/if}
-            <span class="ub-val">{utilizationLabel(w.utilization)}</span>
+            <span class="ub-val" class:stale={rateLimits.stale}>{utilizationLabel(w.utilization)}</span>
           </div>
         </div>
         <div class="ub-track">
@@ -210,6 +210,25 @@
         ></div>
       </div>
       <div class="ub-sub">Monthly overuse budget</div>
+    </div>
+  {/if}
+
+  {#if rateLimits.credits}
+    <div class="ub-row">
+      <div class="ub-head">
+        <span class="ub-label">Credits</span>
+        <span class="ub-val">
+          {#if rateLimits.credits.unlimited}
+            Unlimited
+          {:else if rateLimits.credits.balance != null}
+            {formatUsdAmount(rateLimits.credits.balance)}
+          {:else if rateLimits.credits.hasCredits}
+            Available
+          {:else}
+            Depleted
+          {/if}
+        </span>
+      </div>
     </div>
   {/if}
 </div>
@@ -266,6 +285,9 @@
     font: 500 11px/1 'Inter', sans-serif;
     color: var(--t1);
     font-variant-numeric: tabular-nums;
+  }
+  .ub-val.stale {
+    opacity: 0.55;
   }
   .ub-track {
     position: relative;

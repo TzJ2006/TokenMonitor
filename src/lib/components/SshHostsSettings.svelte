@@ -23,6 +23,10 @@
     ).length,
   );
 
+  let sortedSshHosts = $derived(
+    [...sshHosts].sort((a, b) => a.alias.localeCompare(b.alias, undefined, { sensitivity: "base" })),
+  );
+
   onMount(() => {
     destroyed = false;
     sshConfiguredHosts = current.sshHosts.map((h) => ({
@@ -149,88 +153,72 @@
   }
 </script>
 
-<div class="group">
-  <div class="group-label">Remote Devices</div>
-  <div class="card">
-    <button class="row ssh-toggle-row" type="button" onclick={() => (expanded = !expanded)}>
-      <span class="label">SSH Hosts</span>
-      <div class="ssh-toggle-right">
-        {#if sshHosts.length > 0}
-          <span class="ssh-toggle-count">{enabledCount} of {sshHosts.length} enabled</span>
-        {/if}
-        <svg class="ssh-chevron" class:open={expanded} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="6 9 12 15 18 9"></polyline>
+<div class="card">
+  <div class="row ssh-toggle-row" role="button" tabindex="0" onclick={() => (expanded = !expanded)} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); expanded = !expanded; } }}>
+    <span class="label">SSH Hosts</span>
+    <div class="ssh-toggle-right">
+      {#if sshSyncResult}
+        <span class="ssh-sync-status" class:ssh-sync-error={sshSyncResult.msg.startsWith("Failed")}>{sshSyncResult.msg}</span>
+      {:else if sshHosts.length > 0}
+        <span class="ssh-toggle-count">{enabledCount} of {sshHosts.length} enabled</span>
+      {/if}
+      <button
+        class="ssh-btn ssh-sync-btn"
+        class:spinning={sshSyncing}
+        type="button"
+        aria-label="Sync SSH hosts"
+        onclick={(e) => { e.stopPropagation(); syncAllSshHosts(); }}
+        disabled={sshSyncing || sshConfiguredHosts.filter((h) => h.enabled).length === 0}
+      >
+        <svg class="sync-icon" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <polyline points="1 20 1 14 7 14"></polyline>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
         </svg>
-      </div>
-    </button>
-    <div class="ssh-collapse" class:open={expanded}>
-    <div class="ssh-section">
-      <div class="ssh-hosts">
-        {#each sshHosts as host (host.alias)}
-          <div class="ssh-host-row">
-            <div class="ssh-host-info">
-              <span class="ssh-alias">{host.alias}</span>
-              <span class="ssh-detail">{host.hostname}{host.user ? ` (${host.user})` : ''}{host.port !== 22 ? `:${host.port}` : ''}</span>
-            </div>
-            <div class="ssh-host-actions">
-              {#if sshTestingHost === host.alias}
-                <span class="ssh-testing">...</span>
-              {:else if sshTestResults[host.alias]}
-                <span class="ssh-result" class:ssh-ok={sshTestResults[host.alias].success} class:ssh-fail={!sshTestResults[host.alias].success}>
-                  {sshTestResults[host.alias].success ? 'OK' : 'Fail'}
-                </span>
-              {/if}
-              <button class="ssh-btn" onclick={() => testSshHost(host.alias)}>Test</button>
-              {#if sshConfiguredHosts.some(h => h.alias === host.alias)}
-                <ToggleSwitch
-                  checked={sshConfiguredHosts.find(h => h.alias === host.alias)?.enabled ?? false}
-                  onChange={(checked) => toggleSshHost(host.alias, checked)}
-                />
-              {:else}
-                <ToggleSwitch checked={false} onChange={() => addSshHost(host.alias)} />
-              {/if}
-            </div>
+      </button>
+      <svg class="ssh-chevron" class:open={expanded} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="6 9 12 15 18 9"></polyline>
+      </svg>
+    </div>
+  </div>
+  <div class="ssh-collapse" class:open={expanded}>
+  <div class="ssh-section">
+    <div class="ssh-hosts">
+      {#each sortedSshHosts as host (host.alias)}
+        <div class="ssh-host-row">
+          <div class="ssh-host-info">
+            <span class="ssh-alias">{host.alias}</span>
+            <span class="ssh-detail">{host.hostname}{host.user ? ` (${host.user})` : ''}{host.port !== 22 ? `:${host.port}` : ''}</span>
           </div>
-        {/each}
-        {#if sshHosts.length === 0}
-          <div class="ssh-empty">No hosts found in ~/.ssh/config</div>
-        {/if}
-      </div>
-      {#if sshConfiguredHosts.length > 0}
-        <div class="ssh-sync-row">
-          <span class="ssh-sync-label">
-            {#if sshSyncResult}
-              <span class="ssh-sync-status" class:ssh-sync-error={sshSyncResult.msg.startsWith("Failed")}>{sshSyncResult.msg}</span>
-            {:else}
-              {enabledCount} device(s) enabled
+          <div class="ssh-host-actions">
+            {#if sshTestingHost === host.alias}
+              <span class="ssh-testing">...</span>
+            {:else if sshTestResults[host.alias]}
+              <span class="ssh-result" class:ssh-ok={sshTestResults[host.alias].success} class:ssh-fail={!sshTestResults[host.alias].success}>
+                {sshTestResults[host.alias].success ? 'OK' : 'Fail'}
+              </span>
             {/if}
-          </span>
-          <button class="ssh-btn ssh-sync-btn" class:spinning={sshSyncing} onclick={syncAllSshHosts} disabled={sshSyncing}>
-            <svg class="sync-icon" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="23 4 23 10 17 10"></polyline>
-              <polyline points="1 20 1 14 7 14"></polyline>
-              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
-            </svg>
-            {sshSyncing ? "Syncing..." : "Sync Now"}
-          </button>
+            <button class="ssh-btn" onclick={() => testSshHost(host.alias)}>Test</button>
+            {#if sshConfiguredHosts.some(h => h.alias === host.alias)}
+              <ToggleSwitch
+                checked={sshConfiguredHosts.find(h => h.alias === host.alias)?.enabled ?? false}
+                onChange={(checked) => toggleSshHost(host.alias, checked)}
+              />
+            {:else}
+              <ToggleSwitch checked={false} onChange={() => addSshHost(host.alias)} />
+            {/if}
+          </div>
         </div>
+      {/each}
+      {#if sshHosts.length === 0}
+        <div class="ssh-empty">No hosts found in ~/.ssh/config</div>
       {/if}
     </div>
-    </div>
+  </div>
   </div>
 </div>
 
 <style>
-  .group {
-    margin-bottom: 8px;
-  }
-  .group-label {
-    font: 500 8px/1 'Inter', sans-serif;
-
-    letter-spacing: 0.8px;
-    color: var(--t4);
-    padding: 2px 4px 4px;
-  }
   .card {
     background: var(--surface-2);
     border-radius: 8px;
@@ -281,9 +269,13 @@
     color: var(--t2);
     cursor: pointer;
   }
-  .ssh-btn:hover {
+  .ssh-btn:hover:not(:disabled) {
     color: var(--t1);
     border-color: var(--t3);
+  }
+  .ssh-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
   .row {
     padding: 7px 10px;
@@ -345,31 +337,21 @@
     font: 400 9px/1.4 'Inter', sans-serif;
     color: var(--t3);
   }
-  .ssh-sync-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 10px 2px;
-    border-top: 1px solid var(--border);
-  }
-  .ssh-sync-label {
-    font: 400 8px/1 'Inter', sans-serif;
-    color: var(--t3);
-  }
-  .ssh-sync-status {
-    color: var(--accent, #4caf50);
-  }
-  .ssh-sync-error {
-    color: #f44336;
-  }
   .ssh-sync-btn {
     display: inline-flex;
     align-items: center;
-    gap: 3px;
+    padding: 2px 5px;
   }
   .ssh-sync-btn.spinning .sync-icon {
     animation: refresh-spin 900ms linear infinite;
     transform-origin: center;
+  }
+  .ssh-sync-status {
+    font: 400 8px/1 'Inter', sans-serif;
+    color: var(--accent, #4caf50);
+  }
+  .ssh-sync-error {
+    color: #f44336;
   }
   @keyframes refresh-spin {
     to { transform: rotate(360deg); }

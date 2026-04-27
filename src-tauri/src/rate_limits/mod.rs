@@ -1,6 +1,7 @@
 mod claude;
 mod claude_cli;
 mod codex;
+mod codex_cli;
 mod cursor;
 mod http;
 
@@ -11,6 +12,7 @@ use std::path::Path;
 use claude::fetch_claude_rate_limits;
 use claude_cli::fetch_claude_rate_limits_via_cli;
 use codex::extract_codex_rate_limits;
+use codex_cli::fetch_codex_rate_limits_via_cli;
 use cursor::fetch_cursor_rate_limits;
 use http::{
     mark_rate_limits_stale, merge_provider_rate_limits, provider_cooldown_is_active,
@@ -30,6 +32,7 @@ pub fn request_claude_keychain_access() -> Result<(), String> {
 /// re-fetching when the cached data is still recent.  The frontend enforces a
 /// matching 5-minute interval via `minFetchIntervalMs`.
 const CLAUDE_MIN_REFETCH_SECS: i64 = 300;
+const CODEX_MIN_REFETCH_SECS: i64 = 300;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RateLimitFetchError {
@@ -178,16 +181,29 @@ pub async fn fetch_selected_rate_limits(
             return cached_codex;
         }
 
-        match tokio::task::spawn_blocking(move || extract_codex_rate_limits(&codex_dir)).await {
-            Ok(Ok(rate_limits)) => Some(rate_limits),
-            Ok(Err(error)) => Some(provider_rate_limit_error(
-                "codex",
-                RateLimitFetchError::message(error),
-            )),
-            Err(error) => Some(provider_rate_limit_error(
-                "codex",
-                RateLimitFetchError::message(format!("Task failed: {error}")),
-            )),
+        let now = Utc::now();
+        if is_fresh(cached_codex.as_ref(), CODEX_MIN_REFETCH_SECS, now) {
+            return cached_codex;
+        }
+
+        match fetch_codex_rate_limits_via_cli().await {
+            Ok(rate_limits) => Some(rate_limits),
+            Err(cli_err) => {
+                tracing::debug!(error = %cli_err.message, "Codex app-server probe failed, falling back to file");
+                match tokio::task::spawn_blocking(move || extract_codex_rate_limits(&codex_dir))
+                    .await
+                {
+                    Ok(Ok(rate_limits)) => Some(rate_limits),
+                    Ok(Err(error)) => Some(provider_rate_limit_error(
+                        "codex",
+                        RateLimitFetchError::message(error),
+                    )),
+                    Err(error) => Some(provider_rate_limit_error(
+                        "codex",
+                        RateLimitFetchError::message(format!("Task failed: {error}")),
+                    )),
+                }
+            }
         }
     };
 
@@ -237,6 +253,7 @@ mod tests {
             plan_tier: None,
             windows,
             extra_usage: None,
+            credits: None,
             stale: false,
             error: None,
             retry_after_seconds: None,
