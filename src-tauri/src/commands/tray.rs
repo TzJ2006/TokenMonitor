@@ -73,6 +73,7 @@ pub struct StatusWidgetSummary {
     pub total_cost: f64,
     pub claude_util: Option<f64>,
     pub codex_util: Option<f64>,
+    pub cursor_util: Option<f64>,
     pub title: String,
 }
 
@@ -130,6 +131,12 @@ fn primary_window_utilization(rate_limits: Option<&ProviderRateLimits>) -> Optio
         .map(|window| window.utilization)
 }
 
+fn extra_usage_utilization(rate_limits: Option<&ProviderRateLimits>) -> Option<f64> {
+    rate_limits
+        .and_then(|provider| provider.extra_usage.as_ref())
+        .and_then(|extra| extra.utilization)
+}
+
 pub(crate) fn tray_utilization_from_rate_limits(
     payload: Option<&RateLimitsPayload>,
 ) -> TrayUtilization {
@@ -140,7 +147,7 @@ pub(crate) fn tray_utilization_from_rate_limits(
         codex: primary_window_utilization(
             payload.and_then(|rate_limits| rate_limits.codex.as_ref()),
         ),
-        cursor: primary_window_utilization(
+        cursor: extra_usage_utilization(
             payload.and_then(|rate_limits| rate_limits.cursor.as_ref()),
         ),
     }
@@ -381,6 +388,7 @@ pub async fn get_status_widget_summary(
         total_cost,
         claude_util: utilization.claude,
         codex_util: utilization.codex,
+        cursor_util: utilization.cursor,
     })
 }
 
@@ -493,6 +501,7 @@ mod tests {
                     resets_at: None,
                 }],
                 extra_usage: None,
+                credits: None,
                 stale: false,
                 error: None,
                 retry_after_seconds: None,
@@ -509,6 +518,7 @@ mod tests {
                     resets_at: None,
                 }],
                 extra_usage: None,
+                credits: None,
                 stale: false,
                 error: None,
                 retry_after_seconds: None,
