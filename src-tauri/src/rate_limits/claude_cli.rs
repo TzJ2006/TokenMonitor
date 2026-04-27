@@ -39,7 +39,7 @@ pub(crate) struct ClaudeCliRateLimitInfo {
     pub utilization: Option<f64>,
 }
 
-fn command_in_path(binary: &str) -> Option<PathBuf> {
+pub(super) fn command_in_path(binary: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(binary);
@@ -320,6 +320,7 @@ pub(crate) fn rate_limits_from_claude_cli_info(
         plan_tier: cached.and_then(|payload| payload.plan_tier.clone()),
         windows,
         extra_usage: cached.and_then(|payload| payload.extra_usage.clone()),
+        credits: None,
         stale: used_cached_window_data,
         error: None,
         retry_after_seconds: retry_after_from_reset(cooldown_until.as_deref(), now),
@@ -431,6 +432,7 @@ mod tests {
             plan_tier: Some("Pro".to_string()),
             windows,
             extra_usage: None,
+            credits: None,
             stale: false,
             error: error.map(ToString::to_string),
             retry_after_seconds: None,

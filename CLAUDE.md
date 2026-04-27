@@ -68,8 +68,6 @@ cd src-tauri && cargo clippy -- -D warnings  # Rust lints
 cd src-tauri && cargo test  # Rust tests
 ```
 
-A pre-commit hook runs all CI checks before each commit. If the hook fails, fix the issue — don't skip it.
-
 ### Building
 ```bash
 npx tauri build            # production build (unsigned)
@@ -91,86 +89,55 @@ The `scripts/release.sh` script handles version sync across `package.json`, `src
 
 ## Architecture
 
-```
-Frontend (Svelte 5 + TS)           Backend (Rust)
-──────────────────────────         ──────────────────────────
-App.svelte                         lib.rs (app setup, tray, background refresh)
- ├─ bootstrap.ts              ←→   commands/ (IPC handlers, split by domain)
- ├─ stores/usage.ts          ←IPC→   usage_query, calendar, period, config,
- ├─ stores/rateLimits.ts     ←IPC→   tray, ssh, float_ball/, updater, logging
- ├─ stores/settings.ts             logging.rs (tracing + rolling file appender)
- ├─ stores/updater.ts              models.rs (shared serde payload types)
- ├─ providerMetadata.ts            paths.rs (filesystem path registry)
- ├─ types/index.ts                 usage/ (parser, claude_parser, pricing,
- ├─ permissions/                     integrations, archive, device_aggregation,
- │   keychain.ts, surfaces.ts       exchange_rates, litellm, openrouter,
- ├─ components/*.svelte              ssh_remote.rs, ssh_config.rs)
- ├─ tray/sync.ts, title.ts        rate_limits/ (claude, claude_cli, codex,
- ├─ window/appearance.ts             cursor, http)
- ├─ windowSizing.ts                secrets/ (cursor token management)
- ├─ views/footer.ts, rateLimits.ts updater/ (state, persistence, scheduler)
- └─ utils/platform.ts, plans.ts,  tray/render.rs (native tray icon/bars)
-     calendar.ts, format.ts,       stats/ (change.rs, subagent.rs)
-     logger.ts                     platform/ (macos/, windows/, linux/)
+### Data flow
 
-FloatBall (separate Vite entry)
-──────────────────────────
-float-ball.html → float-ball.ts → FloatBall.svelte (always-on-top overlay)
-```
+Local JSONL files → Rust `usage/parser` + `usage/claude_parser` + `usage/pricing` → in-memory cache (`Arc<RwLock<>>`, 2-min TTL) → Tauri IPC → Svelte stores → UI components. Background loop refreshes tray and emits `data-updated` events every 120s. Frontend also maintains a payload cache to eliminate IPC round-trips on tab switches. SSH remote logs are synced via `usage/ssh_remote.rs` and merged into the same pipeline. Completed hours are archived to `usage/archive.rs` persistent storage to survive log deletion.
 
-**Data flow:** Local JSONL files → Rust `usage/parser` + `usage/claude_parser` + `usage/pricing` → in-memory cache (Arc<RwLock<>>, 2-min TTL) → Tauri IPC → Svelte stores → UI components. Background loop refreshes tray and emits `data-updated` events every 120s. Frontend also maintains a payload cache to eliminate IPC round-trips on tab switches. SSH remote logs are synced via `usage/ssh_remote.rs` and merged into the same pipeline. Completed hours are archived to `usage/archive.rs` persistent storage to survive log deletion.
+### Key modules
 
-**Rate limits:** Split into `rate_limits/claude.rs` (OAuth Keychain + API, macOS only), `rate_limits/claude_cli.rs` (CLI probe fallback, all platforms), `rate_limits/codex.rs` (session file parsing), `rate_limits/cursor.rs` (Cursor API plan usage + spend limits), and `rate_limits/http.rs` (shared HTTP client). On Windows/Linux, the CLI probe is the primary method for Claude. Codex rate limits are read from local session files on all platforms. Cursor rate limits use an access token auto-detected from Cursor IDE's `state.vscdb` or manually stored via the `secrets/cursor.rs` keyring layer. All are cached and refreshed on configurable intervals per provider (see `rateLimits` in `providerMetadata.ts`).
+**Frontend (`src/lib/`):** `bootstrap.ts` is the startup entry point (settings → stores → native IPC, dependencies injected for testability). Svelte stores (`stores/usage.ts`, `stores/rateLimits.ts`, `stores/settings.ts`, `stores/updater.ts`) own all reactive state and IPC calls. `providerMetadata.ts` is the single source of truth for provider-specific UI behavior (tab order, labels, logos, rate-limit support, brand colors, plan tiers). `lib/types/index.ts` defines shared TypeScript interfaces mirroring Rust structs.
 
-**Pricing:** Model pricing lives in `usage/pricing.rs` with a `PRICING_VERSION` constant. When Anthropic/OpenAI update pricing, update the rates in `get_rates()` and bump `PRICING_VERSION`. Cache-write tiers follow Anthropic's standard multipliers (5m = 1.25x, 1h = 2x, read = 0.1x). Dynamic pricing from LiteLLM (`usage/litellm.rs`) and OpenRouter (`usage/openrouter.rs`) APIs is fetched with 24h TTL caching for models not in the static table.
+**Rust backend (`src-tauri/src/`):** `commands.rs` is the IPC dispatch hub, split into domain submodules (`usage_query`, `calendar`, `period`, `config`, `tray`, `ssh`, `float_ball/`, `updater`, `logging`). `AppState` holds all shared state as `Arc<RwLock<>>` fields. `paths.rs` is the central registry of every filesystem path the app reads.
 
-**Exchange rates:** `usage/exchange_rates.rs` fetches live USD→EUR/GBP/JPY/CNY rates from Frankfurter API with 24h TTL disk cache. Used for currency display conversion in the frontend.
+**Pricing:** `usage/pricing.rs` has a hardcoded pricing table with `PRICING_VERSION` constant. When providers update pricing, update `get_rates()` and bump `PRICING_VERSION`. Cache-write tiers: 5m = 1.25x, 1h = 2x, read = 0.1x. Models not in the static table are resolved via LiteLLM (`usage/litellm.rs`) and OpenRouter (`usage/openrouter.rs`) APIs with 24h TTL.
 
-**Frontend tests** live alongside source files as `*.test.ts` (vitest, node environment). Tests mock `@tauri-apps/api` IPC calls.
+**Rate limits:** `rate_limits/claude.rs` (OAuth Keychain + API, macOS only), `rate_limits/claude_cli.rs` (CLI probe, all platforms), `rate_limits/codex.rs` (session file parsing), `rate_limits/cursor.rs` (Cursor API). On Windows/Linux, CLI probe is the primary method for Claude. Cursor token is auto-detected from `state.vscdb` or manually stored via `secrets/cursor.rs` keyring layer.
 
-**Rust tests** live in `#[cfg(test)]` modules within each `.rs` file. Use `tempfile` crate for fixtures.
+**Usage integrations:** Registered in `usage/integrations.rs`. Adding a new provider means adding an integration ID, its log root discovery, and a parser normalization path — no modification to existing provider branches.
 
-**Usage integrations** are registered in `usage/integrations.rs`. Current integrations: Claude, Codex, and Cursor. Adding a new CLI provider means adding an integration ID, its log root discovery, and a parser normalization path — without modifying existing provider branches.
+**Platform:** `platform/` has OS-specific code per target. Frontend `utils/platform.ts` detects OS and conditionally shows macOS-only settings (glass blur, dock icon). IPC commands like `set_glass_effect` are retained as noops on non-macOS for frontend compatibility.
 
-**Provider metadata** for the UI (tab order, labels, logos, rate-limit support, brand colors, plan tiers) is centralized in `providerMetadata.ts`. This is the single source of truth for provider-specific UI behavior.
+**FloatBall:** Separate Vite entry point (`float-ball.html` → `float-ball.ts` → `FloatBall.svelte`), independent of the main window. Multi-entry configured in `vite.config.ts` via `rollupOptions.input`.
 
-**Tray rendering:** `tray/render.rs` generates RGBA pixel buffers for the menu bar icon + utilization bars entirely in Rust (no image library). It composites the app icon with colored progress bars at @2x retina resolution.
+**Usage archive:** `usage/archive.rs` persists completed hourly aggregates into per-month JSONL files. Uses time-boundary partitioning: archive covers `[0..frontier]`, live source covers `(frontier..now]`.
 
-**Native window:** On macOS, the popover previously used `NSVisualEffectView` for glass blur effects; this has been replaced with cross-platform opaque backgrounds. Glass effect toggle and Dock icon settings are hidden on non-macOS platforms via `src/lib/utils/platform.ts` detection. The `set_glass_effect`, `set_window_surface`, and `set_dock_icon_visible` IPC commands are retained as noops for frontend compatibility.
+**Tray rendering:** `tray/render.rs` generates RGBA pixel buffers for the menu bar icon + utilization bars entirely in Rust (no image library), at @2x retina resolution.
 
-**Commands module (Rust):** `commands.rs` is the IPC dispatch hub, split into domain-specific submodules: `usage_query` (data fetching), `calendar` (heatmap queries), `period` (time range selection), `config` (settings sync), `tray` (title/utilization rendering), `ssh` (remote device management), `float_ball/` (overlay state + layout engine, further split into `mod.rs` and `layout.rs`), `updater` (auto-update IPC commands), and `logging` (log-level control). `AppState` (defined in `commands.rs`) holds all shared state as `Arc<RwLock<>>` fields.
+**Note:** The `archive/` directory contains past code (ccusage CLI reporter, MCP modules, debug tools, old design docs) — none of it is part of the build.
 
-**Logging:** `logging.rs` initializes `tracing` with a rolling file appender for backend logs and a separate appender for frontend logs forwarded via IPC (`log_frontend_message` command). Frontend uses `utils/logger.ts` which routes through the same Rust file writer. Log files live in the platform app-data directory. Log level is runtime-configurable via a reload handle.
+### Network calls at runtime
 
-**Bootstrap:** `bootstrap.ts` is the startup entry point that wires settings → stores → native IPC. It applies theme, glass effect, provider/period defaults, and fires macOS-only IPC calls concurrently via `Promise.allSettled`. Dependencies are injected for testability.
+The app is local-first. Network calls are limited to:
+- Dynamic pricing (LiteLLM, OpenRouter) — optional, 24h cached
+- Exchange rates (Frankfurter API) — optional, 24h cached
+- Cursor rate limits (Cursor API) — when enabled
+- Auto-updater (GitHub releases) — configurable interval
 
-**SSH Remote Devices:** The app can fetch usage logs from remote machines via SSH. `usage/ssh_remote.rs` manages per-host sync state and cache; `usage/ssh_config.rs` discovers SSH hosts from `~/.ssh/config`. The frontend `DevicesView.svelte` and `SingleDeviceView.svelte` provide the device management UI. Host configs are persisted in settings.
+### Testing
 
-**Platform modules (Rust):** `platform/` contains OS-specific code compiled per target: `platform/windows/taskbar.rs` embeds a GDI panel into the Windows taskbar (between app list and system tray), `platform/windows/window.rs` handles window positioning aligned to the taskbar. `platform/macos/` and `platform/linux/` contain their respective window management. Cross-platform helpers (e.g., `clamp_window_to_work_area`) live in `platform/mod.rs`.
+Frontend tests live alongside source as `*.test.ts` (vitest, node environment). Tests mock `@tauri-apps/api` IPC calls. Rust tests live in `#[cfg(test)]` modules within each `.rs` file, using `tempfile` crate for fixtures.
 
-**Platform detection (frontend):** `utils/platform.ts` detects macOS/Windows/Linux from the user agent. UI components use `isMacOS()` to conditionally show macOS-only settings (glass blur, dock icon). The result is cached after first call.
+## Coding Style
 
-**FloatBall:** A separate Vite entry point (`float-ball.html` → `float-ball.ts` → `FloatBall.svelte`) that renders an always-on-top draggable overlay ball. It has its own HTML file and mount target (`#float-ball`) independent of the main `App.svelte` window. Multi-entry is configured in `vite.config.ts` via `rollupOptions.input`.
+- TypeScript / Svelte: 2-space indentation, double quotes, semicolons
+- Rust: 4-space indentation (standard `rustfmt`)
+- Svelte components: `PascalCase.svelte`; TS modules: `camelCase.ts`; Rust modules: `snake_case.rs`
+- Shared frontend payload types go in `lib/types/index.ts`
+- Prefer `cargo fmt` and `cargo clippy -- -D warnings` clean before committing Rust changes
 
-**Shared types:** `lib/types/index.ts` defines shared TypeScript interfaces (`UsagePayload`, `UsagePeriod`, `HeaderTabs`, `SubagentStats`, etc.) used across stores, views, and components.
+## Commit Conventions
 
-**Auto-updater:** The `updater/` Rust module implements the full update lifecycle: `state.rs` defines `UpdaterState` with banner/notify predicates, `persistence.rs` persists state via `tauri-plugin-store`, and `scheduler.rs` checks for updates with exponential backoff (initial 10s, then 6h intervals). The frontend `stores/updater.ts` wires IPC commands + event listeners, `UpdateBanner.svelte` shows the in-app banner, and `tray/render.rs` composites a red badge dot on the tray icon when an update is available.
-
-**Secrets management:** `secrets/` provides a "keyring-first, encrypted file second" persistence strategy for user-supplied credentials. Currently the Cursor integration (`secrets/cursor.rs`) is the only consumer — it can auto-detect Cursor's access token from the IDE's `state.vscdb` or accept manual input stored in the OS keyring. The `StorageBackend` enum surfaces where each secret lives (Keyring / File / Auto-detected) for the Settings UI.
-
-**Permissions system:** `permissions/surfaces.ts` defines all filesystem and credential access surfaces with privacy-aware disclosures. `permissions/keychain.ts` implements the macOS Keychain one-time prompt flow. `PermissionDisclosure.svelte` renders surfaces in welcome, settings, and rate-limit contexts. `WelcomeCard.svelte` gates first-launch onboarding with opt-in toggles for rate limits and autostart.
-
-**Paths registry:** `paths.rs` is a central lookup layer for every filesystem path the app may read (Claude logs, Codex sessions, Cursor workspace storage, SSH config, etc.). Helps reason about macOS TCC prompts and privacy documentation.
-
-**Usage archive:** `usage/archive.rs` persists completed hourly aggregates into per-month JSONL files under `{app_data_dir}/usage-archive/`. Uses time-boundary partitioning for zero-overlap dedup: archive covers `[0..frontier]`, live source covers `(frontier..now]`.
-
-**Claude-specific parser:** `usage/claude_parser.rs` provides deep Claude Code JSONL parsing with change-event classification, subagent scope detection, and dedup logic separate from the generic parser.
-
-**Device aggregation:** `usage/device_aggregation.rs` builds device summaries and chart data from remote SSH parsed entries, handling provider filtering and timezone conversion.
-
-**MCP integration (archived):** The MCP modules (`detect.rs`, `mcp_process.rs`, `mcp_client.rs`, `mcp_adapter.rs`) have been moved to `archive/mcp/` as they were not yet wired into the active codebase. They can be restored when MCP integration is ready.
-
-**Note:** The `archive/` directory contains past code (ccusage CLI reporter, MCP modules, debug tools, old design docs) — none of it is part of the TokenMonitor build.
+Imperative subject, prefixed by type: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`, `chore(release):`. Scope in parentheses when useful (e.g. `fix(macos):`, `test(pricing):`).
 
 ## Versioning and Releases
 
