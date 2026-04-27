@@ -1348,6 +1348,7 @@ impl UsageParser {
             subagent_stats: None,
             device_breakdown: None,
             device_chart_buckets: None,
+            provider_detected: None,
         }
     }
 
@@ -1443,6 +1444,7 @@ impl UsageParser {
             subagent_stats: None,
             device_breakdown: None,
             device_chart_buckets: None,
+            provider_detected: None,
         }
     }
 
@@ -1551,6 +1553,7 @@ impl UsageParser {
             subagent_stats: None,
             device_breakdown: None,
             device_chart_buckets: None,
+            provider_detected: None,
         }
     }
 
@@ -1700,6 +1703,7 @@ impl UsageParser {
             subagent_stats: None,
             device_breakdown: None,
             device_chart_buckets: None,
+            provider_detected: None,
         }
     }
 }

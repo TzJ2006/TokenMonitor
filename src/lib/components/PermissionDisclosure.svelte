@@ -61,6 +61,9 @@
     overflow: hidden;
     background: var(--border-subtle);
   }
+  .permission-list-settings {
+    border-radius: 0;
+  }
 
   .permission-row {
     display: flex;

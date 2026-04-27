@@ -2,6 +2,7 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
 pub enum FloatBallAnchor {
     Top,
     Left,
@@ -100,6 +101,7 @@ pub struct FloatBallPosition {
 pub(crate) const BALL_SIZE: f64 = 56.0;
 pub(crate) const EXPANDED_W: f64 = 152.0; // ball (56) + panel (56 × 1.7 ≈ 96)
 pub(crate) const EXPANDED_H: f64 = 56.0; // same height as collapsed ball
+#[cfg(test)]
 pub(crate) const SNAP_THRESHOLD_PX: f64 = (BALL_SIZE / 2.0) * 1.5;
 pub(crate) const EXPAND_MARGIN: f64 = 8.0; // minimum gap from screen edges when expanded
 
@@ -144,34 +146,9 @@ pub(crate) fn ball_rect_from_window(
         FloatBallExpandDirection::Left => rect.x + rect.width - ball_size,
     };
 
-    #[cfg(target_os = "linux")]
-    let y = rect.y;
-    #[cfg(not(target_os = "linux"))]
-    let y = if !state.expanded || rect.width <= ball_size + 1 {
-        rect.y
-    } else {
-        match state.anchor {
-            Some(FloatBallAnchor::Top) => rect.y,
-            Some(FloatBallAnchor::Left)
-            | Some(FloatBallAnchor::Right)
-            | Some(FloatBallAnchor::Bottom)
-            | None => rect.y + rect.height - ball_size,
-        }
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    if !state.expanded || rect.width <= ball_size + 1 {
-        return FloatBallRect {
-            x: rect.x,
-            y: rect.y,
-            width: ball_size,
-            height: ball_size,
-        };
-    }
-
     FloatBallRect {
         x,
-        y,
+        y: rect.y,
         width: ball_size,
         height: ball_size,
     }
@@ -190,17 +167,14 @@ pub(crate) fn clamp_anchored_expand_x(
     inner_bounds: FloatBallBounds,
     target_x: i32,
     width: i32,
-    expand_direction: FloatBallExpandDirection,
+    _expand_direction: FloatBallExpandDirection,
 ) -> i32 {
     let max_x = inner_bounds.right - width;
     if max_x <= inner_bounds.left {
         return inner_bounds.left;
     }
 
-    match expand_direction {
-        FloatBallExpandDirection::Right => target_x.min(max_x),
-        FloatBallExpandDirection::Left => target_x.max(inner_bounds.left),
-    }
+    target_x.clamp(inner_bounds.left, max_x)
 }
 
 pub(crate) fn clamp_anchored_expand_y(
@@ -313,6 +287,7 @@ pub(crate) fn expanded_rect_from_ball(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn choose_float_ball_anchor(
     bounds: FloatBallBounds,
     ball_rect: FloatBallRect,
@@ -337,6 +312,19 @@ pub(crate) fn choose_float_ball_anchor(
         None
     } else {
         Some(closest)
+    }
+}
+
+pub(crate) fn choose_horizontal_snap_anchor(
+    bounds: FloatBallBounds,
+    ball_rect: FloatBallRect,
+) -> FloatBallAnchor {
+    let dist_left = (ball_rect.x - bounds.left).abs();
+    let dist_right = ((bounds.right - ball_rect.width) - ball_rect.x).abs();
+    if dist_left <= dist_right {
+        FloatBallAnchor::Left
+    } else {
+        FloatBallAnchor::Right
     }
 }
 
@@ -411,13 +399,12 @@ pub(crate) fn float_ball_state_for_layout(
     }
 }
 
-// ── Linux-specific pure geometry helpers ───────────────────────────────
+// ── Fixed-window pure geometry helpers ────────────────────────────────
 
-/// On Linux the float ball window is always expanded-size (never resized).
+/// The float ball window is always expanded-size (never resized).
 /// The ball sits at one end depending on expand direction.
 /// Returns the x-offset of the ball within the fixed window.
-#[cfg(target_os = "linux")]
-pub(crate) fn linux_ball_offset_x(
+pub(crate) fn ball_offset_x(
     expand_direction: FloatBallExpandDirection,
     sizes: &FloatBallSizes,
 ) -> i32 {
@@ -428,14 +415,13 @@ pub(crate) fn linux_ball_offset_x(
 }
 
 /// Compute the fixed-size window rect given the ball's screen position.
-#[cfg(target_os = "linux")]
-pub(crate) fn linux_window_rect_from_ball(
+pub(crate) fn window_rect_from_ball(
     ball_x: i32,
     ball_y: i32,
     expand_direction: FloatBallExpandDirection,
     sizes: &FloatBallSizes,
 ) -> FloatBallRect {
-    let offset = linux_ball_offset_x(expand_direction, sizes);
+    let offset = ball_offset_x(expand_direction, sizes);
     FloatBallRect {
         x: ball_x - offset,
         y: ball_y,
@@ -619,7 +605,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(rect.y, 400 - 56);
         #[cfg(not(target_os = "linux"))]
-        assert_eq!(rect.y, 400 - 28);
+        assert_eq!(rect.y, 400 - 56 + 28);
         assert_eq!(rect.height, 56);
     }
 
@@ -650,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_right_anchor_keeps_ball_at_the_edge() {
+    fn expanded_right_anchor_stays_on_screen() {
         let bounds = sample_bounds();
         #[cfg(target_os = "linux")]
         let ball_x = 544;
@@ -672,11 +658,13 @@ mod tests {
             sizes(8),
         );
 
-        assert_eq!(rect.x + rect.width - 56, ball_x);
+        assert!(rect.x >= 8, "left edge within margin");
+        assert!(rect.x + rect.width <= 592, "right edge within margin");
+        assert_eq!(rect.x + rect.width, 592);
     }
 
     #[test]
-    fn expanded_left_anchor_keeps_ball_at_the_edge() {
+    fn expanded_left_anchor_stays_on_screen() {
         let bounds = sample_bounds();
         #[cfg(target_os = "linux")]
         let ball_x = 0;
@@ -698,7 +686,9 @@ mod tests {
             sizes(8),
         );
 
-        assert_eq!(rect.x, ball_x);
+        assert!(rect.x >= 8, "left edge within margin");
+        assert!(rect.x + rect.width <= 592, "right edge within margin");
+        assert_eq!(rect.x, 8);
     }
 
     #[test]
@@ -890,6 +880,119 @@ mod tests {
         assert_eq!(
             choose_float_ball_anchor(bounds, ball_rect, 20),
             Some(FloatBallAnchor::Top)
+        );
+    }
+
+    #[test]
+    fn horizontal_snap_picks_left_when_closer() {
+        let bounds = sample_bounds();
+        let ball_rect = FloatBallRect {
+            x: 100,
+            y: 200,
+            width: 56,
+            height: 56,
+        };
+        assert_eq!(
+            choose_horizontal_snap_anchor(bounds, ball_rect),
+            FloatBallAnchor::Left,
+        );
+    }
+
+    #[test]
+    fn horizontal_snap_picks_right_when_closer() {
+        let bounds = sample_bounds();
+        let ball_rect = FloatBallRect {
+            x: 400,
+            y: 200,
+            width: 56,
+            height: 56,
+        };
+        assert_eq!(
+            choose_horizontal_snap_anchor(bounds, ball_rect),
+            FloatBallAnchor::Right,
+        );
+    }
+
+    #[test]
+    fn horizontal_snap_picks_left_when_equidistant() {
+        let bounds = sample_bounds();
+        let ball_rect = FloatBallRect {
+            x: 272,
+            y: 200,
+            width: 56,
+            height: 56,
+        };
+        assert_eq!(
+            choose_horizontal_snap_anchor(bounds, ball_rect),
+            FloatBallAnchor::Left,
+        );
+    }
+
+    #[test]
+    fn collapsed_left_anchor_half_hidden() {
+        let bounds = sample_bounds();
+        let ball_rect = FloatBallRect {
+            x: 30,
+            y: 200,
+            width: 56,
+            height: 56,
+        };
+        let rect = collapsed_rect_from_ball(bounds, ball_rect, Some(FloatBallAnchor::Left), 56);
+        #[cfg(target_os = "linux")]
+        assert_eq!(rect.x, 0);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(rect.x, -28);
+        assert_eq!(rect.y, 200);
+    }
+
+    #[test]
+    fn collapsed_right_anchor_half_hidden() {
+        let bounds = sample_bounds();
+        let ball_rect = FloatBallRect {
+            x: 500,
+            y: 150,
+            width: 56,
+            height: 56,
+        };
+        let rect = collapsed_rect_from_ball(bounds, ball_rect, Some(FloatBallAnchor::Right), 56);
+        #[cfg(target_os = "linux")]
+        assert_eq!(rect.x, 544);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(rect.x, 572);
+        assert_eq!(rect.y, 150);
+    }
+
+    #[test]
+    fn expand_from_half_hidden_left_stays_on_screen() {
+        let bounds = sample_bounds();
+        #[cfg(target_os = "linux")]
+        let ball_x = 0;
+        #[cfg(not(target_os = "linux"))]
+        let ball_x = -28;
+        let ball_rect = FloatBallRect {
+            x: ball_x,
+            y: 200,
+            width: 56,
+            height: 56,
+        };
+
+        let rect = expanded_rect_from_ball(
+            bounds,
+            ball_rect,
+            Some(FloatBallAnchor::Left),
+            FloatBallExpandDirection::Right,
+            sizes(8),
+        );
+
+        assert!(
+            rect.x >= 8,
+            "expanded rect x={} must be >= inner_bounds.left=8",
+            rect.x
+        );
+        assert!(
+            rect.x + rect.width <= 592,
+            "expanded rect right={} must be <= inner_bounds.right=592",
+            rect.x + rect.width
         );
     }
 }

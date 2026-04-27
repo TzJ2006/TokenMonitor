@@ -383,6 +383,7 @@ async fn try_fetch_claude_rate_limits() -> FetchAttempt {
         plan_tier,
         windows,
         extra_usage,
+        credits: None,
         stale: false,
         error: None,
         retry_after_seconds: None,

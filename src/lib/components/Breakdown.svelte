@@ -343,6 +343,11 @@
   .sub-row {
     display: flex; align-items: flex-start;
     min-height: 22px; padding: 4px 7px 4px 24px; gap: 7px;
+    border-radius: 5px;
+    transition: background var(--t-fast) ease;
+  }
+  .sub-row:hover {
+    background: var(--surface-2);
   }
   .sub-bar { width: 2px; height: 10px; border-radius: 1px; flex-shrink: 0; margin-top: 2px; }
   .sub-info { flex: 1; min-width: 0; }

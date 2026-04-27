@@ -37,6 +37,7 @@ export interface UsagePayload {
   subagent_stats: SubagentStats | null;
   device_breakdown: DeviceSummary[] | null;
   device_chart_buckets: ChartBucket[] | null;
+  provider_detected: boolean | null;
 }
 
 export interface ChartBucket {
@@ -173,11 +174,18 @@ export interface ExtraUsageInfo {
   utilization: number | null;
 }
 
+export interface CreditsInfo {
+  balance: number | null;
+  hasCredits: boolean;
+  unlimited: boolean;
+}
+
 export interface ProviderRateLimits {
   provider: string;
   planTier: string | null;
   windows: RateLimitWindow[];
   extraUsage: ExtraUsageInfo | null;
+  credits: CreditsInfo | null;
   stale: boolean;
   error: string | null;
   retryAfterSeconds: number | null;
@@ -205,6 +213,7 @@ export interface StatusWidgetSummary {
   totalCost: number;
   claudeUtil: number | null;
   codexUtil: number | null;
+  cursorUtil: number | null;
   title: string;
 }
 
