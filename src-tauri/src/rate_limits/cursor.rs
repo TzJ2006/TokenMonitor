@@ -100,6 +100,7 @@ fn build_cursor_rate_limits(resp: CursorPeriodUsageResponse) -> ProviderRateLimi
         plan_tier: None,
         windows,
         extra_usage,
+        credits: None,
         stale: false,
         error: None,
         retry_after_seconds: None,
