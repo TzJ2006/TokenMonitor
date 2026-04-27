@@ -5,20 +5,14 @@ pub(crate) use layout::FloatBallState;
 pub use layout::{FloatBallAnchor, FloatBallExpandDirection, FloatBallLayout, FloatBallPosition};
 
 use layout::{
-    ball_rect_from_window, choose_expand_direction, choose_float_ball_anchor,
+    ball_offset_x, ball_rect_from_window, choose_expand_direction, choose_horizontal_snap_anchor,
     collapsed_rect_from_ball, compute_scaled_sizes, float_ball_edge_distances,
-    float_ball_state_for_layout, inset_bounds, layout_float_ball_rect, FloatBallBounds,
-    FloatBallRect, BALL_SIZE, EXPANDED_H, EXPANDED_W, SNAP_THRESHOLD_PX,
+    float_ball_state_for_layout, inset_bounds, layout_float_ball_rect, window_rect_from_ball,
+    FloatBallBounds, FloatBallRect, FloatBallSizes, BALL_SIZE, EXPANDED_H, EXPANDED_W,
 };
-
-#[cfg(target_os = "linux")]
-use layout::FloatBallSizes;
 
 use super::AppState;
 use tauri::{Manager, WebviewWindow};
-
-#[cfg(target_os = "linux")]
-use layout::{linux_ball_offset_x, linux_window_rect_from_ball};
 
 // ── Window helpers (platform-specific) ─────────────────────────────────
 
@@ -81,9 +75,27 @@ fn current_float_ball_rect(window: &WebviewWindow) -> Result<FloatBallRect, Stri
     })
 }
 
-/// Set the GDK input shape so transparent regions are click-through.
+// ── Hit region management (per-platform click-through) ───────────────
+
+/// Update the clickable region of the float ball window.
 /// Collapsed: only the ball area accepts input.
 /// Expanded: the full window accepts input.
+#[allow(unused_variables)]
+fn update_hit_region(
+    window: &WebviewWindow,
+    expand_direction: FloatBallExpandDirection,
+    is_expanded: bool,
+    sizes: &FloatBallSizes,
+) {
+    #[cfg(target_os = "linux")]
+    update_linux_input_shape(window, expand_direction, is_expanded, sizes);
+
+    #[cfg(target_os = "windows")]
+    update_windows_hit_region(window, expand_direction, is_expanded, sizes);
+
+    // macOS: transparent pixels are naturally click-through (NSView hitTest).
+}
+
 #[cfg(target_os = "linux")]
 fn update_linux_input_shape(
     window: &WebviewWindow,
@@ -91,8 +103,14 @@ fn update_linux_input_shape(
     is_expanded: bool,
     sizes: &FloatBallSizes,
 ) {
+    if std::env::var("WAYLAND_DISPLAY").is_ok()
+        && std::env::var("GDK_BACKEND").ok().as_deref() != Some("x11")
+    {
+        tracing::warn!("float_ball input shape may not work on native Wayland");
+    }
+
     let scale = window.scale_factor().unwrap_or(1.0);
-    let ball_offset = linux_ball_offset_x(expand_direction, sizes);
+    let offset = ball_offset_x(expand_direction, sizes);
 
     let (shape_x, shape_y, shape_w, shape_h) = if is_expanded {
         (
@@ -102,7 +120,7 @@ fn update_linux_input_shape(
             (sizes.expanded_height as f64 / scale).round() as i32,
         )
     } else {
-        let logical_offset = (ball_offset as f64 / scale).round() as i32;
+        let logical_offset = (offset as f64 / scale).round() as i32;
         let logical_ball = (sizes.ball as f64 / scale).round() as i32;
         (logical_offset, 0, logical_ball, logical_ball)
     };
@@ -133,9 +151,31 @@ fn update_linux_input_shape(
     });
 }
 
+#[cfg(target_os = "windows")]
+fn update_windows_hit_region(
+    window: &WebviewWindow,
+    _expand_direction: FloatBallExpandDirection,
+    is_expanded: bool,
+    _sizes: &FloatBallSizes,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::SetWindowRgn;
+
+    let Ok(hwnd_raw) = window.hwnd() else {
+        return;
+    };
+    let hwnd = windows::Win32::Foundation::HWND(hwnd_raw.0 as *mut _);
+
+    unsafe {
+        // Expanded: full expanded-size window is clickable.
+        // Collapsed: window is ball-sized, so full window is also clickable.
+        let _ = SetWindowRgn(hwnd, None, true);
+    }
+    tracing::debug!(is_expanded, "float_ball windows hit region updated");
+}
+
+// ── Fixed-window GTK setup (Linux only) ──────────────────────────────
+
 /// One-time GTK setup for the fixed-size float ball window on Linux.
-/// Sets widget size_request, geometry hints, and disables WebKitGTK scrollbars
-/// so the window stays at exactly expanded_width × expanded_height.
 #[cfg(target_os = "linux")]
 fn setup_linux_fixed_window(window: &WebviewWindow, sizes: &FloatBallSizes) {
     let scale = window.scale_factor().unwrap_or(1.0);
@@ -190,48 +230,80 @@ fn setup_linux_fixed_window(window: &WebviewWindow, sizes: &FloatBallSizes) {
     });
 }
 
-#[allow(unused_variables)]
+// ── Window rect helpers (platform-aware) ────────────────────────────
+
+/// Compute the window rect for the current expand/collapse state.
+/// On macOS/Windows collapsed: window = ball size (no offset needed).
+/// On Linux or expanded: window = expanded size (with direction offset).
+fn window_rect_for_state(
+    ball_x: i32,
+    ball_y: i32,
+    expand_direction: FloatBallExpandDirection,
+    sizes: &FloatBallSizes,
+    expanded: bool,
+) -> FloatBallRect {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = expanded;
+        window_rect_from_ball(ball_x, ball_y, expand_direction, sizes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    if expanded {
+        window_rect_from_ball(ball_x, ball_y, expand_direction, sizes)
+    } else {
+        FloatBallRect {
+            x: ball_x,
+            y: ball_y,
+            width: sizes.ball,
+            height: sizes.ball,
+        }
+    }
+}
+
+/// Ball offset within the window for the current state.
+/// On macOS/Windows collapsed: 0 (window IS the ball).
+/// On Linux or expanded: standard direction-based offset.
+fn effective_offset(
+    expand_direction: FloatBallExpandDirection,
+    sizes: &FloatBallSizes,
+    expanded: bool,
+) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = expanded;
+        ball_offset_x(expand_direction, sizes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    if expanded {
+        ball_offset_x(expand_direction, sizes)
+    } else {
+        0
+    }
+}
+
+// ── Window positioning ───────────────────────────────────────────────
+
+/// Move the float ball window, optionally resizing it first.
 fn apply_float_ball_window_rect(
     window: &WebviewWindow,
     rect: FloatBallRect,
     resize: bool,
-    expand_direction: FloatBallExpandDirection,
+    _expand_direction: FloatBallExpandDirection,
 ) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(hwnd_raw) = window.hwnd() {
-            let hwnd = windows::Win32::Foundation::HWND(hwnd_raw.0 as *mut _);
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                    hwnd,
-                    None,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                );
-            }
-        }
+    #[cfg(not(target_os = "linux"))]
+    if resize {
+        window
+            .set_size(tauri::PhysicalSize::new(
+                rect.width as u32,
+                rect.height as u32,
+            ))
+            .map_err(|e| e.to_string())?;
     }
-
     #[cfg(target_os = "linux")]
-    {
-        window
-            .set_position(tauri::PhysicalPosition::new(rect.x, rect.y))
-            .map_err(|e| e.to_string())?;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let size = tauri::PhysicalSize::new(rect.width as u32, rect.height as u32);
-        let _ = window.set_size(size);
-        window
-            .set_position(tauri::PhysicalPosition::new(rect.x, rect.y))
-            .map_err(|e| e.to_string())?;
-    }
-
+    let _ = resize;
+    window
+        .set_position(tauri::PhysicalPosition::new(rect.x, rect.y))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -300,29 +372,14 @@ pub async fn create_float_ball(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let ball_x = bounds.right - sizes.ball;
     #[cfg(not(target_os = "linux"))]
-    let ball_x = bounds.right - (sizes.ball / 2);
+    let ball_x = bounds.right - sizes.ball / 2;
     let ball_y = bounds.bottom - sizes.ball;
-
-    #[cfg(target_os = "linux")]
-    let initial_direction = FloatBallExpandDirection::Left;
-    #[cfg(not(target_os = "linux"))]
     let initial_direction = FloatBallExpandDirection::Left;
 
-    #[cfg(target_os = "linux")]
-    let rect = linux_window_rect_from_ball(ball_x, ball_y, initial_direction, &sizes);
-    #[cfg(not(target_os = "linux"))]
-    let rect = FloatBallRect {
-        x: ball_x,
-        y: ball_y,
-        width: sizes.ball,
-        height: sizes.ball,
-    };
+    let rect = window_rect_for_state(ball_x, ball_y, initial_direction, &sizes, false);
 
     let initial_state = FloatBallState {
-        #[cfg(target_os = "linux")]
-        anchor: None,
-        #[cfg(not(target_os = "linux"))]
-        anchor: Some(FloatBallAnchor::Right),
+        anchor: Some(layout::FloatBallAnchor::Right),
         expand_direction: initial_direction,
         expanded: false,
         last_rect: Some(rect),
@@ -335,8 +392,7 @@ pub async fn create_float_ball(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     setup_linux_fixed_window(&window, &sizes);
 
-    #[cfg(target_os = "linux")]
-    update_linux_input_shape(&window, initial_direction, false, &sizes);
+    update_hit_region(&window, initial_direction, false, &sizes);
 
     {
         let state = app.state::<AppState>();
@@ -344,10 +400,13 @@ pub async fn create_float_ball(app: tauri::AppHandle) -> Result<(), String> {
         *float_state = initial_state;
     }
 
+    // Linux WMs may ignore the first set_position; retry with backoff.
     #[cfg(target_os = "linux")]
     {
         let w = window.clone();
         let target = rect;
+        let dir = initial_direction;
+        let s = sizes;
         std::thread::spawn(move || {
             for (attempt, delay_ms) in [100_u64, 200, 350, 500, 800].into_iter().enumerate() {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
@@ -362,6 +421,7 @@ pub async fn create_float_ball(app: tauri::AppHandle) -> Result<(), String> {
                             ?target,
                             "float_ball create position confirmed"
                         );
+                        update_linux_input_shape(&w, dir, false, &s);
                         return;
                     }
                     Ok(actual) => {
@@ -384,6 +444,7 @@ pub async fn create_float_ball(app: tauri::AppHandle) -> Result<(), String> {
                 }
 
                 let _ = w.set_position(tauri::PhysicalPosition::new(target.x, target.y));
+                update_linux_input_shape(&w, dir, false, &s);
             }
         });
     }
@@ -490,43 +551,16 @@ pub async fn set_float_ball_expanded(
         "float_ball set_expanded"
     );
 
-    #[cfg(target_os = "linux")]
-    {
-        let linux_rect =
-            linux_window_rect_from_ball(target_ball_rect.x, target_ball_rect.y, direction, &sizes);
-        apply_and_store_rect(&window, linux_rect, &mut float_state, false, direction)?;
-        update_linux_input_shape(&window, direction, expanded, &sizes);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        #[cfg(target_os = "windows")]
-        let collapse_hwnd = if !expanded {
-            window.hwnd().ok().map(|raw| {
-                let hwnd = windows::Win32::Foundation::HWND(raw.0 as *mut _);
-                unsafe {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                        hwnd,
-                        windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
-                    );
-                }
-                hwnd
-            })
-        } else {
-            None
-        };
-
-        apply_and_store_rect(&window, target_rect, &mut float_state, true, direction)?;
-
-        #[cfg(target_os = "windows")]
-        if let Some(hwnd) = collapse_hwnd {
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
-                );
-            }
-        }
-    }
+    let win_rect = window_rect_for_state(
+        target_ball_rect.x,
+        target_ball_rect.y,
+        direction,
+        &sizes,
+        expanded,
+    );
+    let needs_resize = cfg!(not(target_os = "linux"));
+    apply_and_store_rect(&window, win_rect, &mut float_state, needs_resize, direction)?;
+    update_hit_region(&window, direction, expanded, &sizes);
 
     float_state.expand_direction = direction;
     float_state.expanded = expanded;
@@ -536,40 +570,37 @@ pub async fn set_float_ball_expanded(
     })
 }
 
-/// Temporarily expand or restore the GDK input shape during drag.
+/// Temporarily expand or restore the hit region during drag.
 #[tauri::command]
 pub async fn set_float_ball_dragging(
-    #[allow(unused_variables)] app: tauri::AppHandle,
-    #[allow(unused_variables)] dragging: bool,
-    #[allow(unused_variables)] interaction_id: Option<String>,
+    app: tauri::AppHandle,
+    dragging: bool,
+    interaction_id: Option<String>,
 ) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        let Some(window) = app.get_webview_window("float-ball") else {
-            return Ok(());
-        };
-        let scale = window.scale_factor().map_err(|e| e.to_string())?;
-        let sizes = compute_scaled_sizes(scale);
-        let state = app.state::<AppState>();
-        let float_state = state.float_ball_state.read().await;
+    let Some(window) = app.get_webview_window("float-ball") else {
+        return Ok(());
+    };
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let sizes = compute_scaled_sizes(scale);
+    let state = app.state::<AppState>();
+    let float_state = state.float_ball_state.read().await;
 
-        if dragging {
-            update_linux_input_shape(&window, float_state.expand_direction, true, &sizes);
-        } else {
-            update_linux_input_shape(
-                &window,
-                float_state.expand_direction,
-                float_state.expanded,
-                &sizes,
-            );
-        }
-        tracing::debug!(
-            dragging,
-            interaction_id = interaction_id.as_deref().unwrap_or("n/a"),
-            expanded = float_state.expanded,
-            "float_ball dragging input shape"
+    if dragging {
+        update_hit_region(&window, float_state.expand_direction, true, &sizes);
+    } else {
+        update_hit_region(
+            &window,
+            float_state.expand_direction,
+            float_state.expanded,
+            &sizes,
         );
     }
+    tracing::debug!(
+        dragging,
+        interaction_id = interaction_id.as_deref().unwrap_or("n/a"),
+        expanded = float_state.expanded,
+        "float_ball dragging hit region"
+    );
     Ok(())
 }
 
@@ -611,69 +642,43 @@ pub async fn move_float_ball_to(
 
     let bounds = float_ball_bounds(&window)?;
 
-    #[cfg(target_os = "linux")]
-    let (clamp_rule, rect) = {
-        let ball_offset = linux_ball_offset_x(float_state.expand_direction, &sizes);
-        let ball_x = x + ball_offset;
-        let ball_y = y;
+    let offset = effective_offset(float_state.expand_direction, &sizes, float_state.expanded);
+    let ball_x = x + offset;
+    let ball_y = y;
 
-        let (rule, clamped_ball_x, clamped_ball_y) = if float_state.expanded {
-            let inner_bounds = inset_bounds(bounds, sizes.expand_margin);
-            (
-                "linux-expanded-inner-margin",
-                inner_bounds.clamp_x(ball_x, sizes.expanded_width),
-                inner_bounds.clamp_y(ball_y, sizes.expanded_height),
-            )
-        } else {
-            (
-                "linux-ball-full-visible",
-                bounds.clamp_x(ball_x, sizes.ball),
-                bounds.clamp_y(ball_y, sizes.ball),
-            )
-        };
-
-        let win_rect = linux_window_rect_from_ball(
-            clamped_ball_x,
-            clamped_ball_y,
-            float_state.expand_direction,
-            &sizes,
-        );
-        (rule, win_rect)
-    };
-    #[cfg(not(target_os = "linux"))]
-    let (clamp_rule, rect) = {
-        let (win_w, win_h) = if float_state.expanded {
-            (sizes.expanded_width, sizes.expanded_height)
-        } else {
-            (sizes.ball, sizes.ball)
-        };
-
-        let (rule, clamped_x, clamped_y) = if float_state.expanded {
-            let inner_bounds = inset_bounds(bounds, sizes.expand_margin);
-            (
-                "expanded-inner-margin",
-                inner_bounds.clamp_x(x, win_w),
-                inner_bounds.clamp_y(y, win_h),
-            )
-        } else {
-            let half = sizes.ball / 2;
-            (
-                "collapsed-half-visible",
-                x.clamp(bounds.left - half, bounds.right - win_w + half),
-                y.clamp(bounds.top - half, bounds.bottom - win_h + half),
-            )
-        };
-
+    let (clamp_rule, clamped_ball_x, clamped_ball_y) = if float_state.expanded {
+        let inner_bounds = inset_bounds(bounds, sizes.expand_margin);
         (
-            rule,
-            FloatBallRect {
-                x: clamped_x,
-                y: clamped_y,
-                width: win_w,
-                height: win_h,
-            },
+            "expanded-inner-margin",
+            inner_bounds.clamp_x(ball_x, sizes.expanded_width),
+            inner_bounds.clamp_y(ball_y, sizes.expanded_height),
+        )
+    } else {
+        let clamped_x = {
+            #[cfg(target_os = "linux")]
+            {
+                bounds.clamp_x(ball_x, sizes.ball)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let half_ball = sizes.ball / 2;
+                ball_x.clamp(bounds.left - half_ball, bounds.right - half_ball)
+            }
+        };
+        (
+            "collapsed-ball-half-visible",
+            clamped_x,
+            bounds.clamp_y(ball_y, sizes.ball),
         )
     };
+
+    let rect = window_rect_for_state(
+        clamped_ball_x,
+        clamped_ball_y,
+        float_state.expand_direction,
+        &sizes,
+        float_state.expanded,
+    );
     if rect.x != x || rect.y != y {
         tracing::debug!(
             interaction_id = interaction_id.as_deref().unwrap_or("n/a"),
@@ -711,7 +716,7 @@ pub async fn move_float_ball_to(
     Ok(())
 }
 
-/// Snap the float ball to the nearest screen edge (if within threshold).
+/// Snap the float ball to the nearest horizontal screen edge.
 #[tauri::command]
 pub async fn snap_float_ball(
     app: tauri::AppHandle,
@@ -727,7 +732,6 @@ pub async fn snap_float_ball(
 
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
     let sizes = compute_scaled_sizes(scale);
-    let snap_threshold_px = (SNAP_THRESHOLD_PX * scale).round() as i32;
     let bounds = float_ball_bounds(&window)?;
     let state = app.state::<AppState>();
     let mut float_state = state.float_ball_state.write().await;
@@ -748,10 +752,18 @@ pub async fn snap_float_ball(
     });
     let ball_rect = ball_rect_from_window(window_rect, *float_state, sizes.ball);
     let edge_distances = float_ball_edge_distances(bounds, ball_rect);
+
+    // Only snap when the ball center is within one ball diameter of any edge.
+    let snap_threshold = sizes.ball;
+    let min_edge_distance = edge_distances
+        .left
+        .min(edge_distances.right)
+        .min(edge_distances.top)
+        .min(edge_distances.bottom);
+
     tracing::info!(
         interaction_id = interaction_id.as_deref().unwrap_or("n/a"),
         scale,
-        snap_threshold_px,
         ?bounds,
         ?sizes,
         anchor = ?float_state.anchor,
@@ -759,21 +771,23 @@ pub async fn snap_float_ball(
         ?window_rect,
         ?ball_rect,
         ?edge_distances,
+        snap_threshold,
+        min_edge_distance,
         "float_ball snap requested"
     );
 
-    let Some(anchor) = choose_float_ball_anchor(bounds, ball_rect, snap_threshold_px) else {
-        float_state.anchor = None;
+    if min_edge_distance > snap_threshold {
         tracing::info!(
             interaction_id = interaction_id.as_deref().unwrap_or("n/a"),
-            snap_threshold_px,
-            ?bounds,
-            ?ball_rect,
-            ?edge_distances,
-            "float_ball snap skipped: no edge within threshold"
+            min_edge_distance,
+            snap_threshold,
+            "float_ball snap skipped: too far from edges"
         );
+        float_state.anchor = None;
         return Ok(());
-    };
+    }
+
+    let anchor = choose_horizontal_snap_anchor(bounds, ball_rect);
 
     let direction = choose_expand_direction(
         Some(anchor),
@@ -785,18 +799,8 @@ pub async fn snap_float_ball(
     );
 
     let snapped_ball = collapsed_rect_from_ball(bounds, ball_rect, Some(anchor), sizes.ball);
-    #[cfg(target_os = "linux")]
     let target_rect =
-        linux_window_rect_from_ball(snapped_ball.x, snapped_ball.y, direction, &sizes);
-    #[cfg(not(target_os = "linux"))]
-    let target_rect = layout_float_ball_rect(
-        bounds,
-        ball_rect,
-        Some(anchor),
-        float_state.expanded,
-        direction,
-        sizes,
-    );
+        window_rect_for_state(snapped_ball.x, snapped_ball.y, direction, &sizes, false);
 
     tracing::info!(
         interaction_id = interaction_id.as_deref().unwrap_or("n/a"),
@@ -809,15 +813,8 @@ pub async fn snap_float_ball(
         "float_ball snap resolved"
     );
 
-    #[cfg(target_os = "linux")]
-    {
-        apply_and_store_rect(&window, target_rect, &mut float_state, false, direction)?;
-        update_linux_input_shape(&window, direction, false, &sizes);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        apply_and_store_rect(&window, target_rect, &mut float_state, true, direction)?;
-    }
+    apply_and_store_rect(&window, target_rect, &mut float_state, false, direction)?;
+    update_hit_region(&window, direction, false, &sizes);
     float_state.anchor = Some(anchor);
     float_state.expand_direction = direction;
 
@@ -838,24 +835,21 @@ pub async fn get_float_ball_position(
         ?rect,
         "float_ball get_position"
     );
-    #[cfg(target_os = "linux")]
-    let ball_offset_x = {
+    let ball_offset = {
         let scale = app
             .get_webview_window("float-ball")
             .and_then(|w| w.scale_factor().ok())
             .unwrap_or(1.0);
         let sizes = compute_scaled_sizes(scale);
-        linux_ball_offset_x(float_state.expand_direction, &sizes)
+        effective_offset(float_state.expand_direction, &sizes, float_state.expanded)
     };
-    #[cfg(not(target_os = "linux"))]
-    let ball_offset_x = 0;
 
     Ok(FloatBallPosition {
         x: rect.x,
         y: rect.y,
         anchor: float_state.anchor,
         expanded: float_state.expanded,
-        ball_offset_x,
+        ball_offset_x: ball_offset,
     })
 }
 

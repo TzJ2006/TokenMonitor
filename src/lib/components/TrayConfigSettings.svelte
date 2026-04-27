@@ -35,6 +35,7 @@
         resetsAt: null,
       }],
       extraUsage: null,
+      credits: null,
       stale: false,
       error: null,
       cooldownUntil: null,
@@ -216,9 +217,7 @@
     margin-bottom: 8px;
   }
   .group-label {
-    font: 500 8px/1 'Inter', sans-serif;
-
-    letter-spacing: 0.8px;
+    font: 500 10px/1 'Inter', sans-serif;
     color: var(--t4);
     padding: 2px 4px 4px;
   }

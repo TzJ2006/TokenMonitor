@@ -115,9 +115,33 @@
 
   <div class="scroll">
     {#if loading}
-      <div class="placeholder">Loading...</div>
+      <div class="skeleton-cards" aria-busy="true" aria-label="Loading devices">
+        {#each [1, 2, 3] as _}
+          <div class="skeleton-card">
+            <div class="skeleton-row">
+              <div class="skeleton skeleton-dot"></div>
+              <div class="skeleton skeleton-text" style="width: 80px"></div>
+              <div class="skeleton skeleton-text-r" style="width: 40px"></div>
+            </div>
+            <div class="skeleton skeleton-bar"></div>
+            <div class="skeleton-row">
+              <div class="skeleton skeleton-text-sm" style="width: 60px"></div>
+              <div class="skeleton skeleton-text-sm" style="width: 30px"></div>
+            </div>
+          </div>
+        {/each}
+      </div>
     {:else if error}
-      <div class="placeholder error-text">{error}</div>
+      <div class="error-state">
+        <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="15" y1="9" x2="9" y2="15"></line>
+          <line x1="9" y1="9" x2="15" y2="15"></line>
+        </svg>
+        <div class="error-title">Failed to load devices</div>
+        <div class="error-text">{error}</div>
+        <button class="retry-btn" type="button" onclick={fetchDeviceData}>Retry</button>
+      </div>
     {:else if sortedDevices.length > 0}
       {#each sortedDevices as device (device.device)}
         <button
@@ -171,8 +195,14 @@
         </button>
       {/each}
     {:else}
-      <div class="placeholder">
-        No device data. Configure SSH hosts in Settings to see remote device costs.
+      <div class="empty-state">
+        <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+          <line x1="8" y1="21" x2="16" y2="21"></line>
+          <line x1="12" y1="17" x2="12" y2="21"></line>
+        </svg>
+        <div class="empty-title">No device data</div>
+        <div class="empty-text">Configure SSH hosts in Settings to see remote device costs.</div>
       </div>
     {/if}
   </div>
@@ -243,14 +273,64 @@
     padding: 0 10px 10px;
   }
 
-  .placeholder {
+  /* ── Skeleton loading ── */
+  .skeleton-cards { padding: 0 10px; }
+  .skeleton-card {
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    background: var(--surface-2);
+    border-radius: 8px;
+  }
+  .skeleton-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .skeleton-dot { width: 6px; height: 6px; border-radius: 50%; }
+  .skeleton-text { height: 10px; }
+  .skeleton-text-r { height: 10px; margin-left: auto; }
+  .skeleton-bar { height: 4px; width: 100%; margin-bottom: 6px; }
+  .skeleton-text-sm { height: 8px; }
+
+  /* ── Empty & error states ── */
+  .empty-state, .error-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
     padding: 30px 10px;
     text-align: center;
-    font: 400 10px/1.6 'Inter', sans-serif;
+  }
+  .empty-icon { display: block; margin-bottom: 4px; opacity: 0.6; }
+  .empty-title, .error-title {
+    font: 500 11px/1 'Inter', sans-serif;
+    color: var(--t1);
+  }
+  .empty-text {
+    font: 400 9px/1.4 'Inter', sans-serif;
     color: var(--t3);
+    max-width: 220px;
   }
   .error-text {
+    font: 400 9px/1.4 'Inter', sans-serif;
     color: #ef4444;
+    max-width: 220px;
+  }
+  .retry-btn {
+    margin-top: 8px;
+    padding: 5px 12px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--t2);
+    font: 500 9px/1 'Inter', sans-serif;
+    cursor: pointer;
+    transition: background var(--t-fast) ease, color var(--t-fast) ease;
+  }
+  .retry-btn:hover {
+    background: var(--surface-hover);
+    color: var(--t1);
   }
 
   .device-card {
@@ -267,6 +347,7 @@
   }
   .device-card:hover {
     border-color: var(--t4);
+    background: var(--surface-hover);
   }
 
   .device-header {
