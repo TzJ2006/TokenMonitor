@@ -554,7 +554,9 @@ pub(crate) async fn get_usage_data_inner(
 
     let payload = match selection {
         UsageIntegrationSelection::Single(integration_id) => {
-            let payload = get_provider_data(parser, provider, period, offset)?;
+            let mut payload = get_provider_data(parser, provider, period, offset)?;
+            payload.provider_detected =
+                Some(integration_id.detect_roots().iter().any(|r| r.exists()));
             set_last_usage_debug(
                 state,
                 UsageDebugReport {

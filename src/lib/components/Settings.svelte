@@ -3,15 +3,22 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { settings, updateSetting, type Settings as SettingsType } from "../stores/settings.js";
+  import {
+    getVisibleHeaderProviders,
+    settings,
+    updateSetting,
+    type Settings as SettingsType,
+  } from "../stores/settings.js";
   import { clearUsageCache } from "../stores/usage.js";
   import { updaterStore, checkNow, setAutoCheck } from "../stores/updater.js";
   import { isMacOS, isWindows } from "../utils/platform.js";
+  import { currencySymbol } from "../utils/format.js";
   import { logger } from "../utils/logger.js";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
+  import SegmentedControl from "./SegmentedControl.svelte";
   import ToggleSwitch from "./ToggleSwitch.svelte";
 
-  import ThemeSettings from "./ThemeSettings.svelte";
+  import AppearanceSettings from "./AppearanceSettings.svelte";
   import HeaderTabsSettings from "./HeaderTabsSettings.svelte";
   import TrayConfigSettings from "./TrayConfigSettings.svelte";
   import HiddenModelsSettings from "./HiddenModelsSettings.svelte";
@@ -29,6 +36,8 @@
   let checking = $state(false);
   let cursorAuthStatus = $state<CursorAuthStatus | null>(null);
   let cursorAuthMessage = $state<string | null>(null);
+  let cursorExpanded = $state(false);
+  let privacyExpanded = $state(false);
 
   type CursorAuthStatus = {
     source: string;
@@ -52,11 +61,29 @@
 
   const currencies = [
     { value: "USD", label: "USD ($)" },
-    { value: "EUR", label: "EUR (\u20ac)" },
-    { value: "GBP", label: "GBP (\u00a3)" },
-    { value: "JPY", label: "JPY (\u00a5)" },
-    { value: "CNY", label: "CNY (\u00a5)" },
+    { value: "EUR", label: "EUR (€)" },
+    { value: "GBP", label: "GBP (£)" },
+    { value: "JPY", label: "JPY (¥)" },
+    { value: "CNY", label: "CNY (¥)" },
   ];
+
+  let defaultProviderOptions = $derived.by(() =>
+    getVisibleHeaderProviders(current.headerTabs).map((provider) => ({
+      value: provider,
+      label: current.headerTabs[provider].label,
+    })),
+  );
+
+  let costInput = $state("50.00");
+  let costEnabled = $state(true);
+  let costInputFocused = $state(false);
+
+  $effect(() => {
+    costEnabled = current.costAlertThreshold > 0;
+    if (!costInputFocused) {
+      costInput = current.costAlertThreshold > 0 ? current.costAlertThreshold.toFixed(2) : "50.00";
+    }
+  });
 
   onMount(() => {
     getVersion().then((v) => { appVersion = v; }).catch((e) => logger.debug("settings", `getVersion failed: ${e}`));
@@ -70,8 +97,39 @@
       .catch((e) => logger.debug("settings", `isEnabled check failed: ${e}`));
   });
 
+  function handleProvider(val: string) {
+    updateSetting("defaultProvider", val as SettingsType["defaultProvider"]);
+  }
+
+  function handlePeriod(val: string) {
+    updateSetting("defaultPeriod", val as SettingsType["defaultPeriod"]);
+  }
+
   function handleCurrency(val: string) {
     updateSetting("currency", val as string);
+  }
+
+  function handleCostBlur() {
+    const val = parseFloat(costInput);
+    if (!isNaN(val) && val >= 0) {
+      updateSetting("costAlertThreshold", val);
+      costInput = val.toFixed(2);
+    } else {
+      costInput = current.costAlertThreshold.toFixed(2);
+    }
+  }
+
+  function handleCostKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      (e.target as HTMLInputElement).blur();
+    }
+  }
+
+  function handleRefresh(val: string) {
+    const interval = parseInt(val, 10) || 0;
+    logger.info("settings", `Refresh interval IPC: ${interval}s`);
+    updateSetting("refreshInterval", interval);
+    invoke("set_refresh_interval", { interval }).catch((e) => logger.debug("settings", `set_refresh_interval failed: ${e}`));
   }
 
   function cursorStatusLabel(status: CursorAuthStatus | null): string {
@@ -234,60 +292,148 @@
   </div>
 
   <div class="scroll">
-    <ThemeSettings />
-    <HeaderTabsSettings />
-    <TrayConfigSettings />
-    <HiddenModelsSettings />
-    <SshHostsSettings />
+    <!-- 1. Appearance -->
+    <AppearanceSettings />
 
+    <!-- 2. Display -->
     <div class="group">
-      <div class="group-label">Cursor Usage</div>
+      <div class="group-label">Display</div>
       <div class="card">
         <div class="row border">
-          <span class="label">Connection</span>
-          <span class="status status-{cursorStatusTone(cursorAuthStatus)}">
-            <span class="status-dot"></span>{cursorStatusLabel(cursorAuthStatus)}
-          </span>
-        </div>
-        <div class="cursor-section border">
-          <label class="label" for="cursor-api-key">Official API Key</label>
-          <input
-            id="cursor-api-key"
-            class="secret-input"
-            type="password"
-            autocomplete="off"
-            placeholder="key_..."
-            value={current.cursorApiKey}
-            oninput={(e) => handleCursorApiKeyInput((e.target as HTMLInputElement).value)}
+          <span class="label">Default Provider</span>
+          <SegmentedControl
+            options={defaultProviderOptions}
+            value={current.defaultProvider}
+            onChange={handleProvider}
           />
-          <div class="hint">
-            Preferred path. Create an Admin API key in Cursor Dashboard settings, then paste it here.
+        </div>
+        <div class="row border">
+          <span class="label">Default Period</span>
+          <SegmentedControl
+            options={[
+              { value: "5h", label: "5H" },
+              { value: "day", label: "Day" },
+              { value: "week", label: "Week" },
+              { value: "month", label: "Mo" },
+            ]}
+            value={current.defaultPeriod}
+            onChange={handlePeriod}
+          />
+        </div>
+        <div class="row border">
+          <span class="label">Currency</span>
+          <select
+            class="currency-select"
+            value={current.currency}
+            onchange={(e) => handleCurrency((e.target as HTMLSelectElement).value)}
+          >
+            {#each currencies as cur}
+              <option value={cur.value}>{cur.label}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="row border">
+          <span class="label">Cost Alert</span>
+          <div class="cost-row-right">
+            {#if costEnabled}
+              <div class="cost-input">
+                <span class="dollar">{currencySymbol()}</span>
+                <input
+                  type="text"
+                  bind:value={costInput}
+                  onfocus={() => { costInputFocused = true; }}
+                  onblur={() => { costInputFocused = false; handleCostBlur(); }}
+                  onkeydown={handleCostKeydown}
+                  class="cost-field"
+                />
+              </div>
+            {/if}
+            <ToggleSwitch
+              checked={costEnabled}
+              onChange={(checked) => {
+                costEnabled = checked;
+                if (!checked) {
+                  updateSetting("costAlertThreshold", 0);
+                } else {
+                  const val = parseFloat(costInput);
+                  updateSetting("costAlertThreshold", !isNaN(val) && val > 0 ? val : 50);
+                }
+              }}
+            />
           </div>
-          <div class="cursor-actions">
-            <button
-              type="button"
-              class="secondary-btn"
-              onclick={openCursorDashboard}
-            >
-              click me to find your cursor API key
-            </button>
-          </div>
-          <div class="hint">
-            In Cursor Dashboard, open Settings → Advanced → Admin API Keys.
-          </div>
-          {#if cursorAuthMessage || cursorAuthStatus?.lastWarning}
-            <div class="cursor-message">{cursorAuthMessage ?? cursorAuthStatus?.lastWarning}</div>
-          {/if}
+        </div>
+        <div class="row">
+          <span class="label">Model Change Stats</span>
+          <ToggleSwitch
+            checked={current.showModelChangeStats}
+            onChange={(checked) => updateSetting("showModelChangeStats", checked)}
+          />
         </div>
       </div>
     </div>
 
+    <!-- 3. Visibility -->
     <div class="group">
-      <div class="group-label">Privacy & Permissions</div>
-      <PermissionDisclosure mode="settings" />
+      <div class="group-label">Visibility</div>
+      <HeaderTabsSettings />
+      <HiddenModelsSettings />
+      <SshHostsSettings />
     </div>
 
-    <!-- System -->
+    <!-- 4. Menu Bar / Floating Ball -->
+    <TrayConfigSettings />
+
+    <!-- 5. Integrations -->
+    <div class="group">
+      <div class="group-label">Integrations</div>
+      <div class="card">
+        <button class="row collapsible-toggle" type="button" onclick={() => (cursorExpanded = !cursorExpanded)}>
+          <span class="label">Cursor</span>
+          <div class="collapsible-right">
+            <span class="status status-{cursorStatusTone(cursorAuthStatus)}">
+              <span class="status-dot"></span>{cursorStatusLabel(cursorAuthStatus)}
+            </span>
+            <svg class="collapsible-chevron" class:open={cursorExpanded} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </div>
+        </button>
+        <div class="cursor-collapse" class:open={cursorExpanded}>
+          <div class="cursor-section">
+            <label class="label" for="cursor-api-key">Official API Key</label>
+            <input
+              id="cursor-api-key"
+              class="secret-input"
+              type="password"
+              autocomplete="off"
+              placeholder="key_..."
+              value={current.cursorApiKey}
+              oninput={(e) => handleCursorApiKeyInput((e.target as HTMLInputElement).value)}
+            />
+            <div class="hint">
+              Preferred path. Create an Admin API key in Cursor Dashboard settings, then paste it here.
+            </div>
+            <div class="cursor-actions">
+              <button
+                type="button"
+                class="secondary-btn"
+                onclick={openCursorDashboard}
+              >
+                click me to find your cursor API key
+              </button>
+            </div>
+            <div class="hint">
+              In Cursor Dashboard, open Settings → Advanced → Admin API Keys.
+            </div>
+            {#if cursorAuthMessage || cursorAuthStatus?.lastWarning}
+              <div class="cursor-message">{cursorAuthMessage ?? cursorAuthStatus?.lastWarning}</div>
+            {/if}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 6. System -->
     <div class="group">
       <div class="group-label">System</div>
       <div class="card">
@@ -324,23 +470,24 @@
         </div>
         {/if}
         <div class="row border">
+          <span class="label">Refresh</span>
+          <SegmentedControl
+            options={[
+              { value: "30", label: "30s" },
+              { value: "60", label: "1m" },
+              { value: "300", label: "5m" },
+              { value: "0", label: "Off" },
+            ]}
+            value={String(current.refreshInterval)}
+            onChange={handleRefresh}
+          />
+        </div>
+        <div class="row border">
           <span class="label">Debug Logging</span>
           <ToggleSwitch
             checked={current.debugLogging}
             onChange={handleDebugLogging}
           />
-        </div>
-        <div class="row border">
-          <span class="label">Currency</span>
-          <select
-            class="currency-select"
-            value={current.currency}
-            onchange={(e) => handleCurrency((e.target as HTMLSelectElement).value)}
-          >
-            {#each currencies as cur}
-              <option value={cur.value}>{cur.label}</option>
-            {/each}
-          </select>
         </div>
         <div class="row center">
           <div class="actions">
@@ -354,7 +501,7 @@
       </div>
     </div>
 
-    <!-- Updates -->
+    <!-- 7. Updates -->
     <div class="group">
       <div class="group-label">Updates</div>
       <div class="card">
@@ -400,6 +547,24 @@
 
     <div class="update-bottom">
       <UpdateBanner />
+    </div>
+
+    <!-- 8. Privacy & Permissions -->
+    <div class="group">
+      <div class="group-label">Privacy & Permissions</div>
+      <div class="card">
+        <button class="row collapsible-toggle" type="button" onclick={() => (privacyExpanded = !privacyExpanded)}>
+          <span class="label">Permissions</span>
+          <div class="collapsible-right">
+            <svg class="collapsible-chevron" class:open={privacyExpanded} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </div>
+        </button>
+        <div class="privacy-collapse" class:open={privacyExpanded}>
+          <PermissionDisclosure mode="settings" />
+        </div>
+      </div>
     </div>
 
     <div class="quit-section">
@@ -455,8 +620,7 @@
   }
 
   .group-label {
-    font: 500 8px/1 'Inter', sans-serif;
-
+    font: 500 10px/1 'Inter', sans-serif;
     color: var(--t4);
     padding: 2px 4px 4px;
   }
@@ -480,11 +644,48 @@
     justify-content: center;
   }
 
+  .collapsible-toggle {
+    width: 100%;
+    background: none;
+    border: none;
+    cursor: pointer;
+    user-select: none;
+  }
+  .collapsible-toggle:hover {
+    background: var(--surface-hover);
+  }
+  .collapsible-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .collapsible-chevron {
+    color: var(--t3);
+    transition: transform var(--t-normal) ease;
+    transform: rotate(-90deg);
+  }
+  .collapsible-chevron.open {
+    transform: rotate(0deg);
+  }
+  .cursor-collapse {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height var(--t-normal) ease;
+  }
+  .cursor-collapse.open {
+    max-height: 300px;
+  }
+  .privacy-collapse {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height var(--t-normal) ease;
+  }
+  .privacy-collapse.open {
+    max-height: 800px;
+  }
+
   .cursor-section {
     padding: 8px 10px;
-  }
-  .cursor-section.border {
-    border-bottom: 1px solid var(--border-subtle);
   }
   .secret-input {
     width: 100%;
@@ -599,6 +800,35 @@
     outline: none;
     -webkit-appearance: none;
     appearance: none;
+  }
+
+  .cost-row-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .cost-input {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .dollar {
+    font: 400 9px/1 'Inter', sans-serif;
+    color: var(--t3);
+  }
+  .cost-field {
+    background: var(--surface-hover);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 3px 6px;
+    width: 54px;
+    text-align: right;
+    font: 400 9px/1 'Inter', sans-serif;
+    color: var(--t1);
+    outline: none;
+  }
+  .cost-field:focus {
+    border-color: var(--t3);
   }
 
   .reset-btn {

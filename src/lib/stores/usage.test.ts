@@ -59,6 +59,7 @@ function makePayload(overrides: Partial<UsagePayload> = {}): UsagePayload {
     usage_warning: null,
     device_breakdown: null,
     device_chart_buckets: null,
+    provider_detected: null,
     ...overrides,
   };
 }

@@ -16,11 +16,17 @@
 
   let current = $derived($settings as SettingsType);
 
+  let expanded = $state(false);
+
   const HEADER_TAB_FIELDS: Array<{ provider: UsageProvider; title: string }> = USAGE_PROVIDER_ORDER.map(
     (provider) => ({
       provider,
       title: getUsageProviderTitle(provider),
     }),
+  );
+
+  let enabledCount = $derived(
+    HEADER_TAB_FIELDS.filter((tab) => current.headerTabs[tab.provider].enabled).length,
   );
 
   function createHeaderLabelInputs(nextHeaderTabs: SettingsType["headerTabs"]): Record<string, string> {
@@ -81,9 +87,17 @@
   }
 </script>
 
-<div class="group">
-  <div class="group-label">Header</div>
-  <div class="card">
+<div class="card">
+  <button class="row toggle-row" type="button" onclick={() => (expanded = !expanded)}>
+    <span class="label">Provider</span>
+    <div class="toggle-right">
+      <span class="toggle-count">{enabledCount} of {HEADER_TAB_FIELDS.length} enabled</span>
+      <svg class="toggle-chevron" class:open={expanded} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="6 9 12 15 18 9"></polyline>
+      </svg>
+    </div>
+  </button>
+  <div class="collapse" class:open={expanded}>
     {#each HEADER_TAB_FIELDS as tab, index}
       <div class="row header-tab-row" class:border={index < HEADER_TAB_FIELDS.length - 1}>
         <span class="header-source">{tab.title}</span>
@@ -103,20 +117,9 @@
       </div>
     {/each}
   </div>
-  <div class="setting-note">Labels are cosmetic. Usage data is still backed by the registered usage integrations.</div>
 </div>
 
 <style>
-  .group {
-    margin-bottom: 8px;
-  }
-  .group-label {
-    font: 500 8px/1 'Inter', sans-serif;
-
-    letter-spacing: 0.8px;
-    color: var(--t4);
-    padding: 2px 4px 4px;
-  }
   .card {
     background: var(--surface-2);
     border-radius: 8px;
@@ -130,6 +133,46 @@
   }
   .row.border {
     border-bottom: 1px solid var(--border-subtle);
+  }
+  .toggle-row {
+    width: 100%;
+    background: none;
+    border: none;
+    border-bottom: 1px solid var(--border-subtle);
+    cursor: pointer;
+    user-select: none;
+  }
+  .toggle-row:hover {
+    background: var(--surface-hover);
+  }
+  .toggle-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .toggle-count {
+    font: 400 9px/1 'Inter', sans-serif;
+    color: var(--t3);
+  }
+  .toggle-chevron {
+    color: var(--t3);
+    transition: transform var(--t-normal) ease;
+    transform: rotate(-90deg);
+  }
+  .toggle-chevron.open {
+    transform: rotate(0deg);
+  }
+  .collapse {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height var(--t-normal) ease;
+  }
+  .collapse.open {
+    max-height: 300px;
+  }
+  .label {
+    font: 400 10px/1 'Inter', sans-serif;
+    color: var(--t1);
   }
   .header-tab-row {
     gap: 8px;
@@ -153,10 +196,5 @@
   .text-input:focus {
     outline: none;
     border-color: var(--border);
-  }
-  .setting-note {
-    font: 400 8px/1.35 'Inter', sans-serif;
-    color: var(--t4);
-    padding: 4px 4px 0;
   }
 </style>

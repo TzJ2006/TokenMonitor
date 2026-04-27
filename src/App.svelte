@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { get } from "svelte/store";
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
@@ -25,6 +25,7 @@
     getAdjacentWarmProviders,
     getRateLimitIdleSummary,
     getUsageProviderLabel,
+    getUsageProviderTitle,
     isRateLimitProvider,
     rateLimitProvidersForScope,
   } from "./lib/providerMetadata.js";
@@ -121,6 +122,60 @@
   let initialDataLoad: Promise<void> | null = null;
   const REMOTE_USAGE_CACHE_PROVIDERS: UsageProvider[] = [ALL_USAGE_PROVIDER_ID, "claude"];
 
+  // ── View transition logic ──
+  type ViewKey = 'splash' | 'welcome' | 'setup' | 'settings' | 'calendar' | 'single-device' | 'devices' | 'main' | 'loading';
+  const DRILL_VIEWS: ViewKey[] = ['settings', 'calendar', 'devices', 'single-device'];
+
+  let viewKey = $derived.by<ViewKey>(() => {
+    if (showSplash) return 'splash';
+    if (!$settings.hasSeenWelcome) return 'welcome';
+    if (appReady && !data) return 'setup';
+    if (showSettings) return 'settings';
+    if (showCalendar) return 'calendar';
+    if (selectedDevice) return 'single-device';
+    if (showDevices) return 'devices';
+    if (data) return 'main';
+    return 'loading';
+  });
+
+  let prevViewKey: ViewKey = 'splash';
+  let viewTransitionClass = $state('');
+
+  const NO_TRANSITION_VIEWS: ViewKey[] = ['splash', 'loading'];
+
+  $effect(() => {
+    const current = viewKey;
+    const prev = untrack(() => prevViewKey);
+    if (current === prev) return;
+
+    if (NO_TRANSITION_VIEWS.includes(current) || NO_TRANSITION_VIEWS.includes(prev)) {
+      viewTransitionClass = '';
+    } else {
+      const isDrillIn = DRILL_VIEWS.includes(current) && !DRILL_VIEWS.includes(prev);
+      const isDrillOut = !DRILL_VIEWS.includes(current) && DRILL_VIEWS.includes(prev);
+      const isDeeper = DRILL_VIEWS.indexOf(current) > DRILL_VIEWS.indexOf(prev) && DRILL_VIEWS.includes(current) && DRILL_VIEWS.includes(prev);
+
+      if (isDrillIn || isDeeper) {
+        viewTransitionClass = 'view-enter-right';
+      } else if (isDrillOut) {
+        viewTransitionClass = 'view-enter-left';
+      } else {
+        viewTransitionClass = 'view-enter-fade';
+      }
+      resizeOrch?.followContentDuringTransition(200, `view-transition-${current}`);
+    }
+    prevViewKey = current;
+  });
+
+  // ── Data content fade on provider/period/offset switch ──
+  let dataKey = $derived(`${provider}-${period}-${offset}`);
+  let dataTransitionCounter = $state(0);
+
+  $effect(() => {
+    void dataKey;
+    dataTransitionCounter = untrack(() => dataTransitionCounter) + 1;
+  });
+
   let headerToggleOptions = $derived.by(() =>
     getVisibleHeaderProviders(headerTabs).map((value) => ({
       value,
@@ -192,6 +247,17 @@
     }
     if (p === "day") return "A quiet day";
     return "No usage data for this period";
+  }
+
+  function providerNotInstalledTitle(p: UsageProvider): string {
+    return `${getUsageProviderTitle(p)} not installed`;
+  }
+
+  function providerNotInstalledHint(p: UsageProvider): string {
+    if (p === "claude") return "Install Claude Code CLI to start tracking usage.";
+    if (p === "codex") return "Install Codex CLI to start tracking usage.";
+    if (p === "cursor") return "Install Cursor IDE to start tracking usage.";
+    return "Install the provider to start tracking usage.";
   }
 
   async function loadInitialData() {
@@ -499,6 +565,9 @@
         logResizeDebug("window:focus", captureSnapshot("window-focus"));
         void syncNativeWindowSurface(undefined, get(settings).glassEffect).catch((e) => logger.debug("appearance", `syncNativeWindowSurface failed: ${e}`));
         syncSizeAndVerify("window-focus");
+        clearUsageCache();
+        fetchData(provider, period, offset);
+        if (period === "5h") fetchRateLimits(provider);
       },
       onBlur: () => {
         logResizeDebug("window:blur", captureSnapshot("window-blur"));
@@ -635,18 +704,19 @@
     {#if showSplash}
       <SplashScreen ready={appReady} onComplete={() => { showSplash = false; tick().then(() => syncSizeAndVerify("splash-complete")); }} />
     {:else if !$settings.hasSeenWelcome}
-      <WelcomeCard onDismiss={handleWelcomeDismiss} />
+      <div class={viewTransitionClass}><WelcomeCard onDismiss={handleWelcomeDismiss} /></div>
     {:else if appReady && !data}
-      <SetupScreen />
+      <div class={viewTransitionClass}><SetupScreen /></div>
     {:else if showSettings}
-      <Settings onBack={handleSettingsClose} />
+      <div class={viewTransitionClass}><Settings onBack={handleSettingsClose} /></div>
     {:else if showCalendar}
-      <Calendar onBack={handleCalendarClose} />
+      <div class={viewTransitionClass}><Calendar onBack={handleCalendarClose} /></div>
     {:else if selectedDevice}
-      <SingleDeviceView device={selectedDevice} onBack={handleDeviceBack} />
+      <div class={viewTransitionClass}><SingleDeviceView device={selectedDevice} onBack={handleDeviceBack} /></div>
     {:else if showDevices}
-      <DevicesView onBack={() => { showDevices = false; }} onDeviceSelect={handleDeviceSelect} onSettings={handleSettingsOpen} />
+      <div class={viewTransitionClass}><DevicesView onBack={() => { showDevices = false; }} onDeviceSelect={handleDeviceSelect} onSettings={handleSettingsOpen} /></div>
     {:else if data}
+      <div class={viewTransitionClass}>
       {#if showRefresh}<div class="refresh-bar" aria-hidden="true"></div>{/if}
       <Toggle
         active={provider}
@@ -671,6 +741,7 @@
           <div class="loading-text">Loading data...</div>
         </div>
       {:else}
+        <div class="data-content" style:animation-name={dataTransitionCounter > 1 ? 'contentFade' : 'none'}>
         <MetricsRow {data} />
         {#if data.usage_warning && data.usage_warning !== dismissedWarningText}
           <div class="usage-warning">
@@ -742,8 +813,24 @@
             </div>
           {/if}
           <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} deviceBuckets={data.device_chart_buckets} />
+        {:else if period === "5h" && data.provider_detected === false}
+          <div class="rate-limit-empty">
+            <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            <div class="rate-limit-empty-title">No limit for API billing</div>
+            <div class="rate-limit-empty-text">
+              {providerNotInstalledHint(provider)}
+            </div>
+          </div>
         {:else if period === "5h" && !$settings.rateLimitsEnabled}
           <div class="rate-limit-empty">
+            <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </svg>
             <div class="rate-limit-empty-title">Live rate limits are off</div>
             <div class="rate-limit-empty-text">
               Turn this on to see live 5h and weekly rate-limit percentages.
@@ -759,9 +846,21 @@
             </button>
           </div>
         {:else if period === "5h" && rateLimitsRequest.loading}
-          <div class="loading-bars"><div class="spinner"></div></div>
+          <div class="rate-limit-skeleton" aria-busy="true">
+            {#each [1, 2] as _}
+              <div class="rate-limit-skeleton-row">
+                <div class="skeleton" style="width: 50px; height: 8px"></div>
+                <div class="skeleton" style="width: 100%; height: 14px; border-radius: 7px"></div>
+              </div>
+            {/each}
+          </div>
         {:else if period === "5h"}
           <div class="rate-limit-empty">
+            <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
             <div class="rate-limit-empty-title">Rate limits unavailable</div>
             <div class="rate-limit-empty-text">
               {#if isRateLimitProvider(provider) && (data.total_tokens > 0 || data.total_cost > 0)}
@@ -782,7 +881,24 @@
             {/if}
           </div>
         {:else if data.total_cost === 0 && data.total_tokens === 0}
-          <div class="empty-period">{emptyPeriodLabel(period, offset)}</div>
+          <div class="empty-period">
+            {#if data.provider_detected === false}
+              <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+              <span class="empty-title">{providerNotInstalledTitle(provider)}</span>
+              <span class="empty-subtitle">{providerNotInstalledHint(provider)}</span>
+            {:else}
+              <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+                <path d="M2 17l10 5 10-5"></path>
+                <path d="M2 12l10 5 10-5"></path>
+              </svg>
+              <span>{emptyPeriodLabel(period, offset)}</span>
+            {/if}
+          </div>
         {:else}
           <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} deviceBuckets={data.device_chart_buckets} />
         {/if}
@@ -799,8 +915,10 @@
             onToggleDeviceStats={handleToggleDeviceStats}
           />
         {/if}
+      </div>
       {/if}
       <Footer {data} {provider} {period} {rateLimits} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} onDevices={() => { showDevices = true; }} />
+      </div>
     {:else}
       <div class="loading">
         <div class="spinner"></div>
@@ -974,9 +1092,63 @@
     100% { background-position: -200% 0; }
   }
   .empty-period {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
     text-align: center;
     color: var(--t3);
     font: 400 10px/1 'Inter', sans-serif;
     padding: 32px 0;
+  }
+
+  /* ── View entrance transitions ── */
+  .view-enter-fade {
+    animation: viewFadeIn var(--t-normal) var(--ease-out) both;
+  }
+  .view-enter-right {
+    animation: viewSlideInRight var(--t-normal) var(--ease-out) both;
+  }
+  .view-enter-left {
+    animation: viewSlideInLeft var(--t-normal) var(--ease-out) both;
+  }
+
+  /* ── Data content fade on provider/period switch ── */
+  .data-content {
+    animation-duration: var(--t-normal);
+    animation-timing-function: var(--ease-out);
+    animation-fill-mode: both;
+  }
+
+  /* ── Empty state icons ── */
+  .empty-icon {
+    display: block;
+    margin-bottom: 2px;
+    opacity: 0.6;
+  }
+  .rate-limit-empty .empty-icon {
+    margin-bottom: 6px;
+  }
+  .empty-title {
+    font: 600 11px/1 'Inter', sans-serif;
+    color: var(--t2);
+  }
+  .empty-subtitle {
+    font: 400 10px/1.4 'Inter', sans-serif;
+    color: var(--t3);
+    max-width: 220px;
+  }
+
+  /* ── Rate limit skeleton loading ── */
+  .rate-limit-skeleton {
+    padding: 14px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .rate-limit-skeleton-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
   }
 </style>
