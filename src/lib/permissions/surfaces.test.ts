@@ -38,6 +38,7 @@ function settings(overrides: Partial<Settings> = {}): Settings {
     rateLimitsEnabled: false,
     hasSeenWelcome: false,
     keychainAccessRequested: false,
+    usageAccessEnabled: true,
     ...overrides,
   };
 }

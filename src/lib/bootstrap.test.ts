@@ -57,6 +57,7 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     rateLimitsEnabled: false,
     hasSeenWelcome: true,
     keychainAccessRequested: true,
+    usageAccessEnabled: true,
     ...overrides,
   };
 }
