@@ -77,7 +77,6 @@
   import Footer from "./lib/components/Footer.svelte";
   import SetupScreen from "./lib/components/SetupScreen.svelte";
   import SplashScreen from "./lib/components/SplashScreen.svelte";
-  import WelcomeCard from "./lib/components/WelcomeCard.svelte";
   import Settings from "./lib/components/Settings.svelte";
   import Calendar from "./lib/components/Calendar.svelte";
   import DateNav from "./lib/components/DateNav.svelte";
@@ -85,6 +84,7 @@
   import SingleDeviceView from "./lib/components/SingleDeviceView.svelte";
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import PermissionDisclosure from "./lib/components/PermissionDisclosure.svelte";
+  import PermissionsOnboarding from "./lib/components/PermissionsOnboarding.svelte";
   import type { HeaderTabs, UsagePayload, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
 
   let showSplash = $state(true);
@@ -109,6 +109,34 @@
   });
   let showKeychainPermissionPanel = $state(false);
   let keychainPermissionBusy = $state(false);
+  /** Bartender-style onboarding wizard. Driven by the `hasSeenWelcome`
+   * setting now that the test-only auto-open `$effect` has been removed
+   * — first launch shows the wizard, every subsequent launch skips it. */
+  let showPermissionsOnboarding = $derived(!$settings.hasSeenWelcome);
+
+  async function handleOnboardingFinish() {
+    // Order matters: enable parser → wait for the first usage fetch to
+    // populate `data` → only then flip `hasSeenWelcome`. The derived
+    // `showPermissionsOnboarding` watches that flag, so flipping it is
+    // what unmounts the wizard. Doing it last guarantees the dashboard
+    // has data ready and the user never sees a "No usage data found"
+    // flash between wizard close and first IPC return.
+    await invoke("set_usage_access_enabled", { enabled: true }).catch((err) => {
+      logger.error("permissions", `Failed to enable usage access: ${err}`);
+    });
+    await loadInitialData();
+    await updateSetting("hasSeenWelcome", true);
+    await tick();
+    syncSizeAndVerify("onboarding-finish");
+  }
+
+  /** Best-effort signal that the keychain ACL is currently held — true when
+   * the latest rate-limit fetch returned more windows than the CLI fallback
+   * can produce (CLI maxes at one window). */
+  let keychainAuthorized = $derived.by(() => {
+    const claude = providerPayload(rateLimits, "claude");
+    return Boolean(claude && claude.windows.length >= 2);
+  });
   let brandTheming = $state(true);
   let headerTabs = $state<HeaderTabs>(DEFAULT_HEADER_TABS);
   let popEl: HTMLDivElement | null = null;
@@ -283,20 +311,14 @@
     return initialDataLoad;
   }
 
-  async function handleWelcomeDismiss() {
-    await invoke("set_usage_access_enabled", { enabled: true }).catch((err) => {
-      logger.error("permissions", `Failed to enable usage access: ${err}`);
-    });
-    await loadInitialData();
-    await tick();
-    syncSizeAndVerify("welcome-dismiss");
-  }
-
   async function enableRateLimits() {
     showKeychainPermissionPanel = false;
     await updateSetting("rateLimitsEnabled", true);
     await invoke("set_rate_limits_enabled", { enabled: true });
-    await fetchRateLimits(provider);
+    // Force the fetch — the cached payload may carry a cooldownUntil from a
+    // previous CLI rejection that the user has just resolved by re-granting,
+    // and the normal eligibility filter would otherwise skip the call.
+    await fetchRateLimits(provider, { force: true });
     await tick();
     syncSizeAndVerify("rate-limits-enabled");
   }
@@ -717,8 +739,11 @@
     {#if !showSettings}<UpdateBanner />{/if}
     {#if showSplash}
       <SplashScreen ready={appReady} onComplete={() => { showSplash = false; tick().then(() => syncSizeAndVerify("splash-complete")); }} />
-    {:else if !$settings.hasSeenWelcome}
-      <div class={viewTransitionClass}><WelcomeCard onDismiss={handleWelcomeDismiss} /></div>
+    {:else if showPermissionsOnboarding}
+      <PermissionsOnboarding
+        keychainAuthorized={keychainAuthorized}
+        onFinish={handleOnboardingFinish}
+      />
     {:else if appReady && !data}
       <div class={viewTransitionClass}><SetupScreen /></div>
     {:else if showSettings}
@@ -942,6 +967,7 @@
   </div>
 </div>
 
+
 <style>
   .pop {
     width: 340px;
@@ -980,12 +1006,16 @@
     padding: 24px 0;
   }
   .rate-limit-empty,
-  .rate-limit-permission {
+  .rate-limit-permission,
+  .rate-limit-stale-banner {
     display: flex;
     flex-direction: column;
     gap: 4px;
     padding: 18px 14px 16px;
     animation: fadeUp .28s ease both .09s;
+  }
+  .rate-limit-stale-banner {
+    padding-top: 8px;
   }
   .rate-limit-permission {
     gap: 7px;
@@ -1064,6 +1094,46 @@
   .rate-limit-secondary:disabled {
     cursor: default;
     opacity: .55;
+  }
+
+  /* Polished re-grant CTA — quieter than the welcome flow's primary button.
+     Reads as a soft tinted chip, not a saturated action. */
+  .kc-cta {
+    margin-top: 8px;
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 11px 6px 9px;
+    border: 1px solid var(--accent-soft, rgba(255,255,255,0.10));
+    border-radius: 999px;
+    background: var(--accent-soft, rgba(255,255,255,0.06));
+    color: var(--accent, var(--t1));
+    font: 500 10px/1 'Inter', sans-serif;
+    letter-spacing: .15px;
+    cursor: pointer;
+    transition: background var(--t-fast) ease, transform var(--t-fast) ease,
+      border-color var(--t-fast) ease;
+  }
+  .kc-cta:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent, white) 18%, transparent);
+    border-color: color-mix(in srgb, var(--accent, white) 30%, transparent);
+    transform: translateY(-1px);
+  }
+  .kc-cta:active:not(:disabled) {
+    transform: translateY(0);
+  }
+  .kc-cta:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .kc-cta-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px; height: 16px;
+    color: var(--accent, var(--t1));
+    opacity: 0.85;
   }
   .rate-limit-actions {
     display: flex;
