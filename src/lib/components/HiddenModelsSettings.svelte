@@ -11,6 +11,7 @@
 
   let availableModels = $state<KnownModel[]>([]);
   let expanded = $state(false);
+  let modelsLoading = $state(true);
 
   let visibleCount = $derived(
     availableModels.filter((m) => !current.hiddenModels.includes(m.model_key)).length
@@ -25,6 +26,9 @@
       })
       .catch((error) => {
         console.error("Failed to load known models:", error);
+      })
+      .finally(() => {
+        modelsLoading = false;
       });
   }
 
@@ -58,7 +62,17 @@
     </div>
   </button>
   <div class="model-collapse" class:open={expanded}>
-    {#if availableModels.length > 0}
+    {#if modelsLoading}
+      <div class="model-grid" aria-busy="true" aria-label="Loading models">
+        {#each Array(4) as _, i (i)}
+          <div class="model-cell skeleton-cell">
+            <div class="dot skeleton-block"></div>
+            <span class="skeleton-block skeleton-name"></span>
+            <span class="skeleton-block skeleton-toggle"></span>
+          </div>
+        {/each}
+      </div>
+    {:else if availableModels.length > 0}
       <div class="model-grid">
         {#each availableModels as model}
           <div class="model-cell">
@@ -130,8 +144,8 @@
     max-height: 400px;
   }
   .model-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
+    display: flex;
+    flex-direction: column;
     padding: 2px 0;
   }
   .model-empty {
@@ -143,18 +157,50 @@
     display: flex;
     align-items: center;
     min-height: 24px;
-    gap: 5px;
+    gap: 6px;
     padding: 6px 10px;
   }
   .model-name {
     flex: 1;
-    font: 400 9px/1.25 'Inter', sans-serif;
+    min-width: 0;
+    font: 400 10px/1.25 'Inter', sans-serif;
     color: var(--t1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .dot {
     width: 5px;
     height: 5px;
     border-radius: 50%;
     flex-shrink: 0;
+  }
+  .skeleton-block {
+    background: var(--surface-hover, rgba(128, 128, 128, 0.12));
+    border-radius: 3px;
+    animation: skeleton-pulse 1.4s ease-in-out infinite;
+  }
+  .skeleton-cell .dot.skeleton-block {
+    border-radius: 50%;
+  }
+  .skeleton-name {
+    flex: 1;
+    height: 8px;
+    max-width: 120px;
+  }
+  .skeleton-toggle {
+    width: 22px;
+    height: 12px;
+    border-radius: 6px;
+  }
+  .skeleton-cell:nth-child(2) .skeleton-name { max-width: 90px; }
+  .skeleton-cell:nth-child(3) .skeleton-name { max-width: 140px; }
+  .skeleton-cell:nth-child(4) .skeleton-name { max-width: 100px; }
+  @keyframes skeleton-pulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 0.9; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .skeleton-block { animation: none; opacity: 0.6; }
   }
 </style>
