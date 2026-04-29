@@ -3,8 +3,6 @@ use super::{AppState, UsageDebugReport};
 use crate::models::*;
 use crate::secrets;
 use crate::usage::cursor_parser::CursorAuthStatus;
-#[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, State};
 
 /// Apply native window surface adjustments.
