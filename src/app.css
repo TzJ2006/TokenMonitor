@@ -35,6 +35,29 @@
   --o1: #6A8898;
   --o1mini: #7A9098;
   --codex: #4A8DB8;
+
+  /* Extended brand palette — same-family shades (deep/mid/soft) picked by
+     model version tier. Hue spread: 195 teal (GLM) → 205 GPT → 220 DeepSeek
+     → 230 Gemini → 245 Composer → 270 Kimi → 290 Qwen, all kept at similar
+     saturation/lightness so charts read as a unified palette. */
+  --gemini: #5B7FE8;
+  --gemini-mid: #7A95EC;
+  --gemini-soft: #9AABF0;
+  --glm: #3E9B52;
+  --glm-mid: #65B277;
+  --glm-soft: #93C9A0;
+  --deepseek: #3D6BB8;
+  --deepseek-mid: #5F86C8;
+  --deepseek-soft: #8AA5D8;
+  --composer: #6C7BDB;
+  --composer-mid: #8590E2;
+  --composer-soft: #A4AAEB;
+  --kimi: #8B6FD4;
+  --kimi-mid: #A48ADE;
+  --kimi-soft: #BFA8E8;
+  --qwen: #A466C0;
+  --qwen-mid: #B887CE;
+  --qwen-soft: #CCA8DC;
 }
 
 /* ── Dark theme (default) ── */
