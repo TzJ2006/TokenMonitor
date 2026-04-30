@@ -305,14 +305,15 @@ Click the **gear icon** in the popover to open the settings panel:
 
 ### Data
 - **Currency** — Display costs in USD, EUR, GBP, JPY, or CNY
-- **Hidden models** — Select models to exclude from charts and breakdowns
-- **Header tabs** — Show/hide and rename provider tabs
+
+### Visibility
+Grouped into a single card, each row is collapsible:
+- **Provider** — Show/hide and rename the provider header tabs (Claude / Codex / Cursor / All)
+- **Model Visibility** — Exclude individual models from charts and breakdowns
+- **SSH Hosts** — Enable/disable remote devices and trigger a one-click sync of all enabled hosts (see [SSH Remote Devices](#13-ssh-remote-devices))
 
 ### Tray Config
 - Cost display, precision, rate limit bars, and percentage format (see [Tray Display](#11-tray-display))
-
-### SSH Hosts
-- Manage remote SSH device connections (see [SSH Remote Devices](#13-ssh-remote-devices))
 
 ### Updates
 - Enable/disable automatic update checks

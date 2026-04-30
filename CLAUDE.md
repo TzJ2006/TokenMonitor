@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A local-first **cross-platform** system tray app (Tauri v2 + Svelte 5 + Rust) that monitors Claude Code, Codex CLI, and Cursor IDE token usage. It reads JSONL session logs from disk, applies pricing rules in Rust, and presents spend/rate-limit data through a native system tray popover. No cloud sync.
 
-Supported platforms: **macOS**, **Windows**, **Linux**. Current version: **0.12.0**.
+Supported platforms: **macOS**, **Windows**, **Linux**. Current version: **0.12.3**.
 
 ### Platform differences
 
@@ -96,6 +96,8 @@ Local JSONL files → Rust `usage/parser` + `usage/claude_parser` + `usage/prici
 ### Key modules
 
 **Frontend (`src/lib/`):** `bootstrap.ts` is the startup entry point (settings → stores → native IPC, dependencies injected for testability). Svelte stores (`stores/usage.ts`, `stores/rateLimits.ts`, `stores/settings.ts`, `stores/updater.ts`) own all reactive state and IPC calls. `providerMetadata.ts` is the single source of truth for provider-specific UI behavior (tab order, labels, logos, rate-limit support, brand colors, plan tiers). `lib/types/index.ts` defines shared TypeScript interfaces mirroring Rust structs.
+
+**Window sizing (`windowSizing.ts` + `resizeOrchestrator.ts`):** Window height follows content height via a ResizeObserver → `set_window_size_and_align` IPC loop. Two mechanisms prevent the "small → big" cold-launch pop: (1) last applied height is persisted to `settings.json` under `window_state.height` and restored before the chart renders; (2) the orchestrator holds an `initialContentReady` gate that blocks shrink-direction requests until the first payload + first paint settle.
 
 **Rust backend (`src-tauri/src/`):** `commands.rs` is the IPC dispatch hub, split into domain submodules (`usage_query`, `calendar`, `period`, `config`, `tray`, `ssh`, `float_ball/`, `updater`, `logging`). `AppState` holds all shared state as `Arc<RwLock<>>` fields. `paths.rs` is the central registry of every filesystem path the app reads.
 

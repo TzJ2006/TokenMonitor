@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { formatCost, formatTokens, modelColor } from "../utils/format.js";
-  import { activePeriod, activeOffset } from "../stores/usage.js";
+  import { activePeriod, activeOffset, activeProvider } from "../stores/usage.js";
   import type { UsagePayload } from "../types/index.js";
   import Chart from "./Chart.svelte";
 
@@ -15,6 +15,7 @@
   let data = $state<UsagePayload | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  let provider = $derived($activeProvider);
   let period = $derived($activePeriod);
   let offset = $derived($activeOffset);
 
@@ -24,6 +25,7 @@
     try {
       data = await invoke<UsagePayload>("get_single_device_usage", {
         device,
+        provider,
         period,
         offset,
       });
@@ -34,9 +36,10 @@
     loading = false;
   }
 
-  // Fetch on mount and re-fetch when period or offset changes.
+  // Fetch on mount and re-fetch when provider/period/offset changes.
   // In Svelte 5, $effect runs immediately on mount, so onMount is not needed.
   $effect(() => {
+    void provider;
     void period;
     void offset;
     fetchDeviceUsage();
