@@ -263,10 +263,18 @@ pub(crate) async fn build_device_breakdown_for_payload(
             let source_key = format!("device:{}", cfg.alias);
             let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
 
-            let archived_entries = archive
+            // Filter archive rows by the selected provider's model family,
+            // matching the live-record filter below. Without this, archive
+            // rows in the Claude tab include OpenAI/GLM data (and vice versa
+            // for the Codex tab), which double-counts archive data across
+            // tabs — making Claude + Codex exceed ALL.
+            let archived_entries: Vec<_> = archive
                 .as_ref()
                 .map(|a| a.load_archived(&source_key, Some(since)))
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| provider_matches_model(provider, &e.model))
+                .collect();
 
             let all_records = match mgr.load_cached_records(&cfg.alias) {
                 Ok(r) => r,
@@ -348,6 +356,7 @@ pub(crate) async fn build_included_devices_payload(
     let (since, end) = compute_date_bounds(period, offset)?;
     let cache_mgr = state.ssh_cache.read().await;
     let mgr = cache_mgr.as_ref()?;
+    let archive = state.parser.archive();
 
     let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
     let mut chart_entries: Vec<(chrono::DateTime<chrono::FixedOffset>, String, f64, u64)> =
@@ -356,6 +365,44 @@ pub(crate) async fn build_included_devices_payload(
     let mut output_tokens = 0_u64;
 
     for cfg in &included {
+        let source_key = format!("device:{}", cfg.alias);
+        let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
+
+        // ── Archived hourly rows for completed hours ──
+        if let Some(ref a) = archive {
+            for entry in a.load_archived(&source_key, Some(since)) {
+                if !provider_matches_model(provider, &entry.model) {
+                    continue;
+                }
+                let entry_date = entry.timestamp.date_naive();
+                if entry_date < since || entry_date >= end {
+                    continue;
+                }
+                let (display_name, model_key) = crate::models::normalize_model(&entry.model);
+                let cost = calculate_cost_for_key(
+                    &model_key,
+                    entry.input_tokens,
+                    entry.output_tokens,
+                    entry.cache_creation_5m_tokens,
+                    entry.cache_creation_1h_tokens,
+                    entry.cache_read_tokens,
+                    0,
+                );
+                let tokens = entry.input_tokens + entry.output_tokens;
+                input_tokens += entry.input_tokens;
+                output_tokens += entry.output_tokens;
+
+                let agg = model_map
+                    .entry(model_key.clone())
+                    .or_insert_with(|| (display_name, 0.0, 0));
+                agg.1 += cost;
+                agg.2 += tokens;
+
+                chart_entries.push((entry.timestamp.fixed_offset(), model_key, cost, tokens));
+            }
+        }
+
+        // ── Live compact rows (exclude hours already covered by archive) ──
         let records = match mgr.load_cached_records(&cfg.alias) {
             Ok(r) => r,
             Err(e) => {
@@ -375,8 +422,13 @@ pub(crate) async fn build_included_devices_payload(
                 Some(ts) => ts,
                 None => continue,
             };
-            let record_date = parsed_ts.with_timezone(&chrono::Local).date_naive();
-
+            let local = parsed_ts.with_timezone(&chrono::Local);
+            if let Some(ref f) = frontier {
+                if f.covers(local.date_naive(), local.hour() as u8) {
+                    continue;
+                }
+            }
+            let record_date = local.date_naive();
             if record_date < since || record_date >= end {
                 continue;
             }
@@ -536,9 +588,14 @@ pub(crate) async fn build_device_time_chart_buckets(
                 let source_key = format!("device:{}", cfg.alias);
                 let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
 
-                // Archived entries for this device.
+                // Archived entries for this device, filtered by the active
+                // provider's model family (keeps device time-series consistent
+                // with build_device_breakdown_for_payload's totals).
                 if let Some(ref a) = archive {
                     for entry in a.load_archived(&source_key, Some(since)) {
+                        if !provider_matches_model(provider, &entry.model) {
+                            continue;
+                        }
                         let date = entry.timestamp.date_naive();
                         if date >= end {
                             continue;
@@ -1025,6 +1082,227 @@ mod tests {
         let ts = "2024-06-15T10:30:00+05:30";
         let parsed = parse_remote_ts(ts).unwrap();
         assert_eq!(parsed.offset().local_minus_utc(), 5 * 3600 + 30 * 60);
+    }
+
+    /// Regression test for a real bug reported by a user:
+    ///   Devices total for ALL was lower than Claude total + Codex total.
+    ///
+    /// Root cause: build_device_breakdown_for_payload (and _time_chart_buckets)
+    /// loaded archive rows without filtering by the active provider's model
+    /// family, even though live records were filtered. That meant archive rows
+    /// belonging to OpenAI models showed up in the Claude tab, and vice versa
+    /// — so the same archived cost was counted once in Claude and once in
+    /// Codex, while ALL still counted it only once. The invariant below would
+    /// fail before the fix.
+    #[tokio::test]
+    async fn archive_is_filtered_by_provider_so_all_is_not_exceeded_by_sum() {
+        use crate::usage::archive::ArchiveManager;
+        use crate::usage::parser::{ParsedEntry, UsageParser};
+        use crate::usage::ssh_remote::{SshCacheManager, SshHostConfig};
+        use crate::{commands::AppState, stats::subagent::AgentScope};
+        use chrono::{Local, TimeZone};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        // Build a parser with empty dirs — we want ALL of the "remote" rows
+        // to come from archive (not live JSONL), so we can exercise the fix.
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let app_data_dir = TempDir::new().unwrap();
+
+        let mut state = AppState::new();
+        state.parser = Arc::new(UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        ));
+        *state.ssh_hosts.write().await = vec![SshHostConfig {
+            alias: String::from("remote-mixed"),
+            enabled: true,
+            include_in_stats: false,
+        }];
+        *state.ssh_cache.write().await = Some(SshCacheManager::new(app_data_dir.path()));
+
+        // Archive one Anthropic row + one OpenAI row for the same day/hour.
+        // archive_completed_hours needs a `current_hour > row_hour` to
+        // actually archive; we write with ts at hour=10 and bump to hour=12.
+        let archive_mgr = ArchiveManager::new(app_data_dir.path());
+        let today = Local::now().date_naive();
+        let row_ts = Local
+            .from_local_datetime(&today.and_hms_opt(10, 0, 0).unwrap())
+            .single()
+            .unwrap();
+        let rows = vec![
+            ParsedEntry {
+                timestamp: row_ts,
+                model: String::from("claude-opus-4-6"),
+                input_tokens: 1_000,
+                output_tokens: 1_000,
+                cache_creation_5m_tokens: 0,
+                cache_creation_1h_tokens: 0,
+                cache_read_tokens: 0,
+                web_search_requests: 0,
+                unique_hash: None,
+                session_key: String::from("test"),
+                agent_scope: AgentScope::Main,
+            },
+            ParsedEntry {
+                timestamp: row_ts,
+                model: String::from("gpt-5.4"),
+                input_tokens: 1_000,
+                output_tokens: 1_000,
+                cache_creation_5m_tokens: 0,
+                cache_creation_1h_tokens: 0,
+                cache_read_tokens: 0,
+                web_search_requests: 0,
+                unique_hash: None,
+                session_key: String::from("test"),
+                agent_scope: AgentScope::Main,
+            },
+        ];
+        let archived =
+            archive_mgr.archive_completed_hours(&rows, "device:remote-mixed", "all", today, 12);
+        assert!(archived > 0, "archive should have written at least one row");
+        state.parser.set_archive(archive_mgr);
+
+        // Same frontier-less rows as live records so the test also exercises
+        // the live path. (The frontier prunes these to no-ops under ALL, so
+        // the totals here come almost entirely from the archive.)
+
+        let claude_devices = build_device_breakdown_for_payload(&state, "claude", "day", 0)
+            .await
+            .unwrap();
+        let codex_devices = build_device_breakdown_for_payload(&state, "codex", "day", 0)
+            .await
+            .unwrap();
+        let all_devices = build_device_breakdown_for_payload(&state, "all", "day", 0)
+            .await
+            .unwrap();
+
+        let claude_total: f64 = claude_devices.iter().map(|d| d.total_cost).sum();
+        let codex_total: f64 = codex_devices.iter().map(|d| d.total_cost).sum();
+        let all_total: f64 = all_devices.iter().map(|d| d.total_cost).sum();
+
+        // Each family should see only its own archive row.
+        assert!(
+            claude_total > 0.0,
+            "claude should include the Opus archive row"
+        );
+        assert!(
+            codex_total > 0.0,
+            "codex should include the GPT archive row"
+        );
+        // ALL must be at least as large as the sum — archive rows are
+        // family-partitioned, so double-counting must not occur.
+        assert!(
+            all_total + 1e-9 >= claude_total + codex_total,
+            "ALL ({all_total}) should not be less than Claude ({claude_total}) + Codex ({codex_total}); \
+             archive row filtering regressed"
+        );
+    }
+
+    /// Regression test: `build_included_devices_payload` must consume archive
+    /// rows for hosts flagged `include_in_stats`, and must not double-count by
+    /// also consuming live rows for hours already covered by the archive
+    /// frontier.
+    #[tokio::test]
+    async fn included_devices_payload_reads_archive_without_double_counting() {
+        use crate::commands::AppState;
+        use crate::stats::subagent::AgentScope;
+        use crate::usage::archive::ArchiveManager;
+        use crate::usage::parser::{ParsedEntry, UsageParser};
+        use crate::usage::ssh_remote::{SshCacheManager, SshHostConfig};
+        use chrono::{Local, TimeZone};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let app_data_dir = TempDir::new().unwrap();
+
+        let mut state = AppState::new();
+        state.parser = Arc::new(UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        ));
+        *state.ssh_hosts.write().await = vec![SshHostConfig {
+            alias: String::from("remote-inc"),
+            enabled: true,
+            include_in_stats: true,
+        }];
+        *state.ssh_cache.write().await = Some(SshCacheManager::new(app_data_dir.path()));
+
+        let today = Local::now().date_naive();
+        let archived_ts = Local
+            .from_local_datetime(&today.and_hms_opt(9, 0, 0).unwrap())
+            .single()
+            .unwrap();
+        let archive_mgr = ArchiveManager::new(app_data_dir.path());
+        let archived_rows = vec![ParsedEntry {
+            timestamp: archived_ts,
+            model: String::from("claude-sonnet-4-6"),
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            cache_read_tokens: 0,
+            web_search_requests: 0,
+            unique_hash: None,
+            session_key: String::from("test"),
+            agent_scope: AgentScope::Main,
+        }];
+        let archived = archive_mgr.archive_completed_hours(
+            &archived_rows,
+            "device:remote-inc",
+            "all",
+            today,
+            12,
+        );
+        assert!(archived > 0, "archive should have written at least one row");
+        state.parser.set_archive(archive_mgr);
+
+        // Write a live JSONL with:
+        //  • 1 row inside the archived hour (should be de-duped by frontier)
+        //  • 1 row in a later, *not-yet-archived* hour (should be counted)
+        let archived_ts_str = archived_ts.to_rfc3339();
+        let live_ts = Local
+            .from_local_datetime(&today.and_hms_opt(11, 0, 0).unwrap())
+            .single()
+            .unwrap();
+        let live_ts_str = live_ts.to_rfc3339();
+        let live_jsonl = format!(
+            "{}\n{}\n",
+            remote_record(&archived_ts_str, "claude-sonnet-4-6", 500, 500),
+            remote_record(&live_ts_str, "claude-sonnet-4-6", 2_000, 2_000),
+        );
+        write_file(
+            &app_data_dir
+                .path()
+                .join("remote-cache")
+                .join("remote-inc")
+                .join("usage.jsonl"),
+            &live_jsonl,
+        );
+
+        let payload = build_included_devices_payload(&state, "claude", "day", 0)
+            .await
+            .expect("included devices payload should exist when archive has data");
+
+        // Expected tokens: archive (1_000+1_000) + later live row (2_000+2_000)
+        //                  = input=3_000, output=3_000
+        // The archived-hour live row must be skipped via frontier.
+        assert_eq!(
+            payload.input_tokens, 3_000,
+            "frontier should have de-duped the archived-hour live row"
+        );
+        assert_eq!(payload.output_tokens, 3_000);
+        assert!(payload.total_cost > 0.0);
+        assert!(
+            payload
+                .model_breakdown
+                .iter()
+                .any(|m| m.model_key == "sonnet-4-6"),
+            "sonnet-4-6 should appear in the model breakdown"
+        );
     }
 
     #[test]

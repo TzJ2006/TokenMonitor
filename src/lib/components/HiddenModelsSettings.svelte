@@ -51,7 +51,7 @@
   }
 </script>
 
-<div class="card">
+<div class="block">
   <button class="row vis-row" type="button" onclick={() => (expanded = !expanded)}>
     <span class="label">Model Visibility</span>
     <div class="vis-right">
@@ -93,9 +93,7 @@
 </div>
 
 <style>
-  .card {
-    background: var(--surface-2);
-    border-radius: 8px;
+  .block {
     overflow: hidden;
   }
   .row {
@@ -142,6 +140,7 @@
   }
   .model-collapse.open {
     max-height: 400px;
+    border-top: 1px solid var(--border-subtle);
   }
   .model-grid {
     display: flex;
