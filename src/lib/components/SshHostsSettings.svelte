@@ -153,7 +153,7 @@
   }
 </script>
 
-<div class="card">
+<div class="block">
   <div class="row ssh-toggle-row" role="button" tabindex="0" onclick={() => (expanded = !expanded)} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); expanded = !expanded; } }}>
     <span class="label">SSH Hosts</span>
     <div class="ssh-toggle-right">
@@ -220,9 +220,7 @@
 </div>
 
 <style>
-  .card {
-    background: var(--surface-2);
-    border-radius: 8px;
+  .block {
     overflow: hidden;
   }
   .ssh-section {
@@ -292,7 +290,6 @@
     width: 100%;
     background: none;
     border: none;
-    border-bottom: 1px solid var(--border-subtle);
     cursor: pointer;
     user-select: none;
   }
@@ -323,6 +320,7 @@
   }
   .ssh-collapse.open {
     max-height: 500px;
+    border-top: 1px solid var(--border-subtle);
   }
   .ssh-testing {
     font: 400 8px/1 'Inter', sans-serif;
