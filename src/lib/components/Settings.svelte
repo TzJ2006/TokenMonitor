@@ -429,9 +429,11 @@
     <!-- 3. Visibility -->
     <div class="group">
       <div class="group-label">Visibility</div>
-      <HeaderTabsSettings />
-      <HiddenModelsSettings />
-      <SshHostsSettings />
+      <div class="card visibility-card">
+        <HeaderTabsSettings />
+        <HiddenModelsSettings />
+        <SshHostsSettings />
+      </div>
     </div>
 
     <!-- 4. Menu Bar / Floating Ball -->
@@ -697,6 +699,10 @@
     overflow: hidden;
   }
 
+  .visibility-card > :global(.block + .block) {
+    border-top: 1px solid var(--border-subtle);
+  }
+
   .row {
     padding: 7px 10px;
     display: flex;
@@ -733,18 +739,14 @@
   .collapsible-chevron.open {
     transform: rotate(0deg);
   }
-  .cursor-collapse {
+  .cursor-collapse,
+  .privacy-collapse {
     max-height: 0;
     overflow: hidden;
     transition: max-height var(--t-normal) ease;
   }
   .cursor-collapse.open {
-    max-height: 300px;
-  }
-  .privacy-collapse {
-    max-height: 0;
-    overflow: hidden;
-    transition: max-height var(--t-normal) ease;
+    max-height: 400px;
   }
   .privacy-collapse.open {
     max-height: 800px;
