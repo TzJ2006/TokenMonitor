@@ -1,5 +1,45 @@
 # CHANGELOG
 
+## v0.12.3 — Visibility 合并 + 窗口尺寸记忆
+
+### UI
+- **Settings → Visibility 合并为单卡片**：`Provider` / `Model Visibility` / `SSH Hosts` 三个面板现在共享一张 card，视觉上与 `Display` 分组一致，行间用 `border-top` 分隔
+- 修复折叠面板（Cursor / Permissions）收起时会漏出内部内容的问题——`grid-template-rows: 0fr/1fr` 方案在嵌套子组件根节点时 `:global(*)` 作用域不稳，回退到显式 `max-height` + `overflow: hidden`
+
+### 启动体验
+- **窗口尺寸记忆**：新增 `window_state.height` 字段持久化到 `settings.json`，启动时在 `loadInitialData()` 之前立刻把窗口恢复到上次关闭时的高度，消除"先小后大"的跳变
+- **首帧 shrink 门控**：`resizeOrchestrator` 新增 `initialContentReady` 闸门，首次数据就绪前屏蔽所有 shrink 方向的 resize 请求；首帧渲染后再放闸并做一次同步修正
+- `resizeOrchestrator` 新增 `onHeightApplied` 回调，每次 `set_window_size_and_align` 成功后节流 400ms 写回磁盘
+
+## v0.12.2 — 模型家族过滤 + 图表排序
+
+- `fix(usage)`: 按 model family 过滤跨集成聚合行，避免 Claude/Codex/Cursor 计费交叉污染
+- `feat(ui)`: 统一模型名格式化并扩展品牌调色板
+- `feat(chart)`: 按使用成本对图例模型排序
+- `fix(ci)`: 移除 `config.rs` 中未用的 `AtomicBool/Ordering` 引用
+
+## v0.12.1 — 签名与 CI 修复
+
+- `fix(macos)`: 修复 Windows-only 代码路径中的 `SetWindowRgn` 导入路径
+- `fix(ci)`: 使用平台相关的 SHA256SUMS 文件名，避免 release 资产冲突
+- `fix(ci)`: 默认将 release 发布为非草稿
+- `fix(ci)`: `cargo fmt` 应用到 `window.rs`
+- `fix(ci)`: 移除 clippy 报出的多余 `return`
+
+## v0.12.0 — Codex 速率限制 + View Transitions + SSH 加固
+
+### 新功能
+- 新增 Codex CLI 速率限制面板（`rate_limits/codex.rs`）
+- 新增 View Transitions（`view-enter-right` / `view-enter-left` / `view-enter-fade`），在 settings / calendar / devices / single-device 之间切换时做滑入动画
+- 新增 Skeleton loading 骨架屏（`HiddenModelsSettings` 等）
+- 新增 `usage_access_enabled` 原子开关，首次启动通过 welcome card 显式授权后才开始解析本地日志
+
+### 安全与正确性
+- SSH alias 验证加固、缓存失效修正
+- Windows 空白时区 / SHA256 / 磁盘 I/O 错误路径强化
+- 应用内告警添加一键关闭按钮
+- SSH 缓存改为流式读取，降低 Windows 上的内存峰值
+
 ## v0.11.1 — Cursor Rate Limits & Updater Signing Fixes
 
 - 新增 Cursor IDE 速率限制支持（`rate_limits/cursor.rs`），通过 Cursor API 获取计划用量和支出限额

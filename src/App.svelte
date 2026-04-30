@@ -43,9 +43,11 @@
     DEFAULT_HEADER_TABS,
     areHeaderTabsEqual,
     applyProvider,
+    getLastWindowHeight,
     getVisibleHeaderProviders,
     loadSettings,
     resolveVisibleProvider,
+    setLastWindowHeight,
     settings,
     updateSetting,
   } from "./lib/stores/settings.js";
@@ -549,6 +551,18 @@
     let unlistenWindowResize: (() => void) | undefined;
 
     // Create the resize orchestrator (all resize state lives in its closure)
+    let persistedWindowHeight = 0;
+    let persistWindowHeightTimer: ReturnType<typeof setTimeout> | null = null;
+    const persistWindowHeight = (height: number) => {
+      if (height <= 0 || height === persistedWindowHeight) return;
+      persistedWindowHeight = height;
+      if (persistWindowHeightTimer) clearTimeout(persistWindowHeightTimer);
+      persistWindowHeightTimer = setTimeout(() => {
+        persistWindowHeightTimer = null;
+        void setLastWindowHeight(height);
+      }, 400);
+    };
+
     resizeOrch = createResizeOrchestrator({
       getPopEl: () => popEl,
       invoke: (cmd, args) => invoke(cmd, args),
@@ -565,6 +579,7 @@
         }),
       formatDebugError,
       isDebugEnabled: isResizeDebugEnabled,
+      onHeightApplied: persistWindowHeight,
     });
 
     /** Local snapshot helper for event handlers that need debug snapshots. */
@@ -653,6 +668,25 @@
         logResizeDebug("app:settings-load-failed", {});
       }
 
+      // Restore the window to its last-known height before the chart renders.
+      // Combined with the orchestrator's initial-content gate, this hides the
+      // "small → big" pop-out users were seeing on cold launch.
+      const restoredHeight = await getLastWindowHeight();
+      if (!cancelled && restoredHeight) {
+        try {
+          await invoke("set_window_size_and_align", {
+            width: 340,
+            height: restoredHeight,
+          });
+          persistedWindowHeight = restoredHeight;
+          logResizeDebug("app:window-height-restored", { height: restoredHeight });
+        } catch (e) {
+          logResizeDebug("app:window-height-restore-failed", {
+            error: formatDebugError(e),
+          });
+        }
+      }
+
       if (get(settings).hasSeenWelcome) {
         await loadInitialData();
         if (cancelled) return;
@@ -679,6 +713,12 @@
         });
         observer.observe(popEl);
         syncSizeAndVerify("initial-mount");
+        // Wait one frame so the Chart finishes its first paint, then allow
+        // shrink-direction resizes. Until now the orchestrator has buffered
+        // shrinks so the window doesn't collapse between "data arrived" and
+        // "chart rendered".
+        await tick();
+        resizeOrch?.markInitialContentReady();
       }
 
       unlisten = await listen("data-updated", () => {

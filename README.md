@@ -151,6 +151,7 @@ Grab the installer for your platform from the [latest release](https://github.co
 - Stale-while-revalidate loading for fast repeat views
 - Frontend payload cache eliminates IPC round-trips on tab switches
 - Adjacent-window warming for quicker historical navigation
+- Window height is restored from the previous session before the chart renders, so cold launches don't visibly grow after data arrives
 
 ## Platform Differences
 

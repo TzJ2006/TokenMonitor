@@ -87,7 +87,7 @@
   }
 </script>
 
-<div class="card">
+<div class="block">
   <button class="row toggle-row" type="button" onclick={() => (expanded = !expanded)}>
     <span class="label">Provider</span>
     <div class="toggle-right">
@@ -120,9 +120,7 @@
 </div>
 
 <style>
-  .card {
-    background: var(--surface-2);
-    border-radius: 8px;
+  .block {
     overflow: hidden;
   }
   .row {
@@ -138,7 +136,6 @@
     width: 100%;
     background: none;
     border: none;
-    border-bottom: 1px solid var(--border-subtle);
     cursor: pointer;
     user-select: none;
   }
@@ -169,6 +166,7 @@
   }
   .collapse.open {
     max-height: 300px;
+    border-top: 1px solid var(--border-subtle);
   }
   .label {
     font: 400 10px/1 'Inter', sans-serif;

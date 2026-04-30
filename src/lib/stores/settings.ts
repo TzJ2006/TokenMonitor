@@ -392,6 +392,33 @@ async function persistSettings(next: Settings): Promise<void> {
   }
 }
 
+const WINDOW_STATE_KEY = "window_state";
+interface WindowState {
+  height?: number;
+}
+
+export async function getLastWindowHeight(): Promise<number | null> {
+  if (!storeInstance) return null;
+  try {
+    const state = await storeInstance.get<WindowState>(WINDOW_STATE_KEY);
+    const h = state?.height;
+    return typeof h === "number" && Number.isFinite(h) && h > 0 ? h : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function setLastWindowHeight(height: number): Promise<void> {
+  if (!storeInstance) return;
+  if (!Number.isFinite(height) || height <= 0) return;
+  try {
+    await storeInstance.set(WINDOW_STATE_KEY, { height: Math.round(height) });
+    await storeInstance.save();
+  } catch (error) {
+    console.warn("Failed to persist window state:", error);
+  }
+}
+
 export async function updateSetting<K extends keyof Settings>(
   key: K,
   value: Settings[K],
