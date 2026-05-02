@@ -98,12 +98,19 @@ describe("loadSettings", () => {
       taskbarPanel: false,
       sshHosts: [],
       debugLogging: false,
-      // Existing installs (non-empty saved settings) migrate to rate-limits
-      // on, welcome-seen, AND keychain-prompt-already-shown so we don't pop
-      // a tutorial on someone who's been using the app for months.
+      // Existing installs (non-empty saved settings) migrate to
+      // rate-limits-on. `hasSeenWelcome` would be set by the legacy
+      // migration too, but the version-stamp migration on top of that
+      // forces it back to `false` because `lastOnboardedVersion` is
+      // null (this saved settings predates the field). That re-opens
+      // the wizard so the user sees the statusline install step.
       rateLimitsEnabled: true,
-      hasSeenWelcome: true,
-      keychainAccessRequested: true,
+      hasSeenWelcome: false,
+      lastOnboardedVersion: null,
+      statuslineInstalled: false,
+      claudePlanTier: "Pro",
+      claudePlanCustomFiveHourTokens: null,
+      claudePlanCustomWeeklyTokens: null,
       usageAccessEnabled: true,
     });
     expect(get(settings)).toEqual(loaded);
@@ -152,11 +159,17 @@ describe("loadSettings", () => {
       taskbarPanel: false,
       sshHosts: [],
       debugLogging: false,
-      // Failure path goes through pure defaults (no migration), so the
-      // opt-in flags stay off.
-      rateLimitsEnabled: false,
+      // Failure path goes through pure defaults (no migration). Rate
+      // limits default to on now since the fetch is fully local — the
+      // user just needs to install the statusline before they see live
+      // numbers, which the onboarding wizard prompts for.
+      rateLimitsEnabled: true,
       hasSeenWelcome: false,
-      keychainAccessRequested: false,
+      lastOnboardedVersion: null,
+      statuslineInstalled: false,
+      claudePlanTier: "Pro",
+      claudePlanCustomFiveHourTokens: null,
+      claudePlanCustomWeeklyTokens: null,
       usageAccessEnabled: true,
     });
     expect(get(settings)).toEqual(fallback);
@@ -304,6 +317,75 @@ describe("loadSettings migration", () => {
       codex: { label: "Codex", enabled: false },
     });
     expect(loaded.headerTabs.claude.label).toHaveLength(MAX_HEADER_TAB_LABEL_LENGTH);
+  });
+
+  // ── lastOnboardedVersion migration ────────────────────────────────
+  // The contract: when the saved stamp is older than the build's
+  // current onboarding version, force `hasSeenWelcome=false` so the
+  // wizard re-opens. When the stamp matches, leave `hasSeenWelcome`
+  // alone. When the user is fresh (`hasSeenWelcome=false`), the
+  // migration is a no-op regardless of stamp.
+
+  it("forces re-onboarding when lastOnboardedVersion is older than current", async () => {
+    const store = makePersistedStore({
+      hasSeenWelcome: true,
+      lastOnboardedVersion: "0.10.0",
+      rateLimitsEnabled: true,
+    } as Partial<Settings>);
+    mockLoad.mockResolvedValueOnce(store);
+
+    const { loadSettings } = await loadSettingsModule();
+    const loaded = await loadSettings();
+
+    expect(loaded.hasSeenWelcome).toBe(false);
+    // Stamp is preserved so the wizard's "What's New" step can render
+    // the diff between saved and current.
+    expect(loaded.lastOnboardedVersion).toBe("0.10.0");
+  });
+
+  it("does not re-onboard when lastOnboardedVersion already matches current", async () => {
+    const { CURRENT_ONBOARDING_VERSION } = await import("../changelog.js");
+    const store = makePersistedStore({
+      hasSeenWelcome: true,
+      lastOnboardedVersion: CURRENT_ONBOARDING_VERSION,
+      rateLimitsEnabled: true,
+    } as Partial<Settings>);
+    mockLoad.mockResolvedValueOnce(store);
+
+    const { loadSettings } = await loadSettingsModule();
+    const loaded = await loadSettings();
+
+    expect(loaded.hasSeenWelcome).toBe(true);
+  });
+
+  it("treats a missing lastOnboardedVersion stamp as stale and re-onboards", async () => {
+    const store = makePersistedStore({
+      hasSeenWelcome: true,
+      // No lastOnboardedVersion field — simulates an old build that
+      // had the welcome flag but predates the version stamp.
+      rateLimitsEnabled: true,
+    } as Partial<Settings>);
+    mockLoad.mockResolvedValueOnce(store);
+
+    const { loadSettings } = await loadSettingsModule();
+    const loaded = await loadSettings();
+
+    expect(loaded.hasSeenWelcome).toBe(false);
+    expect(loaded.lastOnboardedVersion).toBeNull();
+  });
+
+  it("leaves fresh installs alone (hasSeenWelcome stays false, no fake migration)", async () => {
+    const store = makePersistedStore({
+      hasSeenWelcome: false,
+      lastOnboardedVersion: null,
+    } as Partial<Settings>);
+    mockLoad.mockResolvedValueOnce(store);
+
+    const { loadSettings } = await loadSettingsModule();
+    const loaded = await loadSettings();
+
+    expect(loaded.hasSeenWelcome).toBe(false);
+    expect(loaded.lastOnboardedVersion).toBeNull();
   });
 });
 
