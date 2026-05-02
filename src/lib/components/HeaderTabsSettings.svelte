@@ -6,7 +6,6 @@
     type Settings as SettingsType,
   } from "../stores/settings.js";
   import {
-    ALL_USAGE_PROVIDER_ID,
     getUsageProviderLogoKind,
     getUsageProviderTitle,
     USAGE_PROVIDER_ORDER,
@@ -67,11 +66,19 @@
    * one tab is visible at any time (`getVisibleHeaderProviders` falls
    * back to the first provider when none are enabled), but we still
    * disable the click on the last-enabled chip so the user gets visible
-   * feedback that the action is blocked rather than silently ignored. */
+   * feedback that the action is blocked rather than silently ignored.
+   *
+   * UX nicety: enabling a chip auto-pins the preview to that provider
+   * so the user sees the result of their action immediately.
+   * Disabling the currently-previewed chip falls through to the
+   * `$effect` that repoints `previewActive` to the next visible tab,
+   * so the preview never goes blank mid-toggle. */
   function handleToggleVisibility(provider: UsageProvider) {
     const isOn = current.headerTabs[provider].enabled;
     if (isOn && countEnabled() <= 1) return;
-    updateHeaderTab(provider, { enabled: !isOn });
+    const next = !isOn;
+    updateHeaderTab(provider, { enabled: next });
+    if (next) previewActive = provider;
   }
 
   function countEnabled(): number {
@@ -89,11 +96,11 @@
        theming so the user sees the exact look of the popover header.
        `data-provider` on the wrapper restarts the brand-color cascade
        at this scope, so colors track `previewActive` instead of the
-       popover's currently-active provider. -->
-  <div
-    class="header-preview"
-    data-provider={previewActive === ALL_USAGE_PROVIDER_ID ? null : previewActive}
-  >
+       popover's currently-active provider — including the "all" case,
+       which has its own neutral-grey scope below (the previous version
+       set the attribute to `null`, which made the "All" preview
+       inherit whatever brand the popover happened to be on). -->
+  <div class="header-preview" data-provider={previewActive}>
     {#if previewOptions.length > 0}
       <div class="header-preview-inner">
         <Toggle
@@ -123,7 +130,7 @@
         type="button"
         class="chip"
         class:on={enabled}
-        data-provider={tab.provider === ALL_USAGE_PROVIDER_ID ? null : tab.provider}
+        data-provider={tab.provider}
         disabled={lastEnabled}
         aria-pressed={enabled}
         aria-label={`${enabled ? "Hide" : "Show"} ${tab.title} tab`}
@@ -211,14 +218,22 @@
      outlined = hidden." The brand icon and the chip's surface treatment
      do all the work — there's no separate label column or toggle
      switch widget. Last-enabled chip locks (cursor: not-allowed +
-     muted opacity) so the popover is never left without a tab. */
+     muted opacity) so the popover is never left without a tab.
+
+     Layout uses CSS grid with `auto-fit` + `minmax` so the row wraps
+     gracefully as more providers ship. With 3 providers all chips
+     fit on one row; a 4th or 5th drops to a second row automatically.
+     `minmax(96px, 1fr)` keeps each chip at least wide enough to fit
+     the longest current title ("Claude Code") plus its icon and
+     padding, while letting them grow to fill the row when there's
+     extra space. */
   .chip-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
     gap: 6px;
     padding: 0 2px;
   }
   .chip {
-    flex: 1;
     min-width: 0;
     display: inline-flex;
     align-items: center;
@@ -285,7 +300,25 @@
      because the global `[data-theme="light"][data-provider="…"]`
      selectors require both attributes on the same element (data-theme
      lives on <html>) and so can't reach this scope. If the brand
-     colors in `app.css` change, update both locations. */
+     colors in `app.css` change, update both locations.
+
+     The "all" scope is critical: the popover normally *removes*
+     data-provider when it's on "All", and the cascade falls back to
+     the html-level neutral defaults. But here we want the chip / preview
+     wrapper to be brand-neutral *regardless of where the popover is*,
+     so we set `--accent` / `--accent-soft` explicitly on
+     `[data-provider="all"]` rather than relying on the absence of the
+     attribute. Without this rule, an enabled "All" chip while the
+     popover sat on "Codex" would still show as Codex-blue. */
+  .header-preview[data-provider="all"],
+  .chip[data-provider="all"] {
+    --accent: var(--t2);
+    --accent-soft: rgba(255, 255, 255, 0.08);
+  }
+  :global([data-theme="light"]) .header-preview[data-provider="all"],
+  :global([data-theme="light"]) .chip[data-provider="all"] {
+    --accent-soft: rgba(0, 0, 0, 0.06);
+  }
   .header-preview[data-provider="claude"],
   .chip[data-provider="claude"] {
     --accent: #E8784A;
