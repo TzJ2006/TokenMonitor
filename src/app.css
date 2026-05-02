@@ -265,10 +265,6 @@
   0%,100% { opacity: .45; }
   50% { opacity: 1; }
 }
-@keyframes tabUnderline {
-  from { transform: scaleX(0); }
-  to { transform: scaleX(1); }
-}
 @keyframes tipReveal {
   from { opacity: 0; transform: translateX(-50%) translateY(4px); }
   to { opacity: 1; transform: translateX(-50%) translateY(0); }
@@ -314,4 +310,12 @@ body {
   -moz-osx-font-smoothing: grayscale;
   user-select: none;
   cursor: default;
+  /* Wrap-anywhere safety net for the entire popover. The frame is fixed
+     at 340px, so any single overflowing token (long URL, file path,
+     identifier, hash) needs to break instead of pushing siblings out
+     of the visible window. `anywhere` only kicks in when no normal
+     break would fit — prose still wraps at word boundaries — and it
+     also relaxes the implicit min-content size of flex items so a long
+     status string never forces its row off-screen. */
+  overflow-wrap: anywhere;
 }
