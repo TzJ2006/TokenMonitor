@@ -289,71 +289,15 @@
   {/if}
 </div>
 
-<!-- ── Developer panel ───────────────────────────────────────────────
-     Visible only in dev builds (`import.meta.env.DEV`). Production
-     bundles strip this entire block at compile time so end users
-     never see these affordances. -->
-{#if import.meta.env.DEV}
-  <div class="ps-card ps-dev">
-    <div class="ps-row ps-row-head">
-      <div class="ps-meta">
-        <div class="ps-title">
-          Developer
-          <span class="ps-dev-badge">DEV</span>
-        </div>
-        <div class="ps-sub">
-          Visible only in <code>tauri dev</code>. Stripped from production builds.
-        </div>
-      </div>
-    </div>
+<!-- The Developer panel that previously rendered here (re-run-onboarding
+     buttons gated behind `import.meta.env.DEV`) has been removed now that
+     v0.12 is the published baseline — the in-app affordance was only
+     useful while iterating on the wizard. The same actions remain
+     available in `tauri dev` via the `__tmForceOnboard()` and
+     `__tmResetOnboarding()` console helpers wired up in
+     `lib/bootstrap.ts`, so power users can still re-trigger the flow
+     without a visible UI surface that ships to end users. -->
 
-    <div class="ps-divider"></div>
-
-    <div class="ps-row ps-row-head">
-      <div class="ps-meta">
-        <div class="ps-title">Re-run onboarding (upgrade flow)</div>
-        <div class="ps-sub">
-          Rewinds <code>lastOnboardedVersion</code> to <code>0.0.0</code> so the
-          wizard reopens with What's New → Permissions → Done.
-        </div>
-      </div>
-      <button
-        type="button"
-        class="ps-action"
-        onclick={async () => {
-          await updateSetting("hasSeenWelcome", false);
-          await updateSetting("lastOnboardedVersion", "0.0.0");
-          location.reload();
-        }}
-      >
-        Run →
-      </button>
-    </div>
-
-    <div class="ps-divider"></div>
-
-    <div class="ps-row ps-row-head">
-      <div class="ps-meta">
-        <div class="ps-title">Re-run onboarding (fresh-install flow)</div>
-        <div class="ps-sub">
-          Clears <code>lastOnboardedVersion</code> so the wizard opens with
-          the Welcome hero instead of What's New.
-        </div>
-      </div>
-      <button
-        type="button"
-        class="ps-action"
-        onclick={async () => {
-          await updateSetting("hasSeenWelcome", false);
-          await updateSetting("lastOnboardedVersion", null);
-          location.reload();
-        }}
-      >
-        Run →
-      </button>
-    </div>
-  </div>
-{/if}
 
 <style>
   .ps-card {
@@ -362,42 +306,6 @@
     overflow: hidden;
   }
 
-  /* Dev-only card sits below the main panel in `tauri dev`. Marked with
-     a subtle amber tint + DEV badge so it can never be confused with a
-     real settings surface. Production builds compile this entire block
-     out via `{#if import.meta.env.DEV}`. */
-  .ps-dev {
-    margin-top: 10px;
-    border: 1px dashed rgba(232, 160, 96, 0.30);
-    background: rgba(232, 160, 96, 0.04);
-  }
-  :global([data-theme="light"]) .ps-dev {
-    background: rgba(232, 160, 96, 0.05);
-    border-color: rgba(180, 120, 60, 0.30);
-  }
-  .ps-dev-badge {
-    display: inline-block;
-    margin-left: 6px;
-    padding: 1px 6px;
-    border-radius: 999px;
-    background: rgba(232, 160, 96, 0.16);
-    color: #f5b277;
-    font: 700 8px/1 ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-    letter-spacing: 0.6px;
-    vertical-align: 1px;
-  }
-  :global([data-theme="light"]) .ps-dev-badge {
-    color: #b56923;
-  }
-  .ps-sub code {
-    font: 500 9px/1 ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-    background: rgba(255,255,255,0.06);
-    padding: 1px 4px;
-    border-radius: 3px;
-  }
-  :global([data-theme="light"]) .ps-sub code {
-    background: rgba(0,0,0,0.05);
-  }
   .ps-row {
     padding: 9px 12px;
     display: flex;
