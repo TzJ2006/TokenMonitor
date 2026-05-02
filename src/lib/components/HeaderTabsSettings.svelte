@@ -8,6 +8,7 @@
     type Settings as SettingsType,
   } from "../stores/settings.js";
   import {
+    ALL_USAGE_PROVIDER_ID,
     getUsageProviderTitle,
     USAGE_PROVIDER_ORDER,
   } from "../providerMetadata.js";
@@ -116,27 +117,32 @@
 
   <!-- Live preview: mirrors the Menubar/Floating-Ball preview pattern in
        TrayConfigSettings so every visual settings group has the same
-       "see what you're configuring" feedback.
-       Uses the real Toggle component for fidelity, with two deliberate
-       overrides:
-         1. `brandTheming={false}` — drops the per-brand provider-logo
-            row above the segmented control. That row is taller than
-            the segmented control itself and isn't directly relevant
-            to label/order configuration.
-         2. The wrapper resets `--accent-soft` to a neutral surface
-            color. The popover's accent flips with the active provider
-            (`applyProvider`), so an unscoped Toggle would highlight
-            the preview's "active" segment in whichever brand the
-            user happens to have selected globally — making it look
-            as if clicking "Claude" colored it Codex-blue (or vice
-            versa). Pinning to a brand-neutral grey makes the preview
-            mean only "this is the order and labels," nothing more. -->
-  <div class="header-preview">
+       "see what you're configuring" feedback. Renders the real Toggle
+       component with full brand theming (icons + accent colors) so the
+       preview is exact, not a stand-in.
+
+       Brand-color scoping: `--accent` and `--accent-soft` are normally
+       set on `<html>` via `applyProvider(activeProvider)`, so the popover's
+       active provider colors *every* descendant — including this preview.
+       Without a fix, clicking "Claude" inside the preview while the
+       popover was on Codex would tint the Claude logo Codex-blue (and
+       vice versa), because the preview was reading the popover's accent
+       not its own. We re-set `data-provider` on the preview wrapper so
+       the brand-color cascade restarts here, anchored to `previewActive`
+       — that way the preview always shows the brand color of the tab
+       the user is actively previewing, regardless of where the popover
+       happens to be. The `null` for "all" is intentional: the popover
+       removes the attribute in that case (no brand override) and so
+       does the preview, so they share the same neutral default. -->
+  <div
+    class="header-preview"
+    data-provider={previewActive === ALL_USAGE_PROVIDER_ID ? null : previewActive}
+  >
     {#if previewOptions.length > 0}
       <Toggle
         active={previewActive}
         options={previewOptions}
-        brandTheming={false}
+        brandTheming={current.brandTheming}
         onChange={(p) => (previewActive = p)}
       />
     {:else}
@@ -220,27 +226,13 @@
     padding: 4px 4px 0;
   }
 
-  /* Preview surface. Tighter than `.tray-preview` because the hosted
-     Toggle no longer carries its brand-logo row (brandTheming=false),
-     which means there's nothing tall enough to need extra padding. */
+  /* Preview surface. */
   .header-preview {
     background: var(--surface-2);
     border-radius: 8px;
-    padding: 8px 4px;
+    padding: 6px 4px 8px;
     margin-bottom: 8px;
     overflow: hidden;
-    /* Brand-neutral slider color in the preview scope only. App.svelte
-       sets `--accent-soft` based on the popover's active provider
-       (applyProvider); without this override the preview would tint
-       its "active" segment in whatever brand color the popover is
-       currently on, which lies about what the configured header will
-       look like when each tab activates. Pinning to a low-alpha
-       neutral makes the active highlight purely positional, not
-       brand-coded. */
-    --accent-soft: rgba(255, 255, 255, 0.08);
-  }
-  :global([data-theme="light"]) .header-preview {
-    --accent-soft: rgba(0, 0, 0, 0.06);
   }
   /* Pull Toggle's intrinsic top padding back so the segmented control
      sits visually centered inside the preview surface instead of
@@ -248,6 +240,37 @@
      the popover (which is why .tog-wrap has padding-top: 10px). */
   .header-preview :global(.tog-wrap) {
     padding: 0 8px;
+  }
+
+  /* ── Preview brand-color scope ─────────────────────────────────────
+     These rules mirror the `[data-provider="…"]` block in `app.css`
+     but anchor them to `.header-preview` so the cascade restarts at
+     the wrapper. The `app.css` rules use `[data-theme="light"][data-provider]`
+     selectors that require both attributes on the *same* element —
+     fine for `<html>`, but `data-theme` lives on `<html>` and our
+     `data-provider` lives on `.header-preview`, so the global rules
+     can't reach this scope. We re-establish them here.
+
+     Values are duplicated rather than shared via a custom property
+     because the upstream rules already use literal hex values; one
+     source of truth would mean refactoring app.css too, which is
+     outside the scope of this preview. If brand colors ever change,
+     update both locations. */
+  .header-preview[data-provider="claude"] {
+    --accent: #E8784A;
+    --accent-soft: rgba(232, 120, 74, 0.12);
+  }
+  :global([data-theme="light"]) .header-preview[data-provider="claude"] {
+    --accent: #C85E2A;
+    --accent-soft: rgba(200, 94, 42, 0.14);
+  }
+  .header-preview[data-provider="codex"] {
+    --accent: #52A8DC;
+    --accent-soft: rgba(82, 168, 220, 0.12);
+  }
+  :global([data-theme="light"]) .header-preview[data-provider="codex"] {
+    --accent: #2E7EB5;
+    --accent-soft: rgba(46, 126, 181, 0.14);
   }
   /* Empty state for the no-tabs-enabled corner case. Subtle enough
      that it reads as "informational" rather than "error." */
