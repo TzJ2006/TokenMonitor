@@ -32,12 +32,13 @@ pub async fn set_refresh_interval(interval: u64, state: State<'_, AppState>) -> 
     Ok(())
 }
 
-/// Enable or disable live rate-limit fetching.
+/// Enable or disable rate-limit fetching.
 ///
-/// When disabled, the background loop skips `refresh_rate_limits`, so the app
-/// never touches the Claude OAuth token in the macOS Keychain. This lets us
-/// open the app without firing any Keychain prompt until the user explicitly
-/// opts in (via the welcome card or the rate-limits CTA).
+/// Pre-rewrite this gated the macOS Keychain probe; post-rewrite the fetch
+/// only touches the statusline event file and the JSONL parser cache, so
+/// the toggle is effectively cosmetic — kept so existing settings.json
+/// files continue to round-trip and so users can hide the rate-limit row
+/// if they want.
 #[tauri::command]
 pub async fn set_rate_limits_enabled(
     enabled: bool,
@@ -63,70 +64,6 @@ pub async fn set_usage_access_enabled(
         .usage_access_enabled
         .store(enabled, std::sync::atomic::Ordering::SeqCst);
     Ok(())
-}
-
-/// Outcome of the interactive Keychain prompt. Surfaced to the frontend so it
-/// can show appropriate copy after the user responds.
-///
-/// Each variant is constructed on a different OS path (Granted/Denied on
-/// macOS, NotApplicable everywhere else), so per-target dead-code analysis
-/// flags the ones not used on the current platform. Since the enum is the
-/// IPC contract — every variant is "live" from the frontend's perspective —
-/// suppress the lint at the enum level instead of per-variant.
-///
-/// `AlreadyRequested` is no longer returned by the backend (the frontend
-/// short-circuits via the `keychainAccessRequested` setting before invoking
-/// the IPC). It's kept on the type so older frontend builds that still pattern
-/// match on it continue to compile.
-#[derive(serde::Serialize, Clone, Debug)]
-#[serde(rename_all = "snake_case", tag = "status")]
-#[allow(dead_code)]
-pub enum KeychainAccessOutcome {
-    /// User granted access (or access was already silently available).
-    Granted,
-    /// User denied the prompt, the item is missing, or read failed.
-    Denied { reason: String },
-    /// Keychain isn't part of the credentials path on this platform.
-    NotApplicable,
-    /// Reserved for backwards compatibility with older frontend builds.
-    AlreadyRequested,
-}
-
-/// Trigger the interactive Keychain prompt for the Claude OAuth token.
-///
-/// This is the **only** code path that allows the macOS Keychain UI to
-/// appear — every other read is silent (`skip_authenticated_items` +
-/// `disable_user_interaction`). On a successful read the credentials JSON is
-/// also mirrored into TokenMonitor's owned Keychain item, so subsequent
-/// background refreshes can read silently from our own item without depending
-/// on Claude Code's ACL surviving its next token rotation.
-///
-/// The frontend dedupes concurrent calls via `keychainRequestInFlight` and
-/// gates auto-firing behind the `keychainAccessRequested` setting; the
-/// backend is intentionally re-callable so the user can re-grant on demand
-/// (e.g. via a "Re-grant Keychain access" button) after a token expiry has
-/// invalidated the owned item.
-#[tauri::command]
-pub async fn request_claude_keychain_access() -> Result<KeychainAccessOutcome, String> {
-    #[cfg(target_os = "macos")]
-    {
-        // Run the synchronous Keychain call on a blocking thread so we don't
-        // pin the Tauri async runtime while macOS shows the auth panel.
-        let outcome =
-            tokio::task::spawn_blocking(crate::rate_limits::request_claude_keychain_access)
-                .await
-                .map_err(|e| format!("Keychain access task failed: {e}"))?;
-
-        Ok(match outcome {
-            Ok(()) => KeychainAccessOutcome::Granted,
-            Err(reason) => KeychainAccessOutcome::Denied { reason },
-        })
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(KeychainAccessOutcome::NotApplicable)
-    }
 }
 
 /// Result of an App Data TCC probe. We can't query macOS directly for
@@ -264,45 +201,6 @@ pub async fn open_app_data_settings() -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
         Ok(())
-    }
-}
-
-/// Probe whether TokenMonitor's silent Keychain read currently succeeds.
-/// True means we hold a usable Claude OAuth token — either via our own
-/// mirror item or via a Claude Code-credentials ACL grant that hasn't yet
-/// been wiped by a token rotation. Used by the onboarding wizard so
-/// "Authorized" is shown without requiring a click.
-#[tauri::command]
-pub async fn check_claude_keychain_access() -> Result<bool, String> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(
-            tokio::task::spawn_blocking(crate::rate_limits::has_silent_claude_token)
-                .await
-                .unwrap_or(false),
-        )
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(false)
-    }
-}
-
-/// Test-only IPC that runs the OAuth refresh-grant flow against the owned
-/// mirror right now. Used to exercise the refresh path live (and confirm
-/// it works against Anthropic's endpoint) without waiting for a natural
-/// 401. Returns a short status string.
-#[tauri::command]
-pub async fn debug_force_oauth_refresh() -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(crate::rate_limits::debug_force_refresh().await)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok("not_applicable".to_string())
     }
 }
 
@@ -460,10 +358,16 @@ pub async fn get_rate_limits(
     }
 
     let codex_dir = state.parser.codex_dir().to_path_buf();
+    let plan = *state.claude_plan_tier.read().await;
     let cached = state.cached_rate_limits.read().await.clone();
-    let fresh =
-        crate::rate_limits::fetch_selected_rate_limits(&codex_dir, selection, cached.as_ref())
-            .await;
+    let fresh = crate::rate_limits::fetch_selected_rate_limits(
+        std::sync::Arc::clone(&state.parser),
+        codex_dir,
+        plan,
+        selection,
+        cached.as_ref(),
+    )
+    .await;
 
     let merged = crate::rate_limits::merge_rate_limits(fresh, cached.as_ref());
 
