@@ -214,11 +214,7 @@
   .group {
     margin-bottom: 8px;
   }
-  .group-label {
-    font: 500 8px/1 'Inter', sans-serif;
-    color: var(--t4);
-    padding: 2px 4px 4px;
-  }
+  /* `.group-label` is defined globally in `src/app.css`. */
   .card {
     background: var(--surface-2);
     border-radius: 8px;
