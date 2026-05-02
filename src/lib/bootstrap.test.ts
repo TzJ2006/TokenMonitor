@@ -54,7 +54,11 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     debugLogging: false,
     rateLimitsEnabled: false,
     hasSeenWelcome: true,
-    keychainAccessRequested: true,
+    lastOnboardedVersion: "0.12.0",
+    statuslineInstalled: false,
+    claudePlanTier: "Pro",
+    claudePlanCustomFiveHourTokens: null,
+    claudePlanCustomWeeklyTokens: null,
     usageAccessEnabled: true,
     ...overrides,
   };

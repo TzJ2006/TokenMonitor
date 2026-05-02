@@ -54,9 +54,10 @@ pub fn ssh_config() -> Option<PathBuf> {
     home().map(|h| h.join(".ssh").join("config"))
 }
 
-/// Claude credentials JSON (non-macOS fallback when Keychain isn't used).
+/// Path of `~/.claude/settings.json` — read and patched by the statusline
+/// installer to point Claude Code at our script.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn claude_credentials_file() -> Option<PathBuf> {
+pub fn claude_settings_file() -> Option<PathBuf> {
     env::var("CLAUDE_CONFIG_DIR")
         .ok()
         .and_then(|raw| {
@@ -66,7 +67,7 @@ pub fn claude_credentials_file() -> Option<PathBuf> {
                 .map(PathBuf::from)
         })
         .or_else(|| home().map(|h| h.join(".claude")))
-        .map(|p| p.join(".credentials.json"))
+        .map(|p| p.join("settings.json"))
 }
 
 /// Enumerate every path the app *may* read, for audit and UI display.
@@ -94,9 +95,9 @@ pub fn accessed_paths() -> Vec<AccessedPath> {
             env_override: None,
         });
     }
-    if let Some(p) = claude_credentials_file() {
+    if let Some(p) = claude_settings_file() {
         out.push(AccessedPath {
-            purpose: "Claude OAuth credentials for silent rate-limit reads",
+            purpose: "Claude Code settings.json (statusline configuration)",
             path: p,
             env_override: Some("CLAUDE_CONFIG_DIR"),
         });

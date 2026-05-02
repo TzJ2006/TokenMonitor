@@ -112,8 +112,6 @@
   }
   .group-label {
     font: 500 8px/1 'Inter', sans-serif;
-
-    letter-spacing: 0.8px;
     color: var(--t4);
     padding: 2px 4px 4px;
   }

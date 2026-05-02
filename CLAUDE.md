@@ -14,7 +14,7 @@ Supported platforms: **macOS**, **Windows**, **Linux**.
 |---------|-------|---------|-------|
 | System tray icon | Menu bar | System tray | System tray |
 | Cost display | `set_title()` text beside icon | Tooltip on hover | Tooltip on hover |
-| Rate limits (Claude) | OAuth via Keychain + API, CLI probe fallback | CLI probe only | CLI probe only |
+| Rate limits (Claude) | Statusline events file + JSONL rolling windows | Same | Same |
 | Rate limits (Codex) | JSONL session files | JSONL session files | JSONL session files |
 | Glass blur effect | Supported (toggle in Settings) | Not available (opaque) | Not available (opaque) |
 | Dock icon toggle | Supported | Not applicable | Not applicable |
@@ -113,9 +113,13 @@ float-ball.html → float-ball.ts → FloatBall.svelte (always-on-top overlay)
 
 **Data flow:** Local JSONL files → Rust `usage/parser` + `usage/pricing` → in-memory cache (Arc<RwLock<>>, 2-min TTL) → Tauri IPC → Svelte stores → UI components. Background loop refreshes tray and emits `data-updated` events every 120s. Frontend also maintains a payload cache to eliminate IPC round-trips on tab switches. SSH remote logs are synced via `usage/ssh_remote.rs` and merged into the same pipeline.
 
-**Rate limits:** Split into `rate_limits/claude.rs` (OAuth Keychain + API, macOS only), `rate_limits/claude_cli.rs` (CLI probe fallback, all platforms), `rate_limits/codex.rs` (session file parsing), and `rate_limits/http.rs` (shared HTTP client). On Windows/Linux, the CLI probe is the primary method for Claude. Codex rate limits are read from local session files on all platforms. Both are cached and refreshed on configurable intervals per provider (see `rateLimits` in `providerMetadata.ts`).
+**Rate limits:** `rate_limits/claude.rs` builds the Claude payload from local data only — `statusline::source` for activity freshness + `statusline::windows::compute` for rolling 5h and 7d aggregates over the JSONL parser cache. `rate_limits/codex.rs` parses Codex session files. `rate_limits/http.rs` keeps the shared `merge_provider_rate_limits` and error-payload helpers. There is **no OAuth, no Keychain, no `claude` CLI probe** on any platform; all the system-credential plumbing was retired in favor of the statusline-driven flow described below.
+
+**Statusline integration:** `statusline/install.rs` writes a small POSIX shell or PowerShell script under `<app_data>/statusline/` and patches `~/.claude/settings.json` to invoke it as Claude Code's `statusLine.command`. CC fires that script on every prompt with a JSON envelope on stdin (`session_id`, `transcript_path`, `model`, `cwd`); the script appends one JSONL line to `<app_data>/statusline/events.jsonl` and prints nothing back. `statusline/source.rs` reads the latest event for activity freshness, while `statusline/windows.rs` does the rolling-window math against the user's plan tier (`Free`/`Pro`/`Max5x`/`Max20x`/`Custom`, settable in Settings). `statusline/scripts.rs` holds the script bodies as Rust string constants. The IPC commands `install_statusline`, `check_statusline`, `uninstall_statusline`, `set_claude_plan_tier`, and `read_latest_statusline_ping` live in `commands/statusline.rs`.
 
 **Pricing:** Model pricing lives in `usage/pricing.rs` with a `PRICING_VERSION` constant. When Anthropic/OpenAI update pricing, update the rates in `get_rates()` and bump `PRICING_VERSION`. Cache-write tiers follow Anthropic's standard multipliers (5m = 1.25x, 1h = 2x, read = 0.1x).
+
+**Plan-tier budgets (Claude rate limits):** The rolling-window utilization% is computed against per-tier token budgets in `statusline/windows.rs::ClaudePlanTier`. These constants are deliberate underestimates derived from public Anthropic plan information — they're fine as a "X% of your plan" gauge but should not be treated as authoritative. Users with non-standard accounts can pick `Custom` in Settings and provide their own 5h/weekly token caps.
 
 **Frontend tests** live alongside source files as `*.test.ts` (vitest, node environment). Tests mock `@tauri-apps/api` IPC calls.
 
@@ -129,7 +133,7 @@ float-ball.html → float-ball.ts → FloatBall.svelte (always-on-top overlay)
 
 **Native window:** On macOS, the popover previously used `NSVisualEffectView` for glass blur effects; this has been replaced with cross-platform opaque backgrounds. Glass effect toggle and Dock icon settings are hidden on non-macOS platforms via `src/lib/utils/platform.ts` detection. The `set_glass_effect`, `set_window_surface`, and `set_dock_icon_visible` IPC commands are retained as noops for frontend compatibility.
 
-**Commands module (Rust):** `commands.rs` is the IPC dispatch hub, split into domain-specific submodules: `usage_query` (data fetching), `calendar` (heatmap queries), `period` (time range selection), `config` (settings sync), `tray` (title/utilization rendering), `ssh` (remote device management), `float_ball` (overlay state), and `logging` (log-level control). `AppState` (defined in `commands.rs`) holds all shared state as `Arc<RwLock<>>` fields.
+**Commands module (Rust):** `commands.rs` is the IPC dispatch hub, split into domain-specific submodules: `usage_query` (data fetching), `calendar` (heatmap queries), `period` (time range selection), `config` (settings sync), `tray` (title/utilization rendering), `ssh` (remote device management), `float_ball` (overlay state), `logging` (log-level control), and `statusline` (statusline install/check/uninstall + plan-tier write). `AppState` (defined in `commands.rs`) holds all shared state as `Arc<RwLock<>>` fields, including `claude_plan_tier` for the rate-limit window math.
 
 **Logging:** `logging.rs` initializes `tracing` with a rolling file appender for backend logs and a separate appender for frontend logs forwarded via IPC (`log_frontend_message` command). Frontend uses `utils/logger.ts` which routes through the same Rust file writer. Log files live in the platform app-data directory. Log level is runtime-configurable via a reload handle.
 
