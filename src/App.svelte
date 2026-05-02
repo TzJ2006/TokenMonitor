@@ -14,7 +14,6 @@
     fetchData,
     warmCache,
     warmAllPeriods,
-    clearUsageCache,
     clearUsageCacheForProviders,
     seedUsageCache,
   } from "./lib/stores/usage.js";
@@ -59,12 +58,7 @@
     isResizeDebugEnabled,
     logResizeDebug,
   } from "./lib/uiStability.js";
-  import { isMacOS } from "./lib/utils/platform.js";
-  import {
-    markClaudeKeychainAccessHandled,
-    requestClaudeKeychainAccessAgain,
-    requestClaudeKeychainAccessOnce,
-  } from "./lib/permissions/keychain.js";
+  import { installStatusline, checkStatusline, type InstalledState } from "./lib/permissions/statusline.js";
 
   import Toggle from "./lib/components/Toggle.svelte";
   import TimeTabs from "./lib/components/TimeTabs.svelte";
@@ -82,7 +76,6 @@
   import SingleDeviceView from "./lib/components/SingleDeviceView.svelte";
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import PermissionDisclosure from "./lib/components/PermissionDisclosure.svelte";
-  import KeychainPromptPreview from "./lib/components/KeychainPromptPreview.svelte";
   import PermissionsOnboarding from "./lib/components/PermissionsOnboarding.svelte";
   import type { HeaderTabs, UsagePayload, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
 
@@ -105,11 +98,13 @@
     error: null as string | null,
     deferredUntil: null as string | null,
   });
-  let showKeychainPermissionPanel = $state(false);
-  let keychainPermissionBusy = $state(false);
-  /** Animated preview of the macOS keychain prompt, shown right before the
-   * real one fires so the user knows to click "Always Allow". */
-  let showKeychainPreview = $state(false);
+  let statuslineBusy = $state(false);
+  let statuslineInstalled = $state<boolean | null>(null);
+  /** Granular probe result; mirrors `statuslineInstalled` but distinguishes
+   * `script_missing` from `not_installed` so the stale banner can tell the
+   * user "we'll auto-refresh on your next prompt" instead of pushing a
+   * reinstall when the install is actually fine. */
+  let statuslineProbeStatus = $state<InstalledState["status"] | null>(null);
   /** Bartender-style onboarding wizard. Driven by the `hasSeenWelcome`
    * setting now that the test-only auto-open `$effect` has been removed
    * — first launch shows the wizard, every subsequent launch skips it. */
@@ -126,18 +121,12 @@
       logger.error("permissions", `Failed to enable usage access: ${err}`);
     });
     await loadInitialData();
+    void refreshStatuslineProbe();
     await updateSetting("hasSeenWelcome", true);
     await tick();
     syncSizeAndVerify("onboarding-finish");
   }
 
-  /** Best-effort signal that the keychain ACL is currently held — true when
-   * the latest rate-limit fetch returned more windows than the CLI fallback
-   * can produce (CLI maxes at one window). */
-  let keychainAuthorized = $derived.by(() => {
-    const claude = providerPayload(rateLimits, "claude");
-    return Boolean(claude && claude.windows.length >= 2);
-  });
   let brandTheming = $state(true);
   let headerTabs = $state<HeaderTabs>(DEFAULT_HEADER_TABS);
   let popEl: HTMLDivElement | null = null;
@@ -184,6 +173,24 @@
     const unsub4 = rateLimitsData.subscribe((v) => (rateLimits = v));
     const unsub5 = rateLimitsRequestState.subscribe((v) => (rateLimitsRequest = v));
     return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5(); };
+  });
+
+  // Re-probe statusline whenever a rate-limit payload turns stale. This
+  // keeps `statuslineProbeStatus` truthful at the moment the stale banner
+  // mounts, so the banner can choose between "Reinstall" (script genuinely
+  // missing) and the gentler "we'll auto-refresh" message without the user
+  // ever seeing a reinstall CTA on a healthy install.
+  let anyPayloadStale = $derived.by(() => {
+    if (!rateLimits) return false;
+    return rateLimitProvidersForScope(provider).some((p) => {
+      const payload = providerPayload(rateLimits, p);
+      return Boolean(payload && (payload.error || payload.stale));
+    });
+  });
+  $effect(() => {
+    if (anyPayloadStale && period === "5h") {
+      void refreshStatuslineProbe();
+    }
   });
 
   // Apply/remove data-provider attribute reactively
@@ -244,85 +251,48 @@
   }
 
   async function enableRateLimits() {
-    showKeychainPermissionPanel = false;
     await updateSetting("rateLimitsEnabled", true);
     await invoke("set_rate_limits_enabled", { enabled: true });
-    // Force the fetch — the cached payload may carry a cooldownUntil from a
-    // previous CLI rejection that the user has just resolved by re-granting,
-    // and the normal eligibility filter would otherwise skip the call.
     await fetchRateLimits(provider, { force: true });
     await tick();
     syncSizeAndVerify("rate-limits-enabled");
   }
 
   async function handleEnableRateLimits() {
-    if (keychainPermissionBusy) return;
-    keychainPermissionBusy = true;
+    if (statuslineBusy) return;
+    statuslineBusy = true;
     try {
       await enableRateLimits();
     } finally {
-      keychainPermissionBusy = false;
+      statuslineBusy = false;
     }
   }
 
-  async function handleShowKeychainFallback() {
-    if (keychainPermissionBusy) return;
-    showKeychainPermissionPanel = true;
-    await tick();
-    syncSizeAndVerify("keychain-permission-open");
-  }
-
-  async function handleAllowKeychainForRateLimits() {
-    if (keychainPermissionBusy) return;
-    keychainPermissionBusy = true;
+  /** Single CTA for the rate-limit empty state: install the statusline
+   * (idempotent) and turn on rate-limit fetching. No OS prompts. */
+  async function handleInstallStatusline() {
+    if (statuslineBusy) return;
+    statuslineBusy = true;
     try {
-      await requestClaudeKeychainAccessOnce("rate-limits");
+      await installStatusline("rate-limits");
+      statuslineInstalled = true;
       await enableRateLimits();
+    } catch (err) {
+      logger.error("permissions", `Statusline install failed: ${err}`);
     } finally {
-      keychainPermissionBusy = false;
+      statuslineBusy = false;
     }
   }
 
-  async function handleSkipKeychainForRateLimits() {
-    if (keychainPermissionBusy) return;
-    keychainPermissionBusy = true;
+  async function refreshStatuslineProbe() {
     try {
-      await markClaudeKeychainAccessHandled();
-      await enableRateLimits();
-    } finally {
-      keychainPermissionBusy = false;
+      const probe = await checkStatusline();
+      statuslineProbeStatus = probe.status;
+      statuslineInstalled = probe.status === "installed";
+    } catch {
+      statuslineProbeStatus = null;
+      statuslineInstalled = null;
     }
-  }
-
-  /** Re-trigger the Keychain prompt after a previous grant went stale (e.g.
-   * the OAuth token expired and the backend dropped its owned mirror on 401).
-   * Unlike the welcome card path, this ignores `keychainAccessRequested` so
-   * the user can recover without flipping a setting.
-   *
-   * The flow is: show our animated macOS-prompt preview → on user
-   * confirmation, fire the real Keychain UI via
-   * `requestClaudeKeychainAccessAgain` → enable rate limits and force a
-   * fetch. The preview is purely visual; it never makes an OS call. */
-  function handleRegrantKeychainForRateLimits() {
-    if (keychainPermissionBusy) return;
-    showKeychainPreview = true;
-  }
-
-  async function runKeychainRegrantFlow() {
-    if (keychainPermissionBusy) return;
-    keychainPermissionBusy = true;
-    try {
-      await requestClaudeKeychainAccessAgain("rate-limits");
-      showKeychainPreview = false;
-      await enableRateLimits();
-    } finally {
-      keychainPermissionBusy = false;
-    }
-  }
-
-  function handleKeychainPreviewCancel() {
-    if (keychainPermissionBusy) return;
-    showKeychainPreview = false;
   }
 
   async function handleProviderChange(p: UsageProvider) {
@@ -615,6 +585,7 @@
         await loadInitialData();
         if (cancelled) return;
       }
+      void refreshStatuslineProbe();
       appReady = true;
 
       if (popEl) {
@@ -638,7 +609,18 @@
           period,
           offset,
         });
-        clearUsageCache();
+        // Do **not** call clearUsageCache() here. `fetchData` already
+        // does stale-while-revalidate: a cache hit returns the previous
+        // payload instantly and fires a silent background refresh that
+        // atomically swaps in the new data when it lands. Wiping the
+        // cache forces the cold path (`usageData.set(emptyPayload())`
+        // + `isLoading=true`), which at the 2s fast-poll cadence during
+        // streaming produces a visible flicker every couple of seconds —
+        // the dashboard briefly renders zeroed metrics + a loading bar
+        // before snapping back to real values. Other callers
+        // (`SshHostsSettings`, `Settings`) still wipe the cache because
+        // their changes are semantic; this listener fires on data
+        // *value* changes where the SWR path is exactly what we want.
         fetchData(provider, period, offset);
         if (period === "5h") fetchRateLimits(provider);
       });
@@ -707,7 +689,6 @@
       <SplashScreen ready={appReady} onComplete={() => { showSplash = false; tick().then(() => syncSizeAndVerify("splash-complete")); }} />
     {:else if showPermissionsOnboarding}
       <PermissionsOnboarding
-        keychainAuthorized={keychainAuthorized}
         onFinish={handleOnboardingFinish}
       />
     {:else if appReady && !data}
@@ -742,48 +723,28 @@
       <MetricsRow {data} />
       <div class="hr"></div>
 
-      {#if period === "5h" && showKeychainPermissionPanel && isMacOS() && !$settings.keychainAccessRequested}
-        <div class="rate-limit-permission" role="dialog" aria-labelledby="rate-limit-permission-title">
-          <div class="rate-limit-empty-title" id="rate-limit-permission-title">
-            Keychain fallback for live limits
+      {#if period === "5h" && $settings.rateLimitsEnabled && statuslineInstalled === false}
+        <div class="rate-limit-empty" role="dialog" aria-labelledby="rate-limit-statusline-title">
+          <div class="rate-limit-empty-title" id="rate-limit-statusline-title">
+            Set up live rate limits
           </div>
           <div class="rate-limit-empty-text">
-            TokenMonitor normally reads Claude live limits from your Claude
-            credentials file without any macOS prompt. If that file is missing
-            or unreadable, you can allow a one-time Keychain fallback.
+            TokenMonitor reads live 5-hour and weekly utilization from a tiny
+            statusline script Claude Code calls on every prompt. Installing it
+            adds one entry to <code>~/.claude/settings.json</code> — no
+            Keychain prompt, no network request.
           </div>
           <PermissionDisclosure mode="rate-limit" />
-          <div class="rate-limit-empty-text">
-            macOS may show a Keychain window after you continue. Choose
-            <strong>Always Allow</strong> if you want future fallback checks to stay silent.
-          </div>
-          <div class="rate-limit-actions">
-            <button
-              type="button"
-              class="rate-limit-secondary"
-              onclick={handleSkipKeychainForRateLimits}
-              disabled={keychainPermissionBusy}
-            >
-              Do not use Keychain
-            </button>
-            <button
-              type="button"
-              class="rate-limit-cta"
-              onclick={handleAllowKeychainForRateLimits}
-              disabled={keychainPermissionBusy}
-            >
-              Allow Keychain access
-            </button>
-          </div>
+          <button
+            type="button"
+            class="rate-limit-cta"
+            onclick={handleInstallStatusline}
+            disabled={statuslineBusy}
+          >
+            {statuslineBusy ? "Installing…" : "Install statusline"}
+          </button>
         </div>
       {:else if period === "5h" && $settings.rateLimitsEnabled && visibleUsableRateLimitProviders.length > 0}
-        {#if showKeychainPreview && isMacOS()}
-          <KeychainPromptPreview
-            busy={keychainPermissionBusy}
-            onContinue={runKeychainRegrantFlow}
-            onCancel={handleKeychainPreviewCancel}
-          />
-        {/if}
         {#each visibleUsableRateLimitProviders as rateLimitProvider, index}
           <UsageBars
             providerLabel={provider === ALL_USAGE_PROVIDER_ID ? getUsageProviderLabel(rateLimitProvider) : undefined}
@@ -793,38 +754,47 @@
             <div class="hr"></div>
           {/if}
         {/each}
-        {#if !showKeychainPreview && isMacOS() && visibleUsableRateLimitProviders.some((p) => {
+        {#if visibleUsableRateLimitProviders.some((p) => {
           const payload = providerPayload(rateLimits, p);
-          if (!payload) return false;
-          // Auth error surfaced explicitly, payload marked stale, or — for
-          // Claude only — we got back fewer windows than the OAuth API
-          // returns. CLI fallback only ever emits a single five_hour window,
-          // so anything less than 2 means OAuth is degraded and the user
-          // can't see weekly / per-model / extra-usage stats.
-          return Boolean(payload.error)
-            || payload.stale
-            || (p === "claude" && payload.windows.length < 2);
+          return Boolean(payload && (payload.error || payload.stale));
         })}
-          <div class="rate-limit-stale-banner">
-            <div class="rate-limit-empty-text">
-              Showing limited data. Weekly, weekly Sonnet/Opus, and extra-usage
-              windows only return after a fresh OAuth read.
-            </div>
-            <button
-              type="button"
-              class="kc-cta"
-              onclick={handleRegrantKeychainForRateLimits}
-              disabled={keychainPermissionBusy}
-            >
-              <span class="kc-cta-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="9" cy="13" r="3"/>
-                  <path d="M11.5 11L20 2.5"/>
-                  <path d="M16.5 6L19 8.5"/>
-                </svg>
+          <!-- Two distinct states share this banner. The "stale-but-healthy"
+               case (CC simply hasn't fired in a while) needs a calm,
+               ambient note — pushing reinstall here was the source of the
+               earlier churn. The "actually broken" case (script_missing
+               or not_installed) is the only state that warrants an
+               action button. Visual treatment mirrors the redesigned
+               PermissionSettings: a small status dot carries the color,
+               text stays neutral, the CTA only appears when needed. -->
+          {@const probeBroken =
+            statuslineProbeStatus === "script_missing" ||
+            statuslineProbeStatus === "not_installed"}
+          <div class="rate-limit-stale-banner" data-state={probeBroken ? "warn" : "idle"}>
+            <div class="rl-stale-row">
+              <span class="rl-stale-dot" aria-hidden="true"></span>
+              <span class="rl-stale-headline">
+                {probeBroken
+                  ? "Statusline needs attention"
+                  : "No recent Claude Code activity"}
               </span>
-              Re-grant Keychain access
-            </button>
+            </div>
+            <div class="rl-stale-body">
+              {#if probeBroken}
+                Reinstall the statusline to restore live updates.
+              {:else}
+                Numbers refresh automatically on your next prompt.
+              {/if}
+            </div>
+            {#if probeBroken}
+              <button
+                type="button"
+                class="kc-cta"
+                onclick={handleInstallStatusline}
+                disabled={statuslineBusy}
+              >
+                {statuslineBusy ? "Reinstalling…" : "Reinstall statusline"}
+              </button>
+            {/if}
           </div>
         {/if}
       {:else if period === "5h" && shouldShowFiveHourUsageFallback}
@@ -842,14 +812,14 @@
         <div class="rate-limit-empty">
           <div class="rate-limit-empty-title">Live rate limits are off</div>
           <div class="rate-limit-empty-text">
-            Turn this on to see live 5h and weekly rate-limit percentages.
-            TokenMonitor uses your Claude credentials file first and does not open Keychain from this button.
+            Turn this on to see live 5h and weekly rate-limit percentages
+            computed from local data only.
           </div>
           <button
             type="button"
             class="rate-limit-cta"
             onclick={handleEnableRateLimits}
-            disabled={keychainPermissionBusy}
+            disabled={statuslineBusy}
           >
             Enable rate limits
           </button>
@@ -866,25 +836,14 @@
               {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
             {/if}
           </div>
-          {#if isMacOS() && !$settings.keychainAccessRequested}
-            <button
-              type="button"
-              class="rate-limit-secondary"
-              onclick={handleShowKeychainFallback}
-              disabled={keychainPermissionBusy}
-            >
-              Review Keychain fallback
-            </button>
-          {:else if isMacOS() && rateLimitsRequest.error}
-            <button
-              type="button"
-              class="rate-limit-cta"
-              onclick={handleRegrantKeychainForRateLimits}
-              disabled={keychainPermissionBusy}
-            >
-              Re-grant Keychain access
-            </button>
-          {/if}
+          <button
+            type="button"
+            class="rate-limit-cta"
+            onclick={handleInstallStatusline}
+            disabled={statuslineBusy}
+          >
+            {statuslineBusy ? "Installing…" : "Reinstall statusline"}
+          </button>
         </div>
       {:else if data.total_cost === 0 && data.total_tokens === 0}
         <div class="empty-period">{emptyPeriodLabel(period, offset)}</div>
@@ -953,7 +912,6 @@
     padding: 24px 0;
   }
   .rate-limit-empty,
-  .rate-limit-permission,
   .rate-limit-stale-banner {
     display: flex;
     flex-direction: column;
@@ -963,9 +921,48 @@
   }
   .rate-limit-stale-banner {
     padding-top: 8px;
+    gap: 6px;
   }
-  .rate-limit-permission {
+  /* Status dot + headline row. Dot color is driven by data-state on the
+     parent so the markup stays declarative. The dot picks up a soft halo
+     using a wide low-alpha box-shadow so the indicator reads as alive
+     without shouting — same pattern as PermissionSettings. */
+  .rl-stale-row {
+    display: flex;
+    align-items: center;
     gap: 7px;
+  }
+  .rl-stale-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    transition: background var(--t-fast, 120ms) ease;
+  }
+  .rate-limit-stale-banner[data-state="idle"] .rl-stale-dot {
+    background: var(--t3);
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04);
+  }
+  :global([data-theme="light"]) .rate-limit-stale-banner[data-state="idle"] .rl-stale-dot {
+    box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.05);
+  }
+  .rate-limit-stale-banner[data-state="warn"] .rl-stale-dot {
+    background: #E8A060;
+    box-shadow: 0 0 0 3px rgba(232, 160, 96, 0.14);
+  }
+  .rl-stale-headline {
+    font: 500 11px/1.2 'Inter', sans-serif;
+    color: var(--t1);
+    letter-spacing: -0.05px;
+  }
+  .rate-limit-stale-banner[data-state="warn"] .rl-stale-headline {
+    color: #E8A060;
+  }
+  .rl-stale-body {
+    font: 400 10px/1.45 'Inter', sans-serif;
+    color: var(--t3);
+    letter-spacing: -0.02px;
+    margin-left: 13px; /* aligns with the headline text under the dot */
   }
   .rate-limit-empty-title {
     font: 500 11px/1 'Inter', sans-serif;
@@ -993,8 +990,7 @@
     transition: filter var(--t-fast) ease;
   }
   .rate-limit-cta:hover:not(:disabled) { filter: brightness(1.08); }
-  .rate-limit-cta:disabled,
-  .rate-limit-secondary:disabled {
+  .rate-limit-cta:disabled {
     cursor: default;
     opacity: .55;
   }
@@ -1029,37 +1025,6 @@
   .kc-cta:disabled {
     opacity: 0.5;
     cursor: default;
-  }
-  .kc-cta-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px; height: 16px;
-    color: var(--accent, var(--t1));
-    opacity: 0.85;
-  }
-  .rate-limit-actions {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    margin-top: 7px;
-  }
-  .rate-limit-actions .rate-limit-cta {
-    margin-top: 0;
-  }
-  .rate-limit-secondary {
-    padding: 6px 8px;
-    border: 1px solid var(--border-subtle);
-    border-radius: 6px;
-    background: transparent;
-    color: var(--t2);
-    font: 500 10px/1 'Inter', sans-serif;
-    cursor: pointer;
-    transition: background var(--t-fast) ease, color var(--t-fast) ease;
-  }
-  .rate-limit-secondary:hover:not(:disabled) {
-    background: var(--surface-hover);
-    color: var(--t1);
   }
   .refresh-bar {
     position: absolute;

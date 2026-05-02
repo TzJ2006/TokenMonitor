@@ -5,6 +5,7 @@ mod paths;
 mod platform;
 mod rate_limits;
 mod stats;
+mod statusline;
 mod tray;
 mod updater;
 mod usage;
@@ -323,6 +324,15 @@ pub fn run() {
                 background_loop(app_handle).await;
             });
 
+            // Reactive statusline poll — fires within ~2s of any Claude Code
+            // prompt by watching the events-file mtime. Independent of the
+            // slow background loop so the dashboard keeps pace with the
+            // user without cranking up the global refresh interval.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                fast_statusline_poll(app_handle).await;
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -336,12 +346,14 @@ pub fn run() {
             commands::config::set_refresh_interval,
             commands::config::set_rate_limits_enabled,
             commands::config::set_usage_access_enabled,
-            commands::config::request_claude_keychain_access,
             commands::config::request_app_data_access,
             commands::config::check_app_data_access,
             commands::config::open_app_data_settings,
-            commands::config::check_claude_keychain_access,
-            commands::config::debug_force_oauth_refresh,
+            commands::statusline::install_statusline,
+            commands::statusline::check_statusline,
+            commands::statusline::uninstall_statusline,
+            commands::statusline::set_claude_plan_tier,
+            commands::statusline::read_latest_statusline_ping,
             commands::tray::set_tray_config,
             commands::tray::get_status_widget_summary,
             commands::config::clear_cache,
@@ -387,10 +399,17 @@ pub fn run() {
 
 /// Fetch fresh rate limits and update cached state + tray utilization.
 async fn refresh_rate_limits(app: &tauri::AppHandle, state: &AppState) {
+    // Periodically trim the events file so it doesn't grow unbounded over
+    // long-running sessions. Best-effort; failures are swallowed inside.
+    statusline::source::maybe_trim(&statusline::events_file());
+
     let codex_dir = state.parser.codex_dir().to_path_buf();
+    let plan = *state.claude_plan_tier.read().await;
     let cached = state.cached_rate_limits.read().await.clone();
     let fresh = rate_limits::fetch_selected_rate_limits(
-        &codex_dir,
+        std::sync::Arc::clone(&state.parser),
+        codex_dir,
+        plan,
         rate_limits::RateLimitSelection::All,
         cached.as_ref(),
     )
@@ -405,6 +424,90 @@ async fn refresh_rate_limits(app: &tauri::AppHandle, state: &AppState) {
 
     // Emit so the float ball and main window pick up the new data.
     let _ = app.emit("status-widget-updated", ());
+}
+
+/// Reactive refresh loop that polls the statusline events-file mtime and
+/// fires an immediate parser + rate-limit refresh whenever Claude Code
+/// fires its statusline hook.
+///
+/// The slow background loop is fine for periodic upkeep, but it ticks at
+/// `refresh_interval` (default 30s) and the user expects the dashboard to
+/// reflect a CC prompt within a beat or two of typing. Polling the events
+/// file's modification time is essentially free — one stat call every
+/// `POLL_INTERVAL_SECS` — and lets us react in close-to-real-time without
+/// cranking the global refresh interval down (which would make every
+/// other periodic task pay the cost too).
+///
+/// Gated on `usage_access_enabled` so a brand-new install with onboarding
+/// not yet finished doesn't fire pre-emptive parses.
+async fn fast_statusline_poll(app: tauri::AppHandle) {
+    use std::fs;
+    use std::time::SystemTime;
+
+    /// 2 seconds is the sweet spot — well below human reaction time so the
+    /// update feels live, far above the granularity at which CC will fire
+    /// the hook (one per prompt), and trivial in stat-call overhead.
+    const POLL_INTERVAL_SECS: u64 = 2;
+
+    let path = crate::statusline::events_file();
+
+    // Seed with the current mtime so the very first observation isn't
+    // mis-classified as a change. On a fresh install the file doesn't
+    // exist yet → seed is `None`, which still works: when the script
+    // first writes, `Some(t) != None` and the refresh fires.
+    let mut last_mtime: Option<SystemTime> =
+        fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+
+    let state = app.state::<AppState>();
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+
+        if !state
+            .usage_access_enabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            continue;
+        }
+
+        // Two independent change signals on every tick:
+        //   1. `events.jsonl` mtime → CC fired a new statusline hook, i.e.
+        //      a new prompt landed. Triggers rate-limit refresh because
+        //      the bars come from the latest event's payload.
+        //   2. `parser.invalidate_if_changed()` → any transcript JSONL
+        //      moved, including the *streaming* writes a single response
+        //      generates. Without this, the dashboard's price + token
+        //      number sat on a 30s slow-loop ceiling because events.jsonl
+        //      only ticks once per prompt, not once per chunk. Now the
+        //      cost number tracks the response as it flushes.
+        let now_mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        let events_moved = now_mtime != last_mtime;
+        if events_moved {
+            last_mtime = now_mtime;
+        }
+        let parser_changed = state.parser.invalidate_if_changed();
+
+        if !events_moved && !parser_changed {
+            continue;
+        }
+
+        // Drop the aggregated-payload cache so the next `get_usage_data`
+        // IPC re-aggregates from the freshly-invalidated entry cache.
+        // Required even when only `parser_changed` fired, because the
+        // payload cache is keyed on provider/period/offset and outlives
+        // a single entry-cache invalidation.
+        state.parser.clear_payload_cache();
+
+        if events_moved
+            && state
+                .rate_limits_enabled
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            refresh_rate_limits(&app, &state).await;
+        }
+        sync_tray_title(&app, &state).await;
+        let _ = app.emit("data-updated", 0u64);
+    }
 }
 
 async fn background_loop(app: tauri::AppHandle) {
@@ -422,8 +525,12 @@ async fn background_loop(app: tauri::AppHandle) {
 
     // SSH sync interval: every 10 local refresh cycles (~5 min at 30s interval).
     const SSH_SYNC_EVERY_N_CYCLES: u64 = 10;
-    // Rate limit refresh: every 5 cycles (~2.5 min at 30s interval).
-    const RATE_LIMIT_REFRESH_EVERY_N_CYCLES: u64 = 5;
+    // Rate-limit refresh: every cycle. Prior to the statusline rewrite this
+    // throttled API calls to Anthropic (each cost rate-limit budget); since
+    // the fetch is now a local statusline-event-file read + arithmetic,
+    // there's nothing to conserve. Pair with the `fast_statusline_poll`
+    // task below for sub-second reactivity to fresh CC prompts.
+    const RATE_LIMIT_REFRESH_EVERY_N_CYCLES: u64 = 1;
     // Pricing refresh: every 120 cycles (~1h at 30s interval).
     // The actual TTL check (7 days) is inside should_refresh(), so this just
     // controls how often we check the TTL, not how often we actually fetch.
