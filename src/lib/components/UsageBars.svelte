@@ -231,7 +231,7 @@
           {#if rateLimits.credits.unlimited}
             Unlimited
           {:else if rateLimits.credits.balance != null}
-            {formatUsdAmount(rateLimits.credits.balance)}
+            {Math.round(rateLimits.credits.balance).toLocaleString()} credits
           {:else if rateLimits.credits.hasCredits}
             Available
           {:else}
