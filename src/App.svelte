@@ -895,39 +895,23 @@
                 <div class="hr"></div>
               {/if}
             {/each}
-            {#if visibleUsableRateLimitProviders.some((p) => {
-              const payload = providerPayload(rateLimits, p);
-              return Boolean(payload && (payload.error || payload.stale));
-            })}
-              {@const probeBroken =
-                statuslineProbeStatus === "script_missing" ||
-                statuslineProbeStatus === "not_installed"}
-              <div class="rate-limit-stale-banner" data-state={probeBroken ? "warn" : "idle"}>
+            {#if statuslineProbeStatus === "script_missing" || statuslineProbeStatus === "not_installed"}
+              <div class="rate-limit-stale-banner" data-state="warn">
                 <div class="rl-stale-row">
                   <span class="rl-stale-dot" aria-hidden="true"></span>
-                  <span class="rl-stale-headline">
-                    {probeBroken
-                      ? "Statusline needs attention"
-                      : "No recent Claude Code activity"}
-                  </span>
+                  <span class="rl-stale-headline">Statusline needs attention</span>
                 </div>
                 <div class="rl-stale-body">
-                  {#if probeBroken}
-                    Reinstall the statusline to restore live updates.
-                  {:else}
-                    Numbers refresh automatically on your next prompt.
-                  {/if}
+                  Reinstall the statusline to restore live updates.
                 </div>
-                {#if probeBroken}
-                  <button
-                    type="button"
-                    class="rate-limit-cta"
-                    onclick={handleInstallStatusline}
-                    disabled={statuslineBusy}
-                  >
-                    {statuslineBusy ? "Reinstalling…" : "Reinstall statusline"}
-                  </button>
-                {/if}
+                <button
+                  type="button"
+                  class="rate-limit-cta"
+                  onclick={handleInstallStatusline}
+                  disabled={statuslineBusy}
+                >
+                  {statuslineBusy ? "Reinstalling…" : "Reinstall statusline"}
+                </button>
               </div>
             {/if}
           {:else if !$settings.rateLimitsEnabled}
