@@ -154,7 +154,6 @@ impl RateLimitFetchError {
             cooldown_until: None,
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
