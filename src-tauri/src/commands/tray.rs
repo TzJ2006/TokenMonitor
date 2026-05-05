@@ -47,7 +47,11 @@ impl Default for TrayConfig {
         Self {
             bar_display: BarDisplay::Both,
             bar_provider: "claude".to_string(),
-            bar_providers: vec!["claude".to_string(), "codex".to_string(), "cursor".to_string()],
+            bar_providers: vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "cursor".to_string(),
+            ],
             show_percentages: false,
             percentage_format: PercentageFormat::Compact,
             show_cost: true,
