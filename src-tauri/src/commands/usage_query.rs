@@ -144,7 +144,6 @@ fn parser_payload_for_period(
     Ok(payload)
 }
 
-
 fn attach_local_stats(
     parser: &UsageParser,
     payload: &mut UsagePayload,
@@ -173,10 +172,8 @@ fn attach_local_stats(
         payload.input_tokens = entries.iter().map(|entry| entry.input_tokens).sum();
         payload.output_tokens = entries.iter().map(|entry| entry.output_tokens).sum();
         payload.cache_read_tokens = entries.iter().map(|e| e.cache_read_tokens).sum();
-        payload.cache_write_5m_tokens =
-            entries.iter().map(|e| e.cache_creation_5m_tokens).sum();
-        payload.cache_write_1h_tokens =
-            entries.iter().map(|e| e.cache_creation_1h_tokens).sum();
+        payload.cache_write_5m_tokens = entries.iter().map(|e| e.cache_creation_5m_tokens).sum();
+        payload.cache_write_1h_tokens = entries.iter().map(|e| e.cache_creation_1h_tokens).sum();
         payload.web_search_requests = entries.iter().map(|e| e.web_search_requests).sum();
     }
 
