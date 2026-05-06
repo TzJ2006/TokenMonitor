@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## v0.13.1 — Settings 重构 + SSH 搜索扩展 + FloatBall 修复
+
+### UI
+- **Settings → Visibility 卡片**：Header Tabs / Models / Remote Devices 合并为单张 `.card`，每项显示 "x of y" 计数，折叠展开
+- **Status Displays** 改用单 `.card`（移除 `.group`），预览图移至最顶端
+- **FloatBall 预览修复**：移除 `.fb-ball` 的渐变圆圈背景，改为透明（与真实 FloatBall 一致）
+- **Settings header** 添加 `box-shadow` 分隔头部与滚动内容
+- **SSH hosts** 全部使用 toggle 滑块（移除 Add 按钮），未注册 host 首次开启时自动注册
+- **Cost Alert / Model Change Stats** 放回 Display card
+
+### SSH
+- **远程搜索扩展**：Codex 搜索从固定 `~/.codex/sessions` 改为 glob `~/.codex*`，匹配所有 codex 变体目录
+- **Sync 进度反馈**：逐 host 显示 "x of y servers connected"，完成后显示 "Finished syncing in Xs"
+
+### 修复
+- `fix(floatball)`: 速率利用率回退逻辑——当主窗口过期时，回退到任意未过期窗口（与主窗口行为统一）
+
 ## v0.12.3 — Visibility 合并 + 窗口尺寸记忆
 
 ### UI
