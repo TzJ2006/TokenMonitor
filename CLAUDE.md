@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A local-first **cross-platform** system tray app (Tauri v2 + Svelte 5 + Rust) that monitors Claude Code, Codex CLI, and Cursor IDE token usage. It reads JSONL session logs from disk, applies pricing rules in Rust, and presents spend/rate-limit data through a native system tray popover. No cloud sync.
 
-Supported platforms: **macOS**, **Windows**, **Linux**. Current version: **0.13.0**.
+Supported platforms: **macOS**, **Windows**, **Linux**. Current version: **0.13.1**.
 
 ### Platform differences
 
@@ -14,7 +14,7 @@ Supported platforms: **macOS**, **Windows**, **Linux**. Current version: **0.13.
 |---------|-------|---------|-------|
 | System tray icon | Menu bar | System tray | System tray |
 | Cost display | `set_title()` text beside icon | Tooltip on hover | Tooltip on hover |
-| Rate limits (Claude) | OAuth via Keychain + API, CLI probe fallback | CLI probe only | CLI probe only |
+| Rate limits (Claude) | OAuth via Keychain + API, statusline fallback | Statusline (from Claude Code CLI) | Statusline (from Claude Code CLI) |
 | Rate limits (Codex) | JSONL session files | JSONL session files | JSONL session files |
 | Rate limits (Cursor) | API (auto-detected or manual token) | API (auto-detected or manual token) | API (manual token) |
 | Glass blur effect | Supported (toggle in Settings) | Not available (opaque) | Not available (opaque) |
@@ -99,11 +99,11 @@ Local JSONL files → Rust `usage/parser` + `usage/claude_parser` + `usage/prici
 
 **Window sizing (`windowSizing.ts` + `resizeOrchestrator.ts`):** Window height follows content height via a ResizeObserver → `set_window_size_and_align` IPC loop. Two mechanisms prevent the "small → big" cold-launch pop: (1) last applied height is persisted to `settings.json` under `window_state.height` and restored before the chart renders; (2) the orchestrator holds an `initialContentReady` gate that blocks shrink-direction requests until the first payload + first paint settle.
 
-**Rust backend (`src-tauri/src/`):** `commands.rs` is the IPC dispatch hub, split into domain submodules (`usage_query`, `calendar`, `period`, `config`, `tray`, `ssh`, `float_ball/`, `updater`, `logging`). `AppState` holds all shared state as `Arc<RwLock<>>` fields. `paths.rs` is the central registry of every filesystem path the app reads.
+**Rust backend (`src-tauri/src/`):** `commands.rs` is the IPC dispatch hub, split into domain submodules (`usage_query`, `calendar`, `period`, `config`, `tray`, `ssh`, `float_ball/`, `statusline`, `updater`, `logging`). `AppState` holds all shared state as `Arc<RwLock<>>` fields. `paths.rs` is the central registry of every filesystem path the app reads.
 
 **Pricing:** `usage/pricing.rs` has a hardcoded pricing table with `PRICING_VERSION` constant. When providers update pricing, update `get_rates()` and bump `PRICING_VERSION`. Cache-write tiers: 5m = 1.25x, 1h = 2x, read = 0.1x. Models not in the static table are resolved via LiteLLM (`usage/litellm.rs`) and OpenRouter (`usage/openrouter.rs`) APIs with 24h TTL.
 
-**Rate limits:** `rate_limits/claude.rs` (OAuth Keychain + API, macOS only), `rate_limits/claude_cli.rs` (CLI probe, all platforms), `rate_limits/codex.rs` (session file parsing), `rate_limits/cursor.rs` (Cursor API). On Windows/Linux, CLI probe is the primary method for Claude. Cursor token is auto-detected from `state.vscdb` or manually stored via `secrets/cursor.rs` keyring layer.
+**Rate limits:** `rate_limits/claude.rs` (OAuth Keychain + API on macOS; statusline-first on all platforms), `rate_limits/codex.rs` (session file parsing), `rate_limits/codex_cli.rs` (Codex CLI session rate limits), `rate_limits/cursor.rs` (Cursor API). The statusline integration is the primary rate-limit source for Claude on Windows/Linux. Cursor token is auto-detected from `state.vscdb` or manually stored via `secrets/cursor.rs` keyring layer.
 
 **Usage integrations:** Registered in `usage/integrations.rs`. Adding a new provider means adding an integration ID, its log root discovery, and a parser normalization path — no modification to existing provider branches.
 
@@ -114,6 +114,8 @@ Local JSONL files → Rust `usage/parser` + `usage/claude_parser` + `usage/prici
 **Usage archive:** `usage/archive.rs` persists completed hourly aggregates into per-month JSONL files. Uses time-boundary partitioning: archive covers `[0..frontier]`, live source covers `(frontier..now]`.
 
 **Tray rendering:** `tray/render.rs` generates RGBA pixel buffers for the menu bar icon + utilization bars entirely in Rust (no image library), at @2x retina resolution.
+
+**Statusline (`statusline/`):** Installs a shell/PowerShell script as Claude Code's `statusLine` command. Claude Code invokes the script on every prompt with a JSON envelope (session id, model, rate_limits); the script appends JSONL events to `~/.tokenmonitor/statusline/events.jsonl`. TokenMonitor reads the latest event to relay Claude's own `used_percentage` for 5-hour and 7-day windows — no OAuth, no Keychain, no subprocess spawning. Submodules: `install.rs` (script installation + `~/.claude/settings.json` patching), `scripts.rs` (shell/PowerShell script bodies), `source.rs` (event-file reader with retention trimming), `windows.rs` (rolling-window math fallback for older Claude Code builds).
 
 **Note:** The `archive/` directory contains past code (ccusage CLI reporter, MCP modules, debug tools, old design docs) — none of it is part of the build.
 
