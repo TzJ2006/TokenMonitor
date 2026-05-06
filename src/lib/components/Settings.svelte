@@ -12,6 +12,7 @@
   import { clearUsageCache } from "../stores/usage.js";
   import { updaterStore, checkNow, setAutoCheck } from "../stores/updater.js";
   import { isMacOS } from "../utils/platform.js";
+  import { currencySymbol } from "../utils/format.js";
   import { logger } from "../utils/logger.js";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import SegmentedControl from "./SegmentedControl.svelte";
@@ -40,6 +41,32 @@
   let cursorRetrying = $state(false);
   let cursorRetryTimer: ReturnType<typeof setTimeout> | null = null;
   let cursorRetryCount = $state(0);
+  let costInput = $state("50.00");
+  let costEnabled = $state(true);
+  let costInputFocused = $state(false);
+
+  $effect(() => {
+    costEnabled = current.costAlertThreshold > 0;
+    if (!costInputFocused) {
+      costInput = current.costAlertThreshold > 0 ? current.costAlertThreshold.toFixed(2) : "50.00";
+    }
+  });
+
+  function handleCostBlur() {
+    const val = parseFloat(costInput);
+    if (!isNaN(val) && val >= 0) {
+      updateSetting("costAlertThreshold", val);
+      costInput = val.toFixed(2);
+    } else {
+      costInput = current.costAlertThreshold.toFixed(2);
+    }
+  }
+
+  function handleCostKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      (e.target as HTMLInputElement).blur();
+    }
+  }
   const CURSOR_RETRY_INTERVAL_MS = 4000;
   const CURSOR_RETRY_MAX = 8;
 
@@ -339,13 +366,61 @@
             {/each}
           </select>
         </div>
+        <div class="row border">
+          <span class="label">Cost Alert</span>
+          <div class="cost-row-right">
+            {#if costEnabled}
+              <div class="cost-input">
+                <span class="dollar">{currencySymbol()}</span>
+                <input
+                  type="text"
+                  bind:value={costInput}
+                  onfocus={() => { costInputFocused = true; }}
+                  onblur={() => { costInputFocused = false; handleCostBlur(); }}
+                  onkeydown={handleCostKeydown}
+                  class="cost-field"
+                />
+              </div>
+            {/if}
+            <ToggleSwitch
+              checked={costEnabled}
+              onChange={(checked) => {
+                costEnabled = checked;
+                if (!checked) {
+                  updateSetting("costAlertThreshold", 0);
+                } else {
+                  const val = parseFloat(costInput);
+                  updateSetting("costAlertThreshold", !isNaN(val) && val > 0 ? val : 50);
+                }
+              }}
+            />
+          </div>
+        </div>
+        <div class="row">
+          <span class="label">Model Change Stats</span>
+          <ToggleSwitch
+            checked={current.showModelChangeStats}
+            onChange={(checked) => updateSetting("showModelChangeStats", checked)}
+          />
+        </div>
       </div>
     </div>
 
-    <!-- Visibility / Monitoring / Devices components define their own groups -->
-    <HeaderTabsSettings />
-    <HiddenModelsSettings />
-    <SshHostsSettings />
+    <!-- 3. Visibility -->
+    <div class="group">
+      <div class="group-label">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+          <circle cx="12" cy="12" r="3"></circle>
+        </svg>
+        Visibility
+      </div>
+      <div class="card">
+        <HeaderTabsSettings />
+        <HiddenModelsSettings />
+        <SshHostsSettings />
+      </div>
+    </div>
 
     <!-- 4. Menu Bar / Floating Ball -->
     <TrayConfigSettings />
@@ -587,6 +662,9 @@
     align-items: center;
     justify-content: space-between;
     padding: 10px 12px 6px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+    position: relative;
+    z-index: 1;
   }
 
   .back {
@@ -628,8 +706,8 @@
     overflow: hidden;
   }
 
-  .visibility-card > :global(.block + .block) {
-    border-top: 1px solid var(--border-subtle);
+  .card > :global(.block:first-child) {
+    border-top: none;
   }
 
   .row {

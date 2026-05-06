@@ -74,25 +74,18 @@
     );
   }
 
-  async function addSshHost(alias: string) {
-    logger.info("ssh", `Adding: ${alias}`);
-    try {
-      await invoke("add_ssh_host", { alias });
-      sshConfiguredHosts = [...sshConfiguredHosts, { alias, enabled: true, include_in_stats: false }];
-      persistSshHosts(sshConfiguredHosts);
-      clearUsageCache();
-    } catch (e) {
-      console.error("Failed to add SSH host:", e);
-    }
-  }
-
   async function toggleSshHost(alias: string, enabled: boolean) {
     logger.info("ssh", `Toggle: ${alias} enabled=${enabled}`);
     try {
-      await invoke("toggle_ssh_host", { alias, enabled });
-      sshConfiguredHosts = sshConfiguredHosts.map((h) =>
-        h.alias === alias ? { ...h, enabled } : h,
-      );
+      if (!sshConfiguredHosts.some(h => h.alias === alias)) {
+        await invoke("add_ssh_host", { alias });
+        sshConfiguredHosts = [...sshConfiguredHosts, { alias, enabled, include_in_stats: false }];
+      } else {
+        await invoke("toggle_ssh_host", { alias, enabled });
+        sshConfiguredHosts = sshConfiguredHosts.map((h) =>
+          h.alias === alias ? { ...h, enabled } : h,
+        );
+      }
       persistSshHosts(sshConfiguredHosts);
       clearUsageCache();
     } catch (e) {
@@ -105,9 +98,12 @@
     sshSyncing = true;
     sshSyncResult = null;
     const startTime = performance.now();
+    const enabledHosts = sshConfiguredHosts.filter((h) => h.enabled);
     let totalRecords = 0;
     let failedHosts: string[] = [];
-    for (const host of sshConfiguredHosts.filter((h) => h.enabled)) {
+    let connectedCount = 0;
+
+    for (const host of enabledHosts) {
       if (destroyed) return;
       try {
         const result = await invoke<SshSyncResult>("sync_ssh_host", { alias: host.alias });
@@ -123,8 +119,10 @@
         if (!result.testSuccess) {
           failedHosts.push(host.alias);
         } else {
+          connectedCount++;
           totalRecords += result.recordsSynced;
         }
+        sshSyncResult = { total: totalRecords, msg: `${connectedCount} of ${enabledHosts.length} servers connected` };
       } catch (e) {
         if (destroyed) return;
         failedHosts.push(host.alias);
@@ -137,104 +135,80 @@
     if (failedHosts.length > 0) {
       sshSyncResult = { total: totalRecords, msg: `Failed: ${failedHosts.join(", ")} (${elapsed}s)` };
     } else {
-      const detail = totalRecords > 0 ? `Synced ${totalRecords} records` : "Already up to date";
-      sshSyncResult = { total: totalRecords, msg: `${detail} in ${elapsed}s` };
+      sshSyncResult = { total: totalRecords, msg: `Finished syncing in ${elapsed}s` };
     }
     logger.info("ssh", `Sync done: ${totalRecords} records, ${failedHosts.length} failures`);
     setTimeout(() => { if (!destroyed) sshSyncResult = null; }, 4000);
   }
 </script>
 
-<div class="group">
-  <div class="group-label">
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
-      <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
-      <line x1="6" y1="6" x2="6.01" y2="6"></line>
-      <line x1="6" y1="18" x2="6.01" y2="18"></line>
-    </svg>
-    Remote Devices
-  </div>
-  <div class="card">
-    <button class="row collapsible-toggle" type="button" onclick={() => (devicesExpanded = !devicesExpanded)}>
-      <span class="label">Devices</span>
-      <div class="collapsible-right">
-        {#if !devicesExpanded && sshConfiguredHosts.filter(h => h.enabled).length > 0}
-          <span role="button" tabindex="0" class="ssh-btn sync-collapsed" onclick={(e) => { e.stopPropagation(); syncAllSshHosts(); }} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); syncAllSshHosts(); }}} aria-disabled={sshSyncing}>
-            {sshSyncing ? "Syncing..." : "Sync All"}
-          </span>
-        {/if}
-        <span class="device-count">{sshHosts.length}</span>
-        <svg class="collapsible-chevron" class:open={devicesExpanded} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="6 9 12 15 18 9"></polyline>
-        </svg>
-      </div>
-    </button>
-    <div class="devices-collapse" class:open={devicesExpanded}>
-      <div class="collapse-inner">
-        <div class="ssh-section">
-        <div class="ssh-hosts">
-          {#each sshHosts as host (host.alias)}
-            <div class="ssh-host-row">
-              <div class="ssh-host-info">
-                <span class="ssh-alias">{host.alias}</span>
-                <span class="ssh-detail">{host.hostname}{host.user ? ` (${host.user})` : ''}{host.port !== 22 ? `:${host.port}` : ''}</span>
-              </div>
-              <div class="ssh-host-actions">
-                {#if sshTestingHost === host.alias}
-                  <span class="ssh-testing">...</span>
-                {:else if sshTestResults[host.alias]}
-                  <span class="ssh-result" class:ssh-ok={sshTestResults[host.alias].success} class:ssh-fail={!sshTestResults[host.alias].success}>
-                    {sshTestResults[host.alias].success ? 'OK' : 'Fail'}
-                  </span>
-                {/if}
-                <button class="ssh-btn" onclick={() => testSshHost(host.alias)}>Test</button>
-                {#if sshConfiguredHosts.some(h => h.alias === host.alias)}
-                  <ToggleSwitch
-                    checked={sshConfiguredHosts.find(h => h.alias === host.alias)?.enabled ?? false}
-                    onChange={(checked) => toggleSshHost(host.alias, checked)}
-                  />
-                {:else}
-                  <button class="ssh-btn ssh-add" onclick={() => addSshHost(host.alias)}>Add</button>
-                {/if}
-              </div>
+<div class="block">
+  <button class="row collapsible-toggle" type="button" onclick={() => (devicesExpanded = !devicesExpanded)}>
+    <span class="label">Remote Devices</span>
+    <div class="collapsible-right">
+      {#if !devicesExpanded && sshConfiguredHosts.filter(h => h.enabled).length > 0}
+        <span role="button" tabindex="0" class="ssh-btn sync-collapsed" onclick={(e) => { e.stopPropagation(); syncAllSshHosts(); }} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); syncAllSshHosts(); }}} aria-disabled={sshSyncing}>
+          {sshSyncing ? "Syncing..." : "Sync All"}
+        </span>
+      {/if}
+      <span class="count">{sshConfiguredHosts.filter(h => h.enabled).length} of {sshHosts.length}</span>
+      <svg class="collapsible-chevron" class:open={devicesExpanded} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="6 9 12 15 18 9"></polyline>
+      </svg>
+    </div>
+  </button>
+  <div class="devices-collapse" class:open={devicesExpanded}>
+    <div class="collapse-inner">
+      <div class="ssh-section">
+      <div class="ssh-hosts">
+        {#each sshHosts as host (host.alias)}
+          <div class="ssh-host-row">
+            <div class="ssh-host-info">
+              <span class="ssh-alias">{host.alias}</span>
+              <span class="ssh-detail">{host.hostname}{host.user ? ` (${host.user})` : ''}{host.port !== 22 ? `:${host.port}` : ''}</span>
             </div>
-          {/each}
-          {#if sshHosts.length === 0}
-            <div class="ssh-empty">No hosts found in ~/.ssh/config</div>
-          {/if}
-        </div>
-        {#if sshConfiguredHosts.length > 0}
-          <div class="ssh-sync-row">
-            <span class="ssh-sync-label">
-              {#if sshSyncResult}
-                <span class="ssh-sync-status" class:ssh-sync-error={sshSyncResult.msg.startsWith("Failed")}>{sshSyncResult.msg}</span>
-              {:else}
-                {sshConfiguredHosts.filter(h => h.enabled).length} device(s) enabled
+            <div class="ssh-host-actions">
+              {#if sshTestingHost === host.alias}
+                <span class="ssh-testing">...</span>
+              {:else if sshTestResults[host.alias]}
+                <span class="ssh-result" class:ssh-ok={sshTestResults[host.alias].success} class:ssh-fail={!sshTestResults[host.alias].success}>
+                  {sshTestResults[host.alias].success ? 'OK' : 'Fail'}
+                </span>
               {/if}
-            </span>
-            <button class="ssh-btn" onclick={syncAllSshHosts} disabled={sshSyncing}>
-              {sshSyncing ? "Syncing..." : "Sync Now"}
-            </button>
+              <button class="ssh-btn" onclick={() => testSshHost(host.alias)}>Test</button>
+              <ToggleSwitch
+                checked={sshConfiguredHosts.find(h => h.alias === host.alias)?.enabled ?? false}
+                onChange={(checked) => toggleSshHost(host.alias, checked)}
+              />
+            </div>
           </div>
+        {/each}
+        {#if sshHosts.length === 0}
+          <div class="ssh-empty">No hosts found in ~/.ssh/config</div>
         {/if}
       </div>
+      {#if sshConfiguredHosts.length > 0}
+        <div class="ssh-sync-row">
+          <span class="ssh-sync-label">
+            {#if sshSyncResult}
+              <span class="ssh-sync-status" class:ssh-sync-error={sshSyncResult.msg.startsWith("Failed")}>{sshSyncResult.msg}</span>
+            {:else}
+              {sshConfiguredHosts.filter(h => h.enabled).length} device(s) enabled
+            {/if}
+          </span>
+          <button class="ssh-btn" onclick={syncAllSshHosts} disabled={sshSyncing}>
+            {sshSyncing ? "Syncing..." : "Sync Now"}
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
   </div>
 </div>
 
 <style>
-  .group {
-    margin-bottom: 8px;
-  }
-  /* `.group-label` is defined globally in `src/app.css`. */
-  .card {
-    background: var(--surface-2);
-    border-radius: 8px;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
+  .block {
+    border-top: 1px solid var(--border-subtle);
   }
   .ssh-section {
     padding: 6px 0;
@@ -285,9 +259,6 @@
   .ssh-btn:hover {
     color: var(--t1);
     border-color: var(--t3);
-  }
-  .ssh-add {
-    color: var(--accent, #4a9eff);
   }
   .ssh-testing {
     font: 400 8px/1 'Inter', sans-serif;
@@ -351,9 +322,9 @@
   .collapsible-chevron.open {
     transform: rotate(0deg);
   }
-  .device-count {
+  .count {
     font: 400 9px/1 'Inter', sans-serif;
-    color: var(--t4);
+    color: var(--t3);
   }
   .devices-collapse {
     display: grid;
