@@ -197,7 +197,7 @@ fn build_extraction_script(claude_since: Option<u64>, codex_since: Option<u64>) 
     // permanently skip them once Claude data advances the sync timestamp.
     // We always find ALL Codex files and filter by timestamp in the Python
     // extraction script instead.
-    let codex_find = "for d in ~/.codex/sessions; do \
+    let codex_find = "for d in ~/.codex*; do \\
            [ -d \"$d\" ] && find \"$d\" -name '*.jsonl' -type f 2>/dev/null; \
          done"
         .to_string();

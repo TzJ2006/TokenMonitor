@@ -171,9 +171,16 @@ fn primary_window_utilization(
 ) -> Option<f64> {
     let windows = &rate_limits?.windows;
     let target_id = primary_window_id(provider);
-    windows
+    if let Some(w) = windows
         .iter()
         .find(|w| w.window_id == target_id && !is_window_expired(provider, w.resets_at.as_deref()))
+    {
+        return Some(w.utilization);
+    }
+    // Fallback: any non-expired window (matches main app behavior)
+    windows
+        .iter()
+        .find(|w| !is_window_expired(provider, w.resets_at.as_deref()))
         .map(|w| w.utilization)
 }
 
@@ -646,11 +653,11 @@ mod tests {
     }
 
     #[test]
-    fn primary_window_utilization_returns_none_when_id_missing() {
+    fn primary_window_utilization_falls_back_when_id_missing() {
         let rate_limits = make_provider("claude", vec![make_window("seven_day", 10.0, None)]);
         assert_eq!(
             primary_window_utilization("claude", Some(&rate_limits)),
-            None
+            Some(10.0)
         );
     }
 

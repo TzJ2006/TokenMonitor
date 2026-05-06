@@ -136,7 +136,7 @@
   }
 </script>
 
-<div class="group">
+<div class="card">
   <div class="group-label">
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
@@ -145,27 +145,6 @@
     </svg>
     Status Displays
   </div>
-
-  {#if usesFloatingStatusWidget()}
-    <div class="card" style="margin-bottom: 4px;">
-      <div class="row" class:border={isWindows()}>
-        <span class="label">Floating Ball</span>
-        <ToggleSwitch
-          checked={current.floatBall}
-          onChange={handleFloatBall}
-        />
-      </div>
-      {#if isWindows()}
-      <div class="row">
-        <span class="label">Taskbar Panel</span>
-        <ToggleSwitch
-          checked={current.taskbarPanel}
-          onChange={handleTaskbarPanel}
-        />
-      </div>
-      {/if}
-    </div>
-  {/if}
 
   <!-- Combined Preview -->
   <div class="preview-card">
@@ -231,8 +210,29 @@
     </div>
   </div>
 
+  {#if usesFloatingStatusWidget()}
+    <div class="section border-top">
+      <div class="row" class:border={isWindows()}>
+        <span class="label">Floating Ball</span>
+        <ToggleSwitch
+          checked={current.floatBall}
+          onChange={handleFloatBall}
+        />
+      </div>
+      {#if isWindows()}
+      <div class="row">
+        <span class="label">Taskbar Panel</span>
+        <ToggleSwitch
+          checked={current.taskbarPanel}
+          onChange={handleTaskbarPanel}
+        />
+      </div>
+      {/if}
+    </div>
+  {/if}
+
   <!-- Bars card -->
-  <div class="card" style="margin-bottom: 4px;">
+  <div class="section border-top">
     <div class="row">
       <span class="label">Bars</span>
       <div class="provider-chips">
@@ -254,7 +254,7 @@
   </div>
 
   <!-- Percentages card -->
-  <div class="card" style="margin-bottom: 4px;">
+  <div class="section border-top">
     <div class="row border">
       <span class="label">Show Percentages</span>
       <ToggleSwitch
@@ -276,7 +276,7 @@
   </div>
 
   <!-- Cost card -->
-  <div class="card">
+  <div class="section border-top">
     <div class="row border">
       <span class="label">Show Cost</span>
       <ToggleSwitch
@@ -299,13 +299,17 @@
 </div>
 
 <style>
-  .group {
-    margin-bottom: 8px;
-  }
   .card {
     background: var(--surface-2);
     border-radius: 8px;
     overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .section {
+    overflow: hidden;
+  }
+  .border-top {
+    border-top: 1px solid var(--border-subtle);
   }
   .row {
     padding: 7px 10px;
@@ -328,10 +332,8 @@
 
   /* Combined preview card */
   .preview-card {
-    background: var(--surface-2);
-    border-radius: 8px;
     padding: 8px 10px;
-    margin-bottom: 4px;
+    border-top: 1px solid var(--border-subtle);
   }
   .preview-row {
     display: flex;
@@ -445,13 +447,7 @@
     align-items: center;
     justify-content: center;
     border-radius: 50%;
-    background:
-      radial-gradient(120% 120% at 30% 10%, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0) 50%),
-      linear-gradient(160deg, rgba(30, 34, 45, 0.9) 0%, rgba(10, 12, 16, 0.98) 100%);
-    box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.1),
-      inset 0 2px 4px rgba(255, 255, 255, 0.15),
-      inset 0 -4px 12px rgba(0, 0, 0, 0.6);
+    background: transparent;
   }
   .fb-cost {
     font: 700 8px/1 'Inter', sans-serif;
