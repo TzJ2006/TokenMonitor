@@ -218,7 +218,10 @@
   $effect(() => {
     const unsub1 = usageData.subscribe((v) => { if (deviceToggleGuard === 0) data = v; });
     const unsub2 = isLoading.subscribe((v) => (loading = v));
-    const unsubPL = isPlaceholderLoading.subscribe((v) => (placeholderLoading = v));
+    const unsubPL = isPlaceholderLoading.subscribe((v) => {
+      placeholderLoading = v;
+      tick().then(() => resizeOrch?.syncSizeAndVerify(v ? "content-loading" : "content-loaded"));
+    });
     const unsub3 = settings.subscribe((s) => {
       brandTheming = s.brandTheming;
       if (!areHeaderTabsEqual(headerTabs, s.headerTabs)) {
@@ -662,7 +665,9 @@
 
     const init = async () => {
       await resizeOrch!.refreshWindowMetrics();
-      scrollThresholdH = resizeOrch!.getScrollThresholdH();
+      const fixedH0 = resizeOrch!.getFixedWindowH();
+      const rawThreshold = resizeOrch!.getScrollThresholdH();
+      scrollThresholdH = fixedH0 > 0 ? Math.min(rawThreshold, fixedH0) : rawThreshold;
 
       // Load persisted settings and apply theme + defaults (non-blocking)
       try {
@@ -682,21 +687,24 @@
       }
 
       // Restore the window to its last-known height before the chart renders.
-      // Combined with the orchestrator's initial-content gate, this hides the
-      // "small → big" pop-out users were seeing on cold launch.
-      const restoredHeight = await getLastWindowHeight();
-      if (!cancelled && restoredHeight) {
-        try {
-          await invoke("set_window_size_and_align", {
-            width: 340,
-            height: restoredHeight,
-          });
-          persistedWindowHeight = restoredHeight;
-          logResizeDebug("app:window-height-restored", { height: restoredHeight });
-        } catch (e) {
-          logResizeDebug("app:window-height-restore-failed", {
-            error: formatDebugError(e),
-          });
+      // In fixed-height mode, don't restore persisted height — content will
+      // drive the height until data arrives, then fixedH locks in.
+      const fixedH = resizeOrch!.getFixedWindowH?.() ?? 0;
+      if (fixedH <= 0) {
+        const restoredHeight = await getLastWindowHeight();
+        if (!cancelled && restoredHeight) {
+          try {
+            await invoke("set_window_size_and_align", {
+              width: 340,
+              height: restoredHeight,
+            });
+            persistedWindowHeight = restoredHeight;
+            logResizeDebug("app:window-height-restored", { height: restoredHeight });
+          } catch (e) {
+            logResizeDebug("app:window-height-restore-failed", {
+              error: formatDebugError(e),
+            });
+          }
         }
       }
 
@@ -1022,7 +1030,6 @@
 <style>
   .pop {
     width: 340px;
-    min-height: 200px;
     box-shadow: none;
     animation: popIn var(--t-slow) var(--ease-out) both;
   }
@@ -1038,7 +1045,7 @@
   .hr { height: 1px; background: var(--border-subtle); margin: 0 12px; }
   .loading {
     display: flex; flex-direction: column; align-items: center;
-    justify-content: center; padding: 48px 24px;
+    justify-content: center; padding: 12px 24px;
   }
   .spinner {
     width: 18px; height: 18px;

@@ -290,6 +290,11 @@ pub fn run() {
                     app_data.join("usage-archive")
                 );
 
+                // Initialize payload disk cache for instant cold-start.
+                let disk_cache =
+                    usage::payload_disk_cache::PayloadDiskCache::new(&app_data);
+                *state.payload_disk_cache.blocking_write() = Some(disk_cache);
+
                 // Load cached dynamic pricing immediately (non-blocking).
                 if let Some(rates) = usage::litellm::load_cached(&app_data) {
                     usage::pricing::set_dynamic_pricing(rates);

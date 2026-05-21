@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
+use rayon::prelude::*;
 
 #[cfg(test)]
 use super::claude_parser::read_claude_entries;
@@ -174,6 +175,16 @@ struct CachedFileLoad {
     lines_read: usize,
     opened: bool,
     from_cache: bool,
+}
+
+/// Shared result of a single `load_entries` call, cached for reuse within
+/// the same IPC request scope.
+#[derive(Clone)]
+pub(crate) struct LoadedEntries {
+    pub entries: Vec<ParsedEntry>,
+    pub change_events: Vec<ParsedChangeEvent>,
+    #[allow(dead_code)]
+    pub reports: Vec<ProviderReadDebug>,
 }
 
 struct PayloadCacheEntry {
@@ -445,6 +456,7 @@ pub struct UsageParser {
     root_file_lists: Mutex<HashMap<String, CachedRootFileList>>,
     last_query_debug: Mutex<Option<UsageQueryDebugReport>>,
     archive: Mutex<Option<super::archive::ArchiveManager>>,
+    entries_cache: Mutex<HashMap<String, (Instant, Arc<LoadedEntries>)>>,
 }
 
 fn prune_payload_cache(cache: &mut HashMap<String, PayloadCacheEntry>) {
@@ -556,6 +568,7 @@ impl UsageParser {
             root_file_lists: Mutex::new(HashMap::new()),
             last_query_debug: Mutex::new(None),
             archive: Mutex::new(None),
+            entries_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -644,14 +657,50 @@ impl UsageParser {
                 archive.reset();
             }
         }
+        if let Ok(mut c) = self.entries_cache.lock() {
+            c.clear();
+        }
     }
 
     pub fn clear_payload_cache(&self) {
         if let Ok(mut c) = self.cache.lock() {
             c.clear();
         }
+        self.clear_entries_cache();
     }
 
+
+    pub(crate) fn load_entries_cached(
+        &self,
+        provider: &str,
+        since: Option<NaiveDate>,
+    ) -> Arc<LoadedEntries> {
+        let key = format!("{}:{}", provider, since.map(|d| d.to_string()).unwrap_or_default());
+
+        // Note: do NOT call have_sources_changed() here — it stats all files
+        // and defeats the warm-path optimization. The background loop calls
+        // invalidate_if_changed() which clears entries_cache when sources change.
+
+        {
+            let cache = self.entries_cache.lock().unwrap();
+            if let Some((_stored_at, cached)) = cache.get(&key) {
+                return cached.clone();
+            }
+        }
+        let (entries, change_events, reports) = self.load_entries(provider, since);
+        let loaded = Arc::new(LoadedEntries { entries, change_events, reports });
+        {
+            let mut cache = self.entries_cache.lock().unwrap();
+            cache.insert(key, (Instant::now(), loaded.clone()));
+        }
+        loaded
+    }
+
+    pub(crate) fn clear_entries_cache(&self) {
+        if let Ok(mut c) = self.entries_cache.lock() {
+            c.clear();
+        }
+    }
     pub fn clear_payload_cache_prefix(&self, prefix: &str) {
         if let Ok(mut c) = self.cache.lock() {
             c.retain(|key, _| !key.starts_with(prefix));
@@ -674,6 +723,11 @@ impl UsageParser {
             if !Self::root_listing_is_fresh(entry) {
                 return true;
             }
+            // Also check a sample of file stamps for content changes
+            // (directory mtime only detects add/remove, not in-place edits).
+            if Self::any_file_stamp_changed(entry) {
+                return true;
+            }
         }
 
         false
@@ -684,6 +738,12 @@ impl UsageParser {
     pub fn invalidate_if_changed(&self) -> bool {
         if self.have_sources_changed() {
             self.clear_payload_cache();
+            self.clear_entries_cache();
+            // Clear root_file_lists so next query does a fresh scan
+            // (listing_cache_hit will be false, forcing fresh stat).
+            if let Ok(mut c) = self.root_file_lists.lock() {
+                c.clear();
+            }
             true
         } else {
             false
@@ -744,15 +804,23 @@ impl UsageParser {
             return false;
         }
 
+        // Directory mtime changes whenever files are added/removed/renamed inside it.
+        // If all directory mtimes match, the file listing is still valid — no need
+        // to re-stat every individual file (which costs ~0.4ms × 14K files on Windows).
+        true
+    }
+
+    fn any_file_stamp_changed(entry: &CachedRootFileList) -> bool {
         entry
             .file_stamps
             .iter()
-            .all(|file| file_stamp(&file.path).is_some_and(|stamp| stamp == file.stamp))
+            .any(|file| file_stamp(&file.path).is_some_and(|stamp| stamp != file.stamp))
     }
 
-    fn cached_jsonl_files(&self, dir: &Path) -> (Arc<[PathBuf]>, bool) {
+    #[allow(clippy::type_complexity)]
+    fn cached_jsonl_files(&self, dir: &Path) -> (Arc<[PathBuf]>, Option<Arc<[FileListStamp]>>, bool) {
         if !dir.exists() {
-            return (Arc::from(Vec::<PathBuf>::new()), false);
+            return (Arc::from(Vec::<PathBuf>::new()), None, false);
         }
 
         let cache_key = path_to_string(dir);
@@ -760,7 +828,7 @@ impl UsageParser {
             if let Some(entry) = cache.get_mut(&cache_key) {
                 if Self::root_listing_is_fresh(entry) {
                     entry.last_accessed_at = Instant::now();
-                    return (entry.files.clone(), true);
+                    return (entry.files.clone(), Some(entry.file_stamps.clone()), true);
                 }
                 cache.remove(&cache_key);
             }
@@ -788,7 +856,7 @@ impl UsageParser {
                     CachedRootFileList {
                         files: files.clone(),
                         directories,
-                        file_stamps,
+                        file_stamps: file_stamps.clone(),
                         last_accessed_at: now,
                     },
                 );
@@ -796,7 +864,7 @@ impl UsageParser {
             }
         }
 
-        (files, false)
+        (files, Some(file_stamps), false)
     }
 
     fn load_cached_file(&self, path: &Path, kind: ProviderFileKind) -> CachedFileLoad {
@@ -881,9 +949,10 @@ impl UsageParser {
         let mut entry_report_indices = Vec::new();
         let mut processed_hashes = HashMap::new();
         let mut processed_change_keys = HashMap::new();
+        let kind = config.file_kind();
 
         for root_dir in &config.roots {
-            let (files, listing_cache_hit) = self.cached_jsonl_files(root_dir);
+            let (files, cached_stamps, listing_cache_hit) = self.cached_jsonl_files(root_dir);
             reports.push(ProviderReadDebug {
                 provider: String::from(config.id.as_str()),
                 root_dir: path_to_string(root_dir),
@@ -896,47 +965,187 @@ impl UsageParser {
             });
             let report_idx = reports.len() - 1;
 
-            for path in files.iter() {
+            // Phase 1: Build mtime-filter stamps from cache (fast, no stat) and
+            // prepare to get fresh stamps only for files that pass the filter.
+            let cached_stamp_map: Option<HashMap<&Path, &FileStamp>> = cached_stamps.as_ref().map(|cs| {
+                cs.iter().map(|fs| (fs.path.as_path(), &fs.stamp)).collect()
+            });
+
+            // Phase 2a: Mtime filter using cached stamps (zero stat cost).
+            let mut candidate_indices: Vec<usize> = Vec::new();
+            for (i, path) in files.iter().enumerate() {
                 if let Some(since_date) = since {
-                    if !modified_since(path, since_date) {
-                        let report = reports
-                            .get_mut(report_idx)
-                            .expect("report should exist for current root");
+                    let cached_stamp = cached_stamp_map
+                        .as_ref()
+                        .and_then(|m| m.get(path.as_path()).copied());
+                    let dominated = cached_stamp.is_some_and(|s| {
+                        let dt: DateTime<Local> = s.modified.into();
+                        dt.date_naive() < since_date
+                    });
+                    if dominated {
+                        let report = &mut reports[report_idx];
                         report.skipped_paths += 1;
                         report.skipped_by_mtime += 1;
                         push_sample_path(&mut report.sample_skipped_paths, path);
                         continue;
                     }
                 }
+                candidate_indices.push(i);
+            }
 
-                {
-                    let report = reports
-                        .get_mut(report_idx)
-                        .expect("report should exist for current root");
-                    report.attempted_paths += 1;
-                    push_sample_path(&mut report.sample_paths, path);
-                }
+            // Phase 2b: Classify into cache-hit vs needs-parse (single lock).
+            // When listing_cache_hit is true AND file_cache has the entry, trust it
+            // without fresh stat — the background loop (have_sources_changed) handles
+            // in-place edit detection and clears caches when files change.
+            let mut cache_hits: Vec<CachedFileLoad> = Vec::new();
+            let mut to_parse: Vec<(usize, PathBuf, Option<FileStamp>)> = Vec::new();
+            let mut needs_stat_indices: Vec<usize> = Vec::new();
+            {
+                let cache = self.file_cache.lock().unwrap();
+                for &i in &candidate_indices {
+                    let path = &files[i];
+                    reports[report_idx].attempted_paths += 1;
+                    push_sample_path(&mut reports[report_idx].sample_paths, path);
 
-                let loaded = self.load_cached_file(path, config.file_kind());
-                {
-                    let report = reports
-                        .get_mut(report_idx)
-                        .expect("report should exist for current root");
-                    report.lines_read += loaded.lines_read;
-                    if loaded.from_cache {
-                        report.cache_hits += 1;
-                    } else {
-                        report.cache_misses += 1;
-                        if loaded.opened {
-                            report.opened_paths += 1;
-                        } else {
-                            report.failed_paths += 1;
+                    let cache_key = path_to_string(path);
+                    if listing_cache_hit {
+                        if let Some(cached) = cache.get(&cache_key) {
+                            reports[report_idx].cache_hits += 1;
+                            cache_hits.push(CachedFileLoad {
+                                entries: cached.entries.clone(),
+                                change_events: cached.change_events.clone(),
+                                earliest_date: cached.earliest_date,
+                                lines_read: 0,
+                                opened: false,
+                                from_cache: true,
+                            });
                             continue;
                         }
                     }
+                    needs_stat_indices.push(i);
+                }
+            }
+
+            // Phase 2c: Parallel stat only files not found in file_cache.
+            let fresh_stamps: Vec<(usize, Option<FileStamp>)> = needs_stat_indices
+                .par_iter()
+                .map(|&i| (i, file_stamp(&files[i])))
+                .collect();
+            {
+                let cache = self.file_cache.lock().unwrap();
+                for (i, stamp) in &fresh_stamps {
+                    let path = &files[*i];
+                    let cache_key = path_to_string(path);
+                    let hit = stamp.as_ref().and_then(|s| {
+                        cache.get(&cache_key).and_then(|cached| {
+                            if &cached.stamp == s {
+                                Some(CachedFileLoad {
+                                    entries: cached.entries.clone(),
+                                    change_events: cached.change_events.clone(),
+                                    earliest_date: cached.earliest_date,
+                                    lines_read: 0,
+                                    opened: false,
+                                    from_cache: true,
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
+                    match hit {
+                        Some(loaded) => {
+                            reports[report_idx].cache_hits += 1;
+                            cache_hits.push(loaded);
+                        }
+                        None => {
+                            to_parse.push((*i, path.clone(), stamp.clone()));
+                        }
+                    }
+                }
+            }
+
+            // Phase 3: Parallel parse of cache-miss files.
+            let parsed: Vec<(PathBuf, Option<FileStamp>, CachedFileLoad)> = to_parse
+                .par_iter()
+                .map(|(_i, path, stamp)| {
+                    let (raw_entries, raw_change_events, lines_read, opened) = match kind {
+                        ProviderFileKind::Claude => parse_claude_session_file(path),
+                        ProviderFileKind::Codex => parse_codex_session_file(path),
+                        ProviderFileKind::Cursor => parse_cursor_session_file(path),
+                    };
+                    let earliest_date = earliest_entry_date(&raw_entries);
+                    let loaded = CachedFileLoad {
+                        entries: raw_entries.into(),
+                        change_events: raw_change_events.into(),
+                        earliest_date,
+                        lines_read,
+                        opened,
+                        from_cache: false,
+                    };
+                    (path.clone(), stamp.clone(), loaded)
+                })
+                .collect();
+
+            // Phase 4: Batch update file_cache (single lock).
+            {
+                let mut cache = self.file_cache.lock().unwrap();
+                for (path, stamp, loaded) in &parsed {
+                    let cache_key = path_to_string(path);
+                    if loaded.opened {
+                        if let Some(stamp) = stamp {
+                            let now = Instant::now();
+                            cache.insert(
+                                cache_key,
+                                CachedFileEntries {
+                                    stamp: stamp.clone(),
+                                    entries: loaded.entries.clone(),
+                                    change_events: loaded.change_events.clone(),
+                                    earliest_date: loaded.earliest_date,
+                                    last_accessed_at: now,
+                                },
+                            );
+                        } else {
+                            cache.remove(&cache_key);
+                        }
+                    } else {
+                        cache.remove(&cache_key);
+                    }
+                }
+                prune_file_cache(&mut cache);
+            }
+
+            // If files were re-parsed, entries_cache is stale.
+            if !parsed.is_empty() {
+                self.clear_entries_cache();
+            }
+
+            // Phase 5: Update parse reports.
+            for (_path, _stamp, loaded) in &parsed {
+                let report = &mut reports[report_idx];
+                report.lines_read += loaded.lines_read;
+                if loaded.from_cache {
+                    report.cache_hits += 1;
+                } else {
+                    report.cache_misses += 1;
+                    if loaded.opened {
+                        report.opened_paths += 1;
+                    } else {
+                        report.failed_paths += 1;
+                    }
+                }
+            }
+
+            // Phase 6: Merge entries + dedup (sequential, CPU-bound).
+            let all_loaded = cache_hits
+                .iter()
+                .chain(parsed.iter().map(|(_, _, loaded)| loaded));
+
+            for loaded in all_loaded {
+                if !loaded.opened && !loaded.from_cache {
+                    continue;
                 }
 
-                // Collect change events (filtered by since date)
                 for cev in loaded.change_events.iter() {
                     if since.is_some_and(|since_date| cev.timestamp.date_naive() < since_date) {
                         continue;
@@ -1164,6 +1373,20 @@ impl UsageParser {
         // applies the same predicate to remote SSH rows.
         entries.retain(|e| provider_matches_model(provider, &e.model));
 
+        // Write-through: populate entries_cache so subsequent load_entries_cached
+        // calls within the same request hit the cache instead of re-scanning.
+        let cache_key = format!("{}:{}", provider, since.map(|d| d.to_string()).unwrap_or_default());
+        {
+            let mut cache = self.entries_cache.lock().unwrap();
+            cache.entry(cache_key).or_insert_with(|| {
+                (Instant::now(), Arc::new(LoadedEntries {
+                    entries: entries.clone(),
+                    change_events: change_events.clone(),
+                    reports: reports.clone(),
+                }))
+            });
+        }
+
         (entries, change_events, reports)
     }
 
@@ -1191,7 +1414,7 @@ impl UsageParser {
         before_date: NaiveDate,
     ) -> bool {
         for root_dir in &config.roots {
-            let (files, _) = self.cached_jsonl_files(root_dir);
+            let (files, _, _) = self.cached_jsonl_files(root_dir);
             let mut files: Vec<PathBuf> = files.iter().cloned().collect();
             files.sort_by_key(|path| {
                 fs::metadata(path)
@@ -2564,6 +2787,9 @@ mod tests {
                 r#"{"type":"assistant","timestamp":"2026-03-16T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":200,"output_tokens":75}}}"#,
             ),
         );
+
+        // Simulate the background invalidation loop detecting file changes
+        parser.invalidate_if_changed();
 
         let second = parser.get_monthly("claude", "20260101");
         assert_eq!(second.input_tokens, 300);
