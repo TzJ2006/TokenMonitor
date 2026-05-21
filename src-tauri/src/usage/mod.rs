@@ -8,6 +8,7 @@ pub mod integrations;
 pub mod litellm;
 pub mod openrouter;
 pub mod parser;
+pub mod payload_disk_cache;
 pub mod pricing;
 pub mod ssh_config;
 pub mod ssh_remote;
