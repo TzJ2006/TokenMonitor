@@ -1,18 +1,18 @@
 use chrono::Local;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::stats::change::{ChangeStats, ModelChangeSummary};
 
 // ── Frontend payload (sent to Svelte via IPC) ──
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum UsageSource {
     Parser,
     Mixed,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsagePayload {
     pub total_cost: f64,
     pub total_tokens: u64,
@@ -74,7 +74,7 @@ impl Default for UsagePayload {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChartBucket {
     pub label: String,
     pub sort_key: String,
@@ -82,7 +82,7 @@ pub struct ChartBucket {
     pub segments: Vec<ChartSegment>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChartSegment {
     pub model: String,
     pub model_key: String,
@@ -90,7 +90,7 @@ pub struct ChartSegment {
     pub tokens: u64,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelSummary {
     pub display_name: String,
     pub model_key: String,
@@ -99,7 +99,7 @@ pub struct ModelSummary {
     pub change_stats: Option<ModelChangeSummary>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ActiveBlock {
     pub cost: f64,
     pub burn_rate_per_hour: f64,
@@ -405,7 +405,7 @@ pub(crate) fn is_codex_model_name(raw: &str) -> bool {
 
 // ── Device usage (per-SSH-host breakdown) ──
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeviceModelSummary {
     pub display_name: String,
     pub model_key: String,
@@ -413,7 +413,7 @@ pub struct DeviceModelSummary {
     pub tokens: u64,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeviceSummary {
     pub device: String,
     pub total_cost: f64,

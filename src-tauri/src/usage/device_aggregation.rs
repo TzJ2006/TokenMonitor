@@ -242,8 +242,9 @@ pub(crate) async fn build_device_breakdown_for_payload(
     let (since, end) = compute_date_bounds(period, offset)?;
     let parser = &state.parser;
 
-    let (local_entries, _, _) = parser.load_entries(provider, Some(since));
-    let mut local_summary = build_device_summary_from_parsed("Local", &local_entries, since, end);
+    let loaded = parser.load_entries_cached(provider, Some(since));
+    let local_entries = &loaded.entries;
+    let mut local_summary = build_device_summary_from_parsed("Local", local_entries, since, end);
     local_summary.is_local = true;
     local_summary.status = String::from("online");
 
@@ -556,8 +557,9 @@ pub(crate) async fn build_device_time_chart_buckets(
 
     let mut device_cost_by_bucket: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
-    let (local_entries, _, _) = parser.load_entries(provider, Some(since));
-    for entry in &local_entries {
+    let loaded = parser.load_entries_cached(provider, Some(since));
+    let local_entries = &loaded.entries;
+    for entry in local_entries {
         let date = entry.timestamp.date_naive();
         if date >= end {
             continue;
