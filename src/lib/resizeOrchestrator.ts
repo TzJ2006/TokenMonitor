@@ -11,6 +11,7 @@ import {
   measureTargetWindowHeight,
   resolveEffectiveWindowMaxHeight,
   resolveMonitorMaxWindowHeight,
+  resolveFixedWindowHeight,
   resolveScrollThresholdHeight,
 } from "./windowSizing.js";
 
@@ -19,6 +20,7 @@ export interface ResizeOrchestratorDeps {
   invoke: (cmd: string, args: Record<string, unknown>) => Promise<void>;
   onScrollLockChange: (locked: boolean) => void;
   currentMonitor: () => Promise<{
+    size: { width: number; height: number };
     workArea: { size: { height: number } };
     scaleFactor: number;
   } | null>;
@@ -48,6 +50,7 @@ export interface ResizeOrchestrator {
   getMaxWindowH: () => number;
   getScrollThresholdH: () => number;
   getIsScrollLocked: () => boolean;
+  getFixedWindowH: () => number;
 }
 
 export function createResizeOrchestrator(
@@ -81,7 +84,7 @@ export function createResizeOrchestrator(
   // once the bar chart renders. Suppress shrink requests during that window
   // to avoid a visible pop-out after content arrives.
   let initialContentReady = false;
-
+  let fixedWindowH = 0;
   // ── Internal helpers ──
 
   function captureDebugSnapshot(reason: string): Record<string, unknown> {
@@ -120,6 +123,12 @@ export function createResizeOrchestrator(
     try {
       const monitor = await deps.currentMonitor();
       if (!monitor) return;
+
+      fixedWindowH = resolveFixedWindowHeight(
+        monitor.size.width,
+        monitor.scaleFactor,
+      );
+
       maxWindowH = resolveMonitorMaxWindowHeight(
         monitor.workArea.size.height,
         monitor.scaleFactor,
@@ -133,6 +142,7 @@ export function createResizeOrchestrator(
         scaleFactor: monitor.scaleFactor,
         maxWindowH,
         scrollThresholdH,
+        fixedWindowH,
       });
     } catch {
       maxWindowH = DEFAULT_MAX_WINDOW_HEIGHT;
@@ -142,11 +152,13 @@ export function createResizeOrchestrator(
   }
 
   function getEffectiveWindowMaxHeight(): number {
-    return resolveEffectiveWindowMaxHeight(
+    const base = resolveEffectiveWindowMaxHeight(
       maxWindowH,
       scrollThresholdH,
       MIN_WINDOW_HEIGHT,
     );
+    if (fixedWindowH > 0 && fixedWindowH < base) return fixedWindowH;
+    return base;
   }
 
   function updateScrollLockState(
@@ -601,9 +613,8 @@ export function createResizeOrchestrator(
     initialContentReady = true;
     deps.logDebug("resize:initial-content-ready", {
       lastWindowH,
+      fixedWindowH,
     });
-    // Now that shrinks are unblocked, run one sync pass in case the final
-    // content is shorter than the primed height we started with.
     syncSizeAndVerify("initial-content-ready");
   }
 
@@ -620,5 +631,6 @@ export function createResizeOrchestrator(
     getMaxWindowH: () => maxWindowH,
     getScrollThresholdH: () => scrollThresholdH,
     getIsScrollLocked: () => isScrollLocked,
+    getFixedWindowH: () => fixedWindowH,
   };
 }

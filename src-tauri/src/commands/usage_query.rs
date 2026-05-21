@@ -150,9 +150,9 @@ fn attach_local_stats(
     provider: &str,
     bounds: &PeriodBounds,
 ) {
-    let (mut entries, mut change_events, _reports) =
-        parser.load_entries(provider, Some(bounds.start));
-
+    let loaded = parser.load_entries_cached(provider, Some(bounds.start));
+    let mut entries: Vec<_> = loaded.entries.clone();
+    let mut change_events: Vec<_> = loaded.change_events.clone();
     change_events.retain(|event| {
         let date = event.timestamp.date_naive();
         date >= bounds.start && date < bounds.end
@@ -195,22 +195,22 @@ async fn finalize_usage_payload(
     offset: i32,
     mut payload: UsagePayload,
 ) -> UsagePayload {
-    payload.device_breakdown =
+    let (device_breakdown, device_chart_buckets, included) = tokio::join!(
         crate::usage::device_aggregation::build_device_breakdown_for_payload(
             state, provider, period, offset,
-        )
-        .await;
-    payload.device_chart_buckets =
+        ),
         crate::usage::device_aggregation::build_device_time_chart_buckets(
             state, provider, period, offset,
-        )
-        .await;
+        ),
+        crate::usage::device_aggregation::build_included_devices_payload(
+            state, provider, period, offset,
+        ),
+    );
 
-    if let Some(included) = crate::usage::device_aggregation::build_included_devices_payload(
-        state, provider, period, offset,
-    )
-    .await
-    {
+    payload.device_breakdown = device_breakdown;
+    payload.device_chart_buckets = device_chart_buckets;
+
+    if let Some(included) = included {
         payload = merge_payloads(payload, included);
     }
 
@@ -473,6 +473,15 @@ pub(crate) async fn get_usage_data_inner(
         return Ok(cached);
     }
 
+    // Disk cache fallback: return stale data instantly, caller refreshes in background.
+    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+        if let Some(mut cached) = disk_cache.load(&final_cache_key) {
+            cached.from_cache = true;
+            parser.store_cache(&final_cache_key, cached.clone());
+            return Ok(cached);
+        }
+    }
+
     let payload = match selection {
         UsageIntegrationSelection::Single(integration_id) => {
             let mut payload = get_provider_data(parser, provider, period, offset)?;
@@ -541,6 +550,13 @@ pub(crate) async fn get_usage_data_inner(
     };
 
     parser.store_cache(&final_cache_key, payload.clone());
+    parser.clear_entries_cache();
+
+    // Persist to disk for next cold start (fire-and-forget).
+    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+        disk_cache.save(&final_cache_key, &payload);
+    }
+
     Ok(payload)
 }
 
@@ -956,6 +972,33 @@ mod tests {
         assert!(
             parser.check_cache(&final_key).is_none(),
             "usage-view cache should be removed by prefix invalidation"
+        );
+    }
+
+    #[test]
+    fn load_entries_populates_entries_cache_for_subsequent_cached_calls() {
+        let dir = TempDir::new().unwrap();
+        let now = Local::now();
+        let ts = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let content = format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"model":"claude-sonnet-4-6-20260301","usage":{{"input_tokens":2000,"output_tokens":800}},"stop_reason":"end_turn"}}}}"#,
+        );
+        write_file(&dir.path().join("session.jsonl"), &content);
+
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+        let today = now.date_naive();
+
+        // First call via load_entries (as get_hourly does internally)
+        let (entries, _, _) = parser.load_entries("claude", Some(today));
+        assert!(!entries.is_empty(), "should parse at least one entry");
+
+        // Subsequent call via load_entries_cached should hit the cache
+        // without re-reading files (entries_cache was populated by write-through)
+        let cached = parser.load_entries_cached("claude", Some(today));
+        assert_eq!(
+            cached.entries.len(),
+            entries.len(),
+            "cached entries should match direct load_entries result"
         );
     }
 
