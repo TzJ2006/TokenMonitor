@@ -242,3 +242,43 @@ npx tauri signer generate --ci -p "$(cat signing/tauri-updater-password.txt)" -w
 ```
 
 Linux auto-update uses the `.AppImage` bundle (not `.deb` — apt owns `.deb` installations). The release workflow produces both formats: `.deb` for package-manager installs, `.AppImage` + `.AppImage.sig` for auto-update users.
+
+
+<!-- AI-DEV-COMPANION:START -->
+## AI Dev Companion — Constraints
+
+This project is tracked by AI Dev Companion. The following rules are enforced:
+
+### Mandatory Workflows
+
+1. **All code changes are automatically recorded** via PostToolUse hook — every Edit/Write to tracked files is captured
+2. **Before starting a feature**, use `/ccplan` to create an ECL plan in `docs/ecl/`
+3. **Before editing guarded files**, check `docs/ecl/*.yaml` for active feature guards and preserve invariants
+4. **After editing**, the hook records: timestamp, file, tool, ECL context automatically
+5. **When tests fail**, use `/ccdebug` — fix code, not tests (max 3 retries)
+6. **For codebase analysis**, use `/cconboard` to generate structured documentation
+
+### Tracked File Extensions
+
+Changes to `.py`, `.pyi`, `.ts`, `.tsx`, `.mts`, `.cts` files are tracked at function level.
+
+### Storage Layout
+
+- `.devcompanion/queue/` — event queue (hook writes here, daemon processes)
+- `.devcompanion/reviews/` — processed review sessions (JSON)
+- `.devcompanion/history/` — per-file change history (JSON)
+- `docs/ecl/` — active feature constraints (YAML, committed to git)
+
+### Feature Guard Protocol
+
+When `docs/ecl/*.yaml` files contain `feature_guard` sections:
+- Before editing a guarded file, announce which invariants must be preserved
+- After editing, run the guard's verification command
+- If verification fails, revert and investigate — do not proceed with broken guards
+
+### AI Dev Companion Location
+
+- Install root: `D:\GitHub\ai-companion`
+- Hook: `D:\GitHub\ai-companion/packages/hook/dist/index.js`
+- Skills: `D:\GitHub\ai-companion/skills/`
+<!-- AI-DEV-COMPANION:END -->

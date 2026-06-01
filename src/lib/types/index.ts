@@ -38,6 +38,7 @@ export interface UsagePayload {
   device_breakdown: DeviceSummary[] | null;
   device_chart_buckets: ChartBucket[] | null;
   provider_detected: boolean | null;
+  cursor_loading?: boolean;
 }
 
 export interface ChartBucket {
