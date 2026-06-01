@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod cache_warmup;
 pub mod claude_parser;
 pub mod codex_parser;
 pub mod cursor_parser;

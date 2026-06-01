@@ -280,6 +280,8 @@ export async function fetchData(
   const ctx: FetchCtx = { provider, period, offset, requestId, cacheKey: key };
   logger.debug("usage", `Fetch: ${provider}/${period} offset=${offset}`);
   logResizeDebug("usage:fetch-start", { ...ctx, hadFrontendCache: payloadCache.has(key) });
+  const _fetchT0 = performance.now();
+  console.log(`[PROFILE] fetchData:start provider=${provider} period=${period} offset=${offset}`);
 
   // ── Stale-while-revalidate: instant show + silent refresh ──
   const cached = payloadCache.get(key);
@@ -329,6 +331,7 @@ export async function fetchData(
     await logUsageReadDebug("usage:fetch-resolved", {
       ...ctx, appliedToUi, fromPayloadCache: data.from_cache,
     });
+    console.log(`[PROFILE] fetchData:IPC-resolved = ${(performance.now() - _fetchT0).toFixed(1)}ms provider=${provider}`);
   } catch (e) {
     logger.error("usage", `Fetch failed: provider=${provider} period=${period} offset=${offset} error=${formatDebugError(e)}`);
     logResizeDebug("usage:fetch-rejected", { ...ctx, error: formatDebugError(e) });
@@ -338,6 +341,7 @@ export async function fetchData(
       isPlaceholderLoading.set(false);
     }
   }
+  console.log(`[PROFILE] fetchData:TOTAL = ${(performance.now() - _fetchT0).toFixed(1)}ms provider=${provider}`);
 }
 
 /**

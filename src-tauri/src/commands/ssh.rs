@@ -76,7 +76,7 @@ pub async fn add_ssh_host(alias: String, state: State<'_, AppState>) -> Result<(
     configs.push(SshHostConfig {
         alias,
         enabled: true,
-        include_in_stats: false,
+        include_in_stats: true,
     });
 
     Ok(())
@@ -186,6 +186,9 @@ pub async fn sync_ssh_host(
 
     if count > 0 {
         state.parser.clear_payload_cache();
+        if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+            disk_cache.clear_prefix("usage-view:");
+        }
     }
 
     let diagnostic = if count == 0 {
@@ -303,13 +306,6 @@ pub async fn get_device_usage(
                     })
                     .collect();
 
-                // Skip devices that have no rows in the selected provider scope —
-                // otherwise the list shows empty remote entries when filtering
-                // e.g. Codex while the host only has Claude data.
-                if archived_entries.is_empty() && live_records.is_empty() {
-                    continue;
-                }
-
                 // Build summary: archived entries + live compact records.
                 let mut summary = build_device_summary_merged(
                     &cfg.alias,
@@ -340,10 +336,23 @@ pub async fn get_device_usage(
         }
     }
 
-    // 3. Compute cost percentages.
+    // 3. Log device data for debugging.
+    tracing::info!(
+        "[DEVICE] get_device_usage: provider={provider} period={period} offset={offset} total_cost={total_cost:.2}"
+    );
+    for d in &devices {
+        tracing::info!(
+            "[DEVICE] get_device_usage device={} cost={:.2} is_local={}",
+            d.device,
+            d.total_cost,
+            d.is_local,
+        );
+    }
+
+    // 4. Compute cost percentages.
     enrich_cost_percentages(&mut devices, total_cost);
 
-    // 4. Build chart buckets by device.
+    // 5. Build chart buckets by device.
     let chart_buckets = build_device_chart_buckets(&devices);
 
     Ok(DeviceUsagePayload {
@@ -370,7 +379,7 @@ pub async fn get_single_device_usage(
     use crate::commands::period::{compute_date_bounds, format_day_label};
     use crate::models::{ModelSummary, UsagePayload, UsageSource};
     use crate::usage::integrations::provider_matches_model;
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
     use std::collections::HashMap;
 
     validate_ssh_alias(&device).or_else(|_| {
@@ -416,7 +425,7 @@ pub async fn get_single_device_usage(
                 entry.cache_creation_1h_tokens,
                 entry.cache_read_tokens,
                 0,
-            );
+            ) * provider_multiplier(&entry.model);
             let tokens = entry.input_tokens + entry.output_tokens;
             let agg = model_map
                 .entry(model_key.clone())
@@ -466,7 +475,7 @@ pub async fn get_single_device_usage(
                     record.cache_1h,
                     record.cache_read,
                     0,
-                );
+                ) * provider_multiplier(&record.model);
                 let tokens = record.input_tokens + record.output_tokens;
                 let agg = model_map
                     .entry(model_key.clone())

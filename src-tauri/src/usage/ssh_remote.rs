@@ -25,8 +25,12 @@ pub struct SshHostStatus {
 pub struct SshHostConfig {
     pub alias: String,
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub include_in_stats: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Result of a test_connection call.
