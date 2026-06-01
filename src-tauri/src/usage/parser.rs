@@ -2829,6 +2829,11 @@ mod tests {
         assert_eq!(first_debug.sources[0].cache_hits, 0);
         assert_eq!(first_debug.sources[0].cache_misses, 1);
 
+        // Production clears entries_cache after every top-level query
+        // (usage_query.rs:635); replicate that so this second aggregation
+        // re-runs and exercises the per-file parse cache instead of being
+        // short-circuited by the (provider:since) entries_cache.
+        parser.clear_entries_cache();
         let second = parser.get_daily("claude", "20260315");
         assert!(
             !second.from_cache,
@@ -2851,6 +2856,9 @@ mod tests {
         assert_eq!(first_source.cache_misses, 1);
         assert_eq!(first_source.opened_paths, 1);
 
+        // Cross-query reuse: production clears entries_cache per query, so the
+        // second aggregation must re-run and hit the parsed-file cache.
+        parser.clear_entries_cache();
         parser.get_monthly("claude", "20260101");
         let second_debug = parser.last_query_debug().unwrap();
         let second_source = &second_debug.sources[0];
@@ -2924,6 +2932,9 @@ mod tests {
         let first_debug = parser.last_query_debug().unwrap();
         assert!(!first_debug.sources[0].listing_cache_hit);
 
+        // Production clears entries_cache per query; replicate so the 2nd call
+        // re-runs and reuses the root-file-list (listing) cache.
+        parser.clear_entries_cache();
         parser.get_monthly("claude", "20260101");
         let second_debug = parser.last_query_debug().unwrap();
         assert!(second_debug.sources[0].listing_cache_hit);
@@ -2958,6 +2969,10 @@ mod tests {
         )
         .unwrap();
 
+        // entries_cache (keyed provider:since) would otherwise serve the stale
+        // pre-change entries; production clears it per query, so do the same and
+        // let the listing cache detect the bumped directory mtime.
+        parser.clear_entries_cache();
         let second = parser.get_daily("claude", "20260101");
         assert_eq!(second.input_tokens, 300);
         let second_debug = parser.last_query_debug().unwrap();
