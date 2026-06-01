@@ -300,6 +300,14 @@ pub(crate) async fn build_device_breakdown_for_payload(
                 })
                 .collect();
 
+            // Skip remote hosts with no data matching the selected provider, so
+            // a Claude-only remote device doesn't show up as an empty row on the
+            // Codex page (provider scoping for the device breakdown). Restores a
+            // guard dropped during the device_aggregation refactor.
+            if archived_entries.is_empty() && filtered.is_empty() {
+                continue;
+            }
+
             let mut summary =
                 build_device_summary_merged(&cfg.alias, &archived_entries, &filtered, since, end);
 
