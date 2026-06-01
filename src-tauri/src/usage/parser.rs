@@ -8,13 +8,13 @@ use crate::usage::integrations::{
     provider_matches_model, UsageIntegrationId, UsageIntegrationSelection,
 };
 use chrono::{DateTime, Local, NaiveDate, Timelike};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
-use rayon::prelude::*;
 
 #[cfg(test)]
 use super::claude_parser::read_claude_entries;
@@ -23,8 +23,8 @@ use super::claude_parser::{
 };
 use super::codex_parser::parse_codex_session_file;
 use super::cursor_parser::{
-    cursor_last_warning, fetch_cursor_remote_entries, glob_cursor_chat_session_files,
-    load_cursor_local_entries, parse_cursor_session_file, set_cursor_warning,
+    cursor_last_warning, glob_cursor_chat_session_files, load_cursor_local_entries,
+    parse_cursor_session_file, set_cursor_warning,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -402,7 +402,7 @@ fn build_segment_map(entries: &[&ParsedEntry]) -> HashMap<String, (String, f64, 
             e.cache_creation_1h_tokens,
             e.cache_read_tokens,
             e.web_search_requests,
-        );
+        ) * crate::usage::pricing::provider_multiplier(&e.model);
         let entry = map.entry(key).or_insert((name, 0.0, 0));
         entry.1 += cost;
         entry.2 += entry_total_tokens(e);
@@ -457,6 +457,44 @@ pub struct UsageParser {
     last_query_debug: Mutex<Option<UsageQueryDebugReport>>,
     archive: Mutex<Option<super::archive::ArchiveManager>>,
     entries_cache: Mutex<HashMap<String, (Instant, Arc<LoadedEntries>)>>,
+    cursor_remote_cache: Mutex<Option<CachedCursorRemote>>,
+    /// Earliest entry date per provider string, cached so `has_entries_before`
+    /// answers in O(1) instead of re-scanning every session file per query.
+    /// Invalidated on source change (`invalidate_if_changed`) and `clear_cache`.
+    earliest_date_cache: Mutex<HashMap<String, Option<NaiveDate>>>,
+}
+
+/// Cached result of a background Cursor remote API fetch.
+///
+/// Non-consuming and range-tagged: one fetch of the widest opened range serves
+/// every period view by filtering on the request's `since`. `covered_since` is
+/// the `since` the fetch used (`None` = all time); the cache satisfies any
+/// request whose `since >= covered_since`.
+#[derive(Clone)]
+pub(crate) struct CachedCursorRemote {
+    pub entries: Vec<ParsedEntry>,
+    pub stored_at: Instant,
+    pub covered_since: Option<NaiveDate>,
+}
+
+/// True when a cache covering `[covered_since, now]` satisfies a request for
+/// `[req_since, now]` (the request is a subset). `None` = all time (widest).
+fn cursor_range_covers(covered_since: Option<NaiveDate>, req_since: Option<NaiveDate>) -> bool {
+    match (covered_since, req_since) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(covered), Some(req)) => req >= covered,
+    }
+}
+
+/// True when `candidate` covers at least as much history as `current` — used to
+/// keep the widest fresh cache when concurrent fetches (e.g. warmup) race.
+fn cursor_range_at_least_as_wide(candidate: Option<NaiveDate>, current: Option<NaiveDate>) -> bool {
+    match (candidate, current) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(candidate), Some(current)) => candidate <= current,
+    }
 }
 
 fn prune_payload_cache(cache: &mut HashMap<String, PayloadCacheEntry>) {
@@ -569,6 +607,8 @@ impl UsageParser {
             last_query_debug: Mutex::new(None),
             archive: Mutex::new(None),
             entries_cache: Mutex::new(HashMap::new()),
+            cursor_remote_cache: Mutex::new(None),
+            earliest_date_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -581,6 +621,61 @@ impl UsageParser {
     /// Access the archive manager (if set).
     pub fn archive(&self) -> Option<super::archive::ArchiveManager> {
         self.archive.lock().unwrap().clone()
+    }
+
+    /// Store cursor remote entries fetched by the background task, tagged with
+    /// the `covered_since` range the fetch used. Keeps the widest fresh dataset
+    /// so a late narrow fetch (e.g. a warmup day-range) can't clobber a wider
+    /// one stored by a concurrent fetch.
+    pub(crate) fn store_cursor_remote(
+        &self,
+        entries: Vec<ParsedEntry>,
+        covered_since: Option<NaiveDate>,
+    ) {
+        let mut guard = self.cursor_remote_cache.lock().unwrap();
+        let replace = match guard.as_ref() {
+            None => true,
+            Some(existing) => {
+                existing.stored_at.elapsed().as_secs() >= CACHE_TTL_SECS
+                    || cursor_range_at_least_as_wide(covered_since, existing.covered_since)
+            }
+        };
+        if replace {
+            *guard = Some(CachedCursorRemote {
+                entries,
+                stored_at: Instant::now(),
+                covered_since,
+            });
+        }
+    }
+
+    /// Non-consuming read of the cursor remote cache for a requested `since`.
+    /// Returns `None` when there is no fresh cache covering the request (the
+    /// caller then triggers a background fetch); otherwise returns the cached
+    /// entries filtered to `timestamp.date_naive() >= since`. Because it does
+    /// not consume the cache, every period view can serve from one fetch.
+    pub(crate) fn cursor_remote_for(
+        &self,
+        req_since: Option<NaiveDate>,
+    ) -> Option<Vec<ParsedEntry>> {
+        let guard = self.cursor_remote_cache.lock().unwrap();
+        let cache = guard.as_ref()?;
+        if cache.stored_at.elapsed().as_secs() >= CACHE_TTL_SECS {
+            return None;
+        }
+        if !cursor_range_covers(cache.covered_since, req_since) {
+            return None;
+        }
+        let entries = match req_since {
+            Some(since) => cache
+                .entries
+                .iter()
+                .filter(|e| e.timestamp.date_naive() >= since)
+                .cloned()
+                .collect(),
+            None => cache.entries.clone(),
+        };
+        Some(entries)
     }
 
     /// Create with default home-directory paths.
@@ -646,6 +741,9 @@ impl UsageParser {
         if let Ok(mut c) = self.file_cache.lock() {
             c.clear();
         }
+        if let Ok(mut c) = self.earliest_date_cache.lock() {
+            c.clear();
+        }
         if let Ok(mut c) = self.root_file_lists.lock() {
             c.clear();
         }
@@ -669,13 +767,16 @@ impl UsageParser {
         self.clear_entries_cache();
     }
 
-
     pub(crate) fn load_entries_cached(
         &self,
         provider: &str,
         since: Option<NaiveDate>,
     ) -> Arc<LoadedEntries> {
-        let key = format!("{}:{}", provider, since.map(|d| d.to_string()).unwrap_or_default());
+        let key = format!(
+            "{}:{}",
+            provider,
+            since.map(|d| d.to_string()).unwrap_or_default()
+        );
 
         // Note: do NOT call have_sources_changed() here — it stats all files
         // and defeats the warm-path optimization. The background loop calls
@@ -688,7 +789,11 @@ impl UsageParser {
             }
         }
         let (entries, change_events, reports) = self.load_entries(provider, since);
-        let loaded = Arc::new(LoadedEntries { entries, change_events, reports });
+        let loaded = Arc::new(LoadedEntries {
+            entries,
+            change_events,
+            reports,
+        });
         {
             let mut cache = self.entries_cache.lock().unwrap();
             cache.insert(key, (Instant::now(), loaded.clone()));
@@ -742,6 +847,10 @@ impl UsageParser {
             // Clear root_file_lists so next query does a fresh scan
             // (listing_cache_hit will be false, forcing fresh stat).
             if let Ok(mut c) = self.root_file_lists.lock() {
+                c.clear();
+            }
+            // Source files changed → the cached earliest date may be stale.
+            if let Ok(mut c) = self.earliest_date_cache.lock() {
                 c.clear();
             }
             true
@@ -818,7 +927,10 @@ impl UsageParser {
     }
 
     #[allow(clippy::type_complexity)]
-    fn cached_jsonl_files(&self, dir: &Path) -> (Arc<[PathBuf]>, Option<Arc<[FileListStamp]>>, bool) {
+    fn cached_jsonl_files(
+        &self,
+        dir: &Path,
+    ) -> (Arc<[PathBuf]>, Option<Arc<[FileListStamp]>>, bool) {
         if !dir.exists() {
             return (Arc::from(Vec::<PathBuf>::new()), None, false);
         }
@@ -867,73 +979,6 @@ impl UsageParser {
         (files, Some(file_stamps), false)
     }
 
-    fn load_cached_file(&self, path: &Path, kind: ProviderFileKind) -> CachedFileLoad {
-        let cache_key = path_to_string(path);
-        let stamp = file_stamp(path);
-
-        if let Some(stamp) = stamp.as_ref() {
-            if let Ok(mut cache) = self.file_cache.lock() {
-                if let Some(cached) = cache.get_mut(&cache_key) {
-                    if &cached.stamp == stamp {
-                        cached.last_accessed_at = Instant::now();
-                        return CachedFileLoad {
-                            entries: cached.entries.clone(),
-                            change_events: cached.change_events.clone(),
-                            earliest_date: cached.earliest_date,
-                            lines_read: 0,
-                            opened: false,
-                            from_cache: true,
-                        };
-                    }
-                }
-            }
-        }
-
-        let (entries, change_events, lines_read, opened) = match kind {
-            ProviderFileKind::Claude => parse_claude_session_file(path),
-            ProviderFileKind::Codex => {
-                let (e, ce, lr, op) = parse_codex_session_file(path);
-                (e, ce, lr, op)
-            }
-            ProviderFileKind::Cursor => parse_cursor_session_file(path),
-        };
-        let earliest_date = earliest_entry_date(&entries);
-        let entries: Arc<[ParsedEntry]> = entries.into();
-        let change_events: Arc<[ParsedChangeEvent]> = change_events.into();
-
-        if let Ok(mut cache) = self.file_cache.lock() {
-            if opened {
-                if let Some(stamp) = stamp {
-                    let now = Instant::now();
-                    cache.insert(
-                        cache_key,
-                        CachedFileEntries {
-                            stamp,
-                            entries: entries.clone(),
-                            change_events: change_events.clone(),
-                            earliest_date,
-                            last_accessed_at: now,
-                        },
-                    );
-                    prune_file_cache(&mut cache);
-                } else {
-                    cache.remove(&cache_key);
-                }
-            } else {
-                cache.remove(&cache_key);
-            }
-        }
-
-        CachedFileLoad {
-            entries,
-            change_events,
-            earliest_date,
-            lines_read,
-            opened,
-            from_cache: false,
-        }
-    }
-
     fn load_integration_entries_with_debug(
         &self,
         config: &UsageIntegrationConfig,
@@ -950,8 +995,10 @@ impl UsageParser {
         let mut processed_hashes = HashMap::new();
         let mut processed_change_keys = HashMap::new();
         let kind = config.file_kind();
+        let _prof_t0 = std::time::Instant::now();
 
         for root_dir in &config.roots {
+            let _t_scan = std::time::Instant::now();
             let (files, cached_stamps, listing_cache_hit) = self.cached_jsonl_files(root_dir);
             reports.push(ProviderReadDebug {
                 provider: String::from(config.id.as_str()),
@@ -967,9 +1014,9 @@ impl UsageParser {
 
             // Phase 1: Build mtime-filter stamps from cache (fast, no stat) and
             // prepare to get fresh stamps only for files that pass the filter.
-            let cached_stamp_map: Option<HashMap<&Path, &FileStamp>> = cached_stamps.as_ref().map(|cs| {
-                cs.iter().map(|fs| (fs.path.as_path(), &fs.stamp)).collect()
-            });
+            let cached_stamp_map: Option<HashMap<&Path, &FileStamp>> = cached_stamps
+                .as_ref()
+                .map(|cs| cs.iter().map(|fs| (fs.path.as_path(), &fs.stamp)).collect());
 
             // Phase 2a: Mtime filter using cached stamps (zero stat cost).
             let mut candidate_indices: Vec<usize> = Vec::new();
@@ -992,6 +1039,14 @@ impl UsageParser {
                 }
                 candidate_indices.push(i);
             }
+            tracing::info!(
+                "[PROFILE] {}: Phase1+2a scan+mtime_filter={:?} files={} candidates={} listing_cache={}",
+                config.id.as_str(),
+                _t_scan.elapsed(),
+                files.len(),
+                candidate_indices.len(),
+                listing_cache_hit,
+            );
 
             // Phase 2b: Classify into cache-hit vs needs-parse (single lock).
             // When listing_cache_hit is true AND file_cache has the entry, trust it
@@ -1025,6 +1080,13 @@ impl UsageParser {
                     needs_stat_indices.push(i);
                 }
             }
+            tracing::info!(
+                "[PROFILE] {}: Phase2b classify elapsed={:?} cache_hits={} needs_stat={}",
+                config.id.as_str(),
+                _t_scan.elapsed(),
+                cache_hits.len(),
+                needs_stat_indices.len(),
+            );
 
             // Phase 2c: Parallel stat only files not found in file_cache.
             let fresh_stamps: Vec<(usize, Option<FileStamp>)> = needs_stat_indices
@@ -1064,6 +1126,12 @@ impl UsageParser {
                     }
                 }
             }
+            tracing::info!(
+                "[PROFILE] {}: Phase2c parallel_stat elapsed={:?} to_parse={}",
+                config.id.as_str(),
+                _t_scan.elapsed(),
+                to_parse.len(),
+            );
 
             // Phase 3: Parallel parse of cache-miss files.
             let parsed: Vec<(PathBuf, Option<FileStamp>, CachedFileLoad)> = to_parse
@@ -1086,6 +1154,12 @@ impl UsageParser {
                     (path.clone(), stamp.clone(), loaded)
                 })
                 .collect();
+            tracing::info!(
+                "[PROFILE] {}: Phase3 parallel_parse elapsed={:?} parsed_files={}",
+                config.id.as_str(),
+                _t_scan.elapsed(),
+                parsed.len(),
+            );
 
             // Phase 4: Batch update file_cache (single lock).
             {
@@ -1197,6 +1271,13 @@ impl UsageParser {
                 }
             }
         }
+        tracing::info!(
+            "[PROFILE] {}: TOTAL={:?} entries={} change_events={}",
+            config.id.as_str(),
+            _prof_t0.elapsed(),
+            entries.len(),
+            change_events.len(),
+        );
 
         (entries, change_events, reports)
     }
@@ -1249,38 +1330,35 @@ impl UsageParser {
             return (local_entries, Vec::new(), report);
         }
 
-        match fetch_cursor_remote_entries(since) {
-            Ok(Some(entries)) => {
-                report.strategy = format!("{}+cursor-remote-api", report.strategy);
-                report.emitted_entries = entries.len();
-                if entries.is_empty() {
-                    tracing::info!(
-                        "Cursor remote API returned no usage entries for the selected period"
-                    );
-                }
-                set_cursor_warning(None);
-                (entries, Vec::new(), report)
-            }
-            Ok(None) => {
-                report.strategy = format!("{}+cursor-remote-api-not-configured", report.strategy);
-                let warning = String::from(
-                    "Cursor remote auth is not configured. Paste a `WorkosCursorSessionToken` from cursor.com cookies (recommended for Pro/Pro+/Ultra) — or, for Enterprise admins, paste a `key_…` Admin API Key from Cursor Dashboard → Settings → Advanced.",
-                );
-                set_cursor_warning(Some(warning));
-                (Vec::new(), Vec::new(), report)
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "Cursor remote API source failed"
-                );
-                push_sample_path(
-                    &mut report.sample_skipped_paths,
-                    Path::new(&format!("cursor-remote-api: {error}")),
-                );
-                report.strategy = format!("{}+cursor-remote-api-failed", report.strategy);
-                set_cursor_warning(None);
-                (Vec::new(), Vec::new(), report)
+        // Serve from the non-consuming, range-tagged remote cache when it covers
+        // the requested range (entries are filtered to `since`).
+        if let Some(entries) = self.cursor_remote_for(since) {
+            report.strategy = format!("{}+cursor-remote-cache", report.strategy);
+            report.emitted_entries = entries.len();
+            set_cursor_warning(None);
+            return (entries, Vec::new(), report);
+        }
+
+        // No local entries and no cache — signal that async fetch is needed.
+        // The caller (usage_query) will spawn a background task.
+        report.strategy = format!("{}+cursor-remote-pending", report.strategy);
+        (Vec::new(), Vec::new(), report)
+    }
+
+    /// Returns `true` when Cursor remote auth is configured and the cache does
+    /// not already cover the requested `since` range — indicating a background
+    /// fetch should be spawned (adaptive widening: only fetch the part we lack).
+    pub(crate) fn needs_cursor_remote_fetch(&self, req_since: Option<NaiveDate>) -> bool {
+        use super::cursor_parser::resolve_cursor_auth;
+        if resolve_cursor_auth().is_none() {
+            return false;
+        }
+        let guard = self.cursor_remote_cache.lock().unwrap();
+        match guard.as_ref() {
+            None => true,
+            Some(cache) => {
+                cache.stored_at.elapsed().as_secs() >= CACHE_TTL_SECS
+                    || !cursor_range_covers(cache.covered_since, req_since)
             }
         }
     }
@@ -1375,15 +1453,22 @@ impl UsageParser {
 
         // Write-through: populate entries_cache so subsequent load_entries_cached
         // calls within the same request hit the cache instead of re-scanning.
-        let cache_key = format!("{}:{}", provider, since.map(|d| d.to_string()).unwrap_or_default());
+        let cache_key = format!(
+            "{}:{}",
+            provider,
+            since.map(|d| d.to_string()).unwrap_or_default()
+        );
         {
             let mut cache = self.entries_cache.lock().unwrap();
             cache.entry(cache_key).or_insert_with(|| {
-                (Instant::now(), Arc::new(LoadedEntries {
-                    entries: entries.clone(),
-                    change_events: change_events.clone(),
-                    reports: reports.clone(),
-                }))
+                (
+                    Instant::now(),
+                    Arc::new(LoadedEntries {
+                        entries: entries.clone(),
+                        change_events: change_events.clone(),
+                        reports: reports.clone(),
+                    }),
+                )
             });
         }
 
@@ -1393,85 +1478,89 @@ impl UsageParser {
     // ── has_entries_before: check if data exists before a given date ──
 
     pub fn has_entries_before(&self, provider: &str, before_date: NaiveDate) -> bool {
-        let Some(selection) = UsageIntegrationSelection::parse(provider) else {
-            return false;
-        };
+        self.provider_earliest_date(provider)
+            .is_some_and(|earliest| earliest < before_date)
+    }
 
+    /// Earliest entry date across all of a provider's data, cached per epoch.
+    ///
+    /// The first call scans the provider's session files once (parsing
+    /// uncached ones in parallel); every later call — including each period
+    /// switch and the background warmup's per-offset probing — is O(1). The
+    /// cache is cleared by `clear_cache` and `invalidate_if_changed`.
+    fn provider_earliest_date(&self, provider: &str) -> Option<NaiveDate> {
+        if let Ok(cache) = self.earliest_date_cache.lock() {
+            if let Some(cached) = cache.get(provider) {
+                return *cached;
+            }
+        }
+        let computed = self.compute_provider_earliest_date(provider);
+        if let Ok(mut cache) = self.earliest_date_cache.lock() {
+            cache.insert(provider.to_string(), computed);
+        }
+        computed
+    }
+
+    fn compute_provider_earliest_date(&self, provider: &str) -> Option<NaiveDate> {
+        let selection = UsageIntegrationSelection::parse(provider)?;
         selection
             .integration_ids()
             .iter()
             .copied()
-            .any(|integration_id| match integration_id {
-                UsageIntegrationId::Claude => self.has_claude_entries_before(before_date),
-                UsageIntegrationId::Codex => self.has_codex_entries_before(before_date),
-                UsageIntegrationId::Cursor => self.has_cursor_entries_before(before_date),
+            .filter_map(|integration_id| match integration_id {
+                UsageIntegrationId::Cursor => self.cursor_earliest_date(),
+                _ => self
+                    .integration_config(integration_id)
+                    .and_then(|config| self.integration_earliest_date(config)),
             })
+            .min()
     }
 
-    fn has_integration_entries_before(
-        &self,
-        config: &UsageIntegrationConfig,
-        before_date: NaiveDate,
-    ) -> bool {
-        for root_dir in &config.roots {
-            let (files, _, _) = self.cached_jsonl_files(root_dir);
-            let mut files: Vec<PathBuf> = files.iter().cloned().collect();
-            files.sort_by_key(|path| {
-                fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .map(|modified| {
-                        let modified: chrono::DateTime<Local> = modified.into();
-                        let modified_date = modified.date_naive();
-                        (modified_date >= before_date, modified_date)
+    /// Minimum earliest-entry-date across a provider's session files.
+    ///
+    /// Parses files directly in parallel and keeps only each file's earliest
+    /// date — it deliberately does NOT go through `load_cached_file`. With many
+    /// thousands of session files, inserting each into the `MAX_FILE_CACHE_ENTRIES`
+    /// (4096) capped `file_cache` would call `prune_file_cache` on every insert
+    /// past the cap (clone-all-keys + O(n log n) sort, under one Mutex shared by
+    /// the rayon workers) — that eviction churn, not parsing, was the multi-second
+    /// cost here. Raw parsing of the whole tree is sub-second.
+    fn integration_earliest_date(&self, config: &UsageIntegrationConfig) -> Option<NaiveDate> {
+        let kind = config.file_kind();
+        config
+            .roots
+            .iter()
+            .filter_map(|root_dir| {
+                let (files, _, _) = self.cached_jsonl_files(root_dir);
+                let files: Vec<PathBuf> = files.iter().cloned().collect();
+                files
+                    .par_iter()
+                    .filter_map(|path| {
+                        let entries = match kind {
+                            ProviderFileKind::Claude => parse_claude_session_file(path).0,
+                            ProviderFileKind::Codex => parse_codex_session_file(path).0,
+                            ProviderFileKind::Cursor => parse_cursor_session_file(path).0,
+                        };
+                        earliest_entry_date(&entries)
                     })
-                    .unwrap_or((true, Local::now().date_naive()))
-            });
-
-            for path in files {
-                let loaded = self.load_cached_file(&path, config.file_kind());
-                if loaded
-                    .earliest_date
-                    .is_some_and(|entry_date| entry_date < before_date)
-                {
-                    return true;
-                }
-            }
-        }
-
-        false
+                    .min()
+            })
+            .min()
     }
 
-    fn has_claude_entries_before(&self, before_date: NaiveDate) -> bool {
-        let config = self
-            .integration_config(UsageIntegrationId::Claude)
-            .expect("claude integration should be configured");
-        self.has_integration_entries_before(config, before_date)
-    }
-
-    fn has_codex_entries_before(&self, before_date: NaiveDate) -> bool {
-        let config = self
-            .integration_config(UsageIntegrationId::Codex)
-            .expect("codex integration should be configured");
-        self.has_integration_entries_before(config, before_date)
-    }
-
-    fn has_cursor_entries_before(&self, before_date: NaiveDate) -> bool {
-        let config = self
-            .integration_config(UsageIntegrationId::Cursor)
-            .expect("cursor integration should be configured");
+    fn cursor_earliest_date(&self) -> Option<NaiveDate> {
+        let config = self.integration_config(UsageIntegrationId::Cursor)?;
+        let mut earliest: Option<NaiveDate> = None;
         for root_dir in &config.roots {
             for path in glob_cursor_chat_session_files(root_dir) {
                 let (entries, _changes, _lines_read, _opened) = parse_cursor_session_file(&path);
-                if entries
-                    .iter()
-                    .any(|entry| entry.timestamp.date_naive() < before_date)
-                {
-                    return true;
+                for entry in &entries {
+                    let date = entry.timestamp.date_naive();
+                    earliest = Some(earliest.map_or(date, |cur| cur.min(date)));
                 }
             }
         }
-        false
+        earliest
     }
 
     // ── Internal: build model_breakdown across all entries ──
@@ -1496,7 +1585,8 @@ impl UsageParser {
     pub fn get_daily(&self, provider: &str, since: &str) -> UsagePayload {
         let cache_key = format!("daily:{}:{}", provider, since);
         let since_date = parse_since_date(since);
-        let (entries, _change_events, sources) = self.load_entries(provider, since_date);
+        let loaded = self.load_entries_cached(provider, since_date);
+        let entries = &loaded.entries;
         self.set_last_query_debug(UsageQueryDebugReport {
             provider: provider.to_string(),
             aggregation: String::from("daily"),
@@ -1504,13 +1594,13 @@ impl UsageParser {
             cache_key: cache_key.clone(),
             from_cache: false,
             entry_count: entries.len(),
-            sources,
+            sources: loaded.reports.clone(),
         });
 
         // Group by NaiveDate using a BTreeMap so dates are ordered
         let mut day_map: std::collections::BTreeMap<NaiveDate, Vec<&ParsedEntry>> =
             std::collections::BTreeMap::new();
-        for e in &entries {
+        for e in entries {
             day_map.entry(e.timestamp.date_naive()).or_default().push(e);
         }
 
@@ -1580,6 +1670,7 @@ impl UsageParser {
             device_breakdown: None,
             device_chart_buckets: None,
             provider_detected: None,
+            cursor_loading: false,
         }
     }
 
@@ -1588,7 +1679,8 @@ impl UsageParser {
     pub fn get_monthly(&self, provider: &str, since: &str) -> UsagePayload {
         let cache_key = format!("monthly:{}:{}", provider, since);
         let since_date = parse_since_date(since);
-        let (entries, _change_events, sources) = self.load_entries(provider, since_date);
+        let loaded = self.load_entries_cached(provider, since_date);
+        let entries = &loaded.entries;
         self.set_last_query_debug(UsageQueryDebugReport {
             provider: provider.to_string(),
             aggregation: String::from("monthly"),
@@ -1596,13 +1688,13 @@ impl UsageParser {
             cache_key: cache_key.clone(),
             from_cache: false,
             entry_count: entries.len(),
-            sources,
+            sources: loaded.reports.clone(),
         });
 
         // Group by YYYY-MM string using a BTreeMap for order
         let mut month_map: std::collections::BTreeMap<String, Vec<&ParsedEntry>> =
             std::collections::BTreeMap::new();
-        for e in &entries {
+        for e in entries {
             let key = e.timestamp.format("%Y-%m").to_string();
             month_map.entry(key).or_default().push(e);
         }
@@ -1676,6 +1768,7 @@ impl UsageParser {
             device_breakdown: None,
             device_chart_buckets: None,
             provider_detected: None,
+            cursor_loading: false,
         }
     }
 
@@ -1685,9 +1778,10 @@ impl UsageParser {
         let cache_key = format!("hourly:{}:{}", provider, since);
         let since_date = parse_since_date(since);
         let end_date = since_date.map(|date| date + chrono::Duration::days(1));
-        let (entries, _change_events, sources) = self.load_entries(provider, since_date);
-        let entries: Vec<ParsedEntry> = entries
-            .into_iter()
+        let loaded = self.load_entries_cached(provider, since_date);
+        let entries: Vec<&ParsedEntry> = loaded
+            .entries
+            .iter()
             .filter(|entry| end_date.is_none_or(|end| entry.timestamp.date_naive() < end))
             .collect();
         self.set_last_query_debug(UsageQueryDebugReport {
@@ -1697,13 +1791,13 @@ impl UsageParser {
             cache_key: cache_key.clone(),
             from_cache: false,
             entry_count: entries.len(),
-            sources,
+            sources: loaded.reports.clone(),
         });
 
         // Group by hour (0-23)
         let mut hour_map: HashMap<u32, Vec<&ParsedEntry>> = HashMap::new();
         for e in &entries {
-            hour_map.entry(e.timestamp.hour()).or_default().push(e);
+            hour_map.entry(e.timestamp.hour()).or_default().push(*e);
         }
 
         let now = Local::now();
@@ -1785,6 +1879,7 @@ impl UsageParser {
             device_breakdown: None,
             device_chart_buckets: None,
             provider_detected: None,
+            cursor_loading: false,
         }
     }
 
@@ -1793,7 +1888,8 @@ impl UsageParser {
     pub fn get_blocks(&self, provider: &str, since: &str) -> UsagePayload {
         let cache_key = format!("blocks:{}:{}", provider, since);
         let since_date = parse_since_date(since);
-        let (mut entries, _change_events, sources) = self.load_entries(provider, since_date);
+        let loaded = self.load_entries_cached(provider, since_date);
+        let mut entries: Vec<&ParsedEntry> = loaded.entries.iter().collect();
         self.set_last_query_debug(UsageQueryDebugReport {
             provider: provider.to_string(),
             aggregation: String::from("blocks"),
@@ -1801,7 +1897,7 @@ impl UsageParser {
             cache_key: cache_key.clone(),
             from_cache: false,
             entry_count: entries.len(),
-            sources,
+            sources: loaded.reports.clone(),
         });
 
         // Sort by timestamp ascending
@@ -1813,11 +1909,10 @@ impl UsageParser {
         // Split into blocks separated by gaps > 30 minutes
         let mut blocks: Vec<Vec<&ParsedEntry>> = Vec::new();
         {
-            let entry_refs: Vec<&ParsedEntry> = entries.iter().collect();
             let mut current_block: Vec<&ParsedEntry> = Vec::new();
             let mut prev_ts: Option<DateTime<Local>> = None;
 
-            for e in &entry_refs {
+            for &e in &entries {
                 if let Some(prev) = prev_ts {
                     if e.timestamp - prev > gap_threshold && !current_block.is_empty() {
                         blocks.push(std::mem::take(&mut current_block));
@@ -1928,6 +2023,7 @@ impl UsageParser {
             device_breakdown: None,
             device_chart_buckets: None,
             provider_detected: None,
+            cursor_loading: false,
         }
     }
 }
@@ -3792,7 +3888,6 @@ mod path_a_smoke {
     //! cargo test --lib path_a_smoke -- --ignored --nocapture
     //! ```
 
-    use super::*;
     use crate::usage::cursor_parser::*;
     use std::time::Duration;
 
@@ -4154,5 +4249,108 @@ mod path_a_smoke {
             Ok(None) => eprintln!("fetch_cursor_remote_entries returned Ok(None) — auth missing?"),
             Err(e) => eprintln!("ERROR: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cursor_remote_cache_tests {
+    //! Range-aware, non-consuming Cursor remote cache (cursor-global-cache-reuse):
+    //! one fetch of the widest opened range serves every period view by filtering
+    //! on the request's `since`, killing the old consume-once + narrow->wide race.
+    use super::*;
+    use chrono::{Local, NaiveDate, NaiveTime, TimeZone};
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn make_cursor_entry(day: NaiveDate) -> ParsedEntry {
+        let naive_dt = day.and_time(NaiveTime::from_hms_opt(12, 0, 0).unwrap());
+        let timestamp = Local.from_local_datetime(&naive_dt).single().unwrap();
+        ParsedEntry {
+            timestamp,
+            model: "cursor-gpt".to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            cache_read_tokens: 0,
+            web_search_requests: 0,
+            unique_hash: None,
+            session_key: "test-cursor".to_string(),
+            agent_scope: crate::stats::subagent::AgentScope::Main,
+        }
+    }
+
+    #[test]
+    fn range_covers_only_when_request_is_a_subset() {
+        let jan1 = date(2026, 1, 1);
+        let jun1 = date(2026, 6, 1);
+        // A wide cache (since=Jan1) covers a narrower request (since=Jun1).
+        assert!(cursor_range_covers(Some(jan1), Some(jun1)));
+        assert!(cursor_range_covers(Some(jan1), Some(jan1)));
+        // A narrow cache (since=Jun1) cannot serve a wider request (since=Jan1).
+        assert!(!cursor_range_covers(Some(jun1), Some(jan1)));
+        // All-time cache covers anything; a bounded cache can't cover all-time.
+        assert!(cursor_range_covers(None, Some(jan1)));
+        assert!(!cursor_range_covers(Some(jan1), None));
+    }
+
+    #[test]
+    fn range_at_least_as_wide_prefers_earlier_start() {
+        let jan1 = date(2026, 1, 1);
+        let jun1 = date(2026, 6, 1);
+        assert!(cursor_range_at_least_as_wide(Some(jan1), Some(jun1)));
+        assert!(!cursor_range_at_least_as_wide(Some(jun1), Some(jan1)));
+        assert!(cursor_range_at_least_as_wide(None, Some(jan1)));
+        assert!(!cursor_range_at_least_as_wide(Some(jan1), None));
+    }
+
+    #[test]
+    fn cursor_remote_for_is_non_consuming_and_filters_by_since() {
+        let parser = UsageParser::new();
+        let jan1 = date(2026, 1, 1);
+        let mar1 = date(2026, 3, 1);
+        let jun1 = date(2026, 6, 1);
+        // One fetch covering [Jan1, now] with a Jan entry and a Jun entry.
+        let entries = vec![make_cursor_entry(jan1), make_cursor_entry(jun1)];
+        parser.store_cursor_remote(entries, Some(jan1));
+
+        // Year view (since=Jan1): covered, both entries.
+        assert_eq!(parser.cursor_remote_for(Some(jan1)).unwrap().len(), 2);
+        // Non-consuming: a second read still returns the data.
+        assert_eq!(parser.cursor_remote_for(Some(jan1)).unwrap().len(), 2);
+        // Narrower views filter to entries on/after `since`.
+        let recent = parser.cursor_remote_for(Some(jun1)).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].timestamp.date_naive(), jun1);
+        assert_eq!(parser.cursor_remote_for(Some(mar1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cursor_remote_for_misses_when_request_is_wider_than_cache() {
+        let parser = UsageParser::new();
+        let jan1 = date(2026, 1, 1);
+        let jun1 = date(2026, 6, 1);
+        // Cache only covers [Jun1, now].
+        parser.store_cursor_remote(vec![make_cursor_entry(jun1)], Some(jun1));
+        // A year request wants older data we don't have -> miss (triggers fetch).
+        assert!(parser.cursor_remote_for(Some(jan1)).is_none());
+        // The narrow request it does cover is still served.
+        assert_eq!(parser.cursor_remote_for(Some(jun1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn store_keeps_widest_fresh_cache_against_late_narrow_fetch() {
+        let parser = UsageParser::new();
+        let jan1 = date(2026, 1, 1);
+        let jun1 = date(2026, 6, 1);
+        // Wide fetch lands first.
+        let wide = vec![make_cursor_entry(jan1), make_cursor_entry(jun1)];
+        parser.store_cursor_remote(wide, Some(jan1));
+        // A later narrow (day-range) fetch must not clobber the wider dataset.
+        parser.store_cursor_remote(vec![make_cursor_entry(jun1)], Some(jun1));
+        // Year view still served fully from the retained wide cache.
+        assert_eq!(parser.cursor_remote_for(Some(jan1)).unwrap().len(), 2);
     }
 }

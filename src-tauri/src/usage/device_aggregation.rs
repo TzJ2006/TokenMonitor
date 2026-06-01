@@ -34,7 +34,7 @@ pub(crate) fn build_device_summary_from_parsed(
     end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
     use std::collections::HashMap;
 
     let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
@@ -53,7 +53,7 @@ pub(crate) fn build_device_summary_from_parsed(
             entry.cache_creation_1h_tokens,
             entry.cache_read_tokens,
             0,
-        );
+        ) * provider_multiplier(&entry.model);
         let tokens = entry.input_tokens + entry.output_tokens;
 
         let agg = model_map
@@ -74,7 +74,7 @@ pub(crate) fn build_device_summary_from_compact(
     end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
     use std::collections::HashMap;
 
     let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
@@ -99,7 +99,7 @@ pub(crate) fn build_device_summary_from_compact(
             record.cache_1h,
             record.cache_read,
             0,
-        );
+        ) * provider_multiplier(&record.model);
         let tokens = record.input_tokens + record.output_tokens;
 
         let agg = model_map
@@ -120,7 +120,7 @@ pub(crate) fn build_device_summary_merged(
     end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
     use std::collections::HashMap;
 
     let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
@@ -139,7 +139,7 @@ pub(crate) fn build_device_summary_merged(
             entry.cache_creation_1h_tokens,
             entry.cache_read_tokens,
             0,
-        );
+        ) * provider_multiplier(&entry.model);
         let tokens = entry.input_tokens + entry.output_tokens;
         let agg = model_map
             .entry(model_key)
@@ -165,7 +165,7 @@ pub(crate) fn build_device_summary_merged(
             record.cache_1h,
             record.cache_read,
             0,
-        );
+        ) * provider_multiplier(&record.model);
         let tokens = record.input_tokens + record.output_tokens;
         let agg = model_map
             .entry(model_key)
@@ -300,10 +300,6 @@ pub(crate) async fn build_device_breakdown_for_payload(
                 })
                 .collect();
 
-            if archived_entries.is_empty() && filtered.is_empty() {
-                continue;
-            }
-
             let mut summary =
                 build_device_summary_merged(&cfg.alias, &archived_entries, &filtered, since, end);
 
@@ -338,7 +334,7 @@ pub(crate) async fn build_included_devices_payload(
 ) -> Option<crate::models::UsagePayload> {
     use crate::commands::period::compute_date_bounds;
     use crate::models::{ModelSummary, UsagePayload, UsageSource};
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
     use std::collections::HashMap;
 
     if !provider_includes_remote_ssh_usage(provider) {
@@ -346,10 +342,7 @@ pub(crate) async fn build_included_devices_payload(
     }
 
     let configs = state.ssh_hosts.read().await;
-    let included: Vec<_> = configs
-        .iter()
-        .filter(|c| c.enabled && c.include_in_stats)
-        .collect();
+    let included: Vec<_> = configs.iter().filter(|c| c.enabled).collect();
     if included.is_empty() {
         return None;
     }
@@ -388,7 +381,7 @@ pub(crate) async fn build_included_devices_payload(
                     entry.cache_creation_1h_tokens,
                     entry.cache_read_tokens,
                     0,
-                );
+                ) * provider_multiplier(&entry.model);
                 let tokens = entry.input_tokens + entry.output_tokens;
                 input_tokens += entry.input_tokens;
                 output_tokens += entry.output_tokens;
@@ -443,7 +436,7 @@ pub(crate) async fn build_included_devices_payload(
                 record.cache_1h,
                 record.cache_read,
                 0,
-            );
+            ) * provider_multiplier(&record.model);
             let tokens = record.input_tokens + record.output_tokens;
             input_tokens += record.input_tokens;
             output_tokens += record.output_tokens;
@@ -544,7 +537,7 @@ pub(crate) async fn build_device_time_chart_buckets(
 ) -> Option<Vec<ChartBucket>> {
     use crate::commands::period::compute_date_bounds;
     use crate::models::normalize_model;
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
     use std::collections::HashMap;
 
     let configs = state.ssh_hosts.read().await;
@@ -574,7 +567,7 @@ pub(crate) async fn build_device_time_chart_buckets(
             entry.cache_creation_1h_tokens,
             entry.cache_read_tokens,
             0,
-        );
+        ) * provider_multiplier(&entry.model);
         *device_cost_by_bucket
             .entry(bucket_key)
             .or_default()
@@ -613,7 +606,7 @@ pub(crate) async fn build_device_time_chart_buckets(
                             entry.cache_creation_1h_tokens,
                             entry.cache_read_tokens,
                             0,
-                        );
+                        ) * provider_multiplier(&entry.model);
                         *device_cost_by_bucket
                             .entry(bucket_key)
                             .or_default()
@@ -659,7 +652,7 @@ pub(crate) async fn build_device_time_chart_buckets(
                         record.cache_1h,
                         record.cache_read,
                         0,
-                    );
+                    ) * provider_multiplier(&record.model);
                     *device_cost_by_bucket
                         .entry(bucket_key)
                         .or_default()

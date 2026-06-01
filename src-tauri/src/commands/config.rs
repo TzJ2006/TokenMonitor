@@ -543,6 +543,9 @@ pub async fn set_dock_icon_visible(app: tauri::AppHandle, visible: bool) -> Resu
 #[tauri::command]
 pub async fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.parser.clear_cache();
+    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+        disk_cache.clear_all();
+    }
     if let Some(ssh_cache) = state.ssh_cache.read().await.as_ref() {
         ssh_cache.reset_all_caches();
     }
@@ -554,12 +557,18 @@ pub async fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn clear_payload_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.parser.clear_payload_cache();
+    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+        disk_cache.clear_all();
+    }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn clear_usage_view_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.parser.clear_payload_cache_prefix("usage-view:");
+    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+        disk_cache.clear_prefix("usage-view:");
+    }
     Ok(())
 }
 
@@ -715,4 +724,34 @@ pub async fn get_exchange_rates() -> Result<std::collections::HashMap<String, f6
 pub async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     app.exit(0);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn start_cache_warmup(
+    app: AppHandle,
+    priority_provider: Option<String>,
+    priority_period: Option<String>,
+) -> Result<u32, String> {
+    if crate::usage::cache_warmup::is_warmup_running() {
+        return Err("Warmup already running".to_string());
+    }
+    let provider = priority_provider.unwrap_or_else(|| "all".to_string());
+    let period = priority_period.unwrap_or_else(|| "day".to_string());
+
+    tokio::spawn(async move {
+        crate::usage::cache_warmup::warmup_payloads(&app, &provider, &period, true).await;
+    });
+
+    Ok(0)
+}
+
+#[tauri::command]
+pub fn cancel_cache_warmup() -> Result<(), String> {
+    crate::usage::cache_warmup::cancel_warmup();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_warmup_status() -> bool {
+    crate::usage::cache_warmup::is_warmup_running()
 }
