@@ -127,11 +127,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::new())
         .setup(|app| {
+            let setup_t0 = std::time::Instant::now();
             // Initialize logging first — must happen before any tracing macros.
             if let Ok(app_data) = app.path().app_data_dir() {
                 let logging_state = logging::init_logging(&app_data);
                 app.manage(logging_state);
             }
+            tracing::info!("[PROFILE] setup:logging = {:?}", setup_t0.elapsed());
 
             // Build tray menu (right-click on macOS/Windows, any click on Linux).
             let show = MenuItemBuilder::with_id("show", "Show TokenMonitor").build(app)?;
@@ -233,6 +235,7 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+            tracing::info!("[PROFILE] setup:tray+window = {:?}", setup_t0.elapsed());
 
             // Hide window on focus loss (popover behavior), but not when
             // focus moves to another app window (e.g. float-ball) or when a
@@ -275,6 +278,7 @@ pub fn run() {
             if let Some(ref w) = app.get_webview_window("main") {
                 platform::linux::position_top_right(w);
             }
+            tracing::info!("[PROFILE] setup:focus-handler = {:?}", setup_t0.elapsed());
 
             // Initialize SSH cache manager and usage archive with Tauri app data dir.
             if let Ok(app_data) = app.path().app_data_dir() {
@@ -291,8 +295,7 @@ pub fn run() {
                 );
 
                 // Initialize payload disk cache for instant cold-start.
-                let disk_cache =
-                    usage::payload_disk_cache::PayloadDiskCache::new(&app_data);
+                let disk_cache = usage::payload_disk_cache::PayloadDiskCache::new(&app_data);
                 *state.payload_disk_cache.blocking_write() = Some(disk_cache);
 
                 // Load cached dynamic pricing immediately (non-blocking).
@@ -337,6 +340,7 @@ pub fn run() {
                     });
                 }
             }
+            tracing::info!("[PROFILE] setup:data-init = {:?}", setup_t0.elapsed());
 
             // Hydrate the in-memory Cursor secret cache from keyring (or
             // file fallback) so the first usage refresh after launch can
@@ -344,6 +348,7 @@ pub fn run() {
             // round-trip a `set_cursor_auth_config` call. Best-effort: a
             // missing/locked keychain just leaves the cache empty.
             commands::config::prime_cursor_auth_from_disk(app.handle());
+            tracing::info!("[PROFILE] setup:cursor-prime = {:?}", setup_t0.elapsed());
 
             // Load persisted updater state
             {
@@ -355,6 +360,7 @@ pub fn run() {
 
             // Spawn the updater scheduler
             updater::scheduler::spawn(app.handle().clone());
+            tracing::info!("[PROFILE] setup:updater-done = {:?}", setup_t0.elapsed());
 
             // Spawn background setup + polling
             let app_handle = app.handle().clone();
@@ -371,6 +377,7 @@ pub fn run() {
                 fast_statusline_poll(app_handle).await;
             });
 
+            tracing::info!("[PROFILE] setup:TOTAL = {:?}", setup_t0.elapsed());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -437,10 +444,16 @@ pub fn run() {
             commands::updater::updater_check_now,
             commands::updater::updater_install,
             commands::updater::updater_set_auto_check,
+            commands::updater::updater_set_channel,
+            commands::updater::updater_discover_channels,
+            commands::updater::updater_fetch_channel_pubkey,
             commands::updater::updater_skip_version,
             commands::updater::updater_dismiss,
             commands::config::get_exchange_rates,
             commands::config::quit_app,
+            commands::config::start_cache_warmup,
+            commands::config::cancel_cache_warmup,
+            commands::config::get_warmup_status,
         ])
         .run(tauri::generate_context!())
         .expect("error running TokenMonitor");
@@ -530,6 +543,17 @@ async fn background_loop(app: tauri::AppHandle) {
     let state = app.state::<AppState>();
 
     sync_tray_title(&app, &state).await;
+
+    // One-shot silent warmup: precompute all payload caches in background.
+    if state
+        .usage_access_enabled
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            usage::cache_warmup::warmup_payloads(&app_clone, "all", "day", false).await;
+        });
+    }
 
     let mut update_counter: u64 = 0;
     let mut ssh_sync_counter: u64 = 0;
@@ -630,6 +654,9 @@ async fn background_loop(app: tauri::AppHandle) {
             if usage_access_enabled && ssh_changed {
                 // Invalidate parser cache so device data reflects new remote files.
                 state.parser.invalidate_if_changed();
+                if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+                    disk_cache.clear_prefix("usage-view:");
+                }
                 let _ = app.emit("data-updated", update_counter);
             }
             // Archive SSH device data for data loss prevention.

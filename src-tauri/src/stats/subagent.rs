@@ -97,7 +97,7 @@ impl ScopeSummaryBuilder {
             entry.cache_creation_1h_tokens,
             entry.cache_read_tokens,
             entry.web_search_requests,
-        );
+        ) * crate::usage::pricing::provider_multiplier(&entry.model);
         self.cost += entry_cost;
         self.input_tokens += entry.input_tokens;
         self.output_tokens += entry.output_tokens;
