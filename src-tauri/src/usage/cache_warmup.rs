@@ -29,10 +29,7 @@ fn max_negative_offset(state: &AppState, provider: &str, period: &str) -> i32 {
     }
 
     let mut offset = -1i32;
-    loop {
-        let Ok(bounds) = resolve_period_bounds(period, offset) else {
-            break;
-        };
+    while let Ok(bounds) = resolve_period_bounds(period, offset) {
         if !state.parser.has_entries_before(provider, bounds.start) {
             break;
         }
