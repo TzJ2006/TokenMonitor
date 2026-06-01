@@ -41,6 +41,9 @@ pub struct UsagePayload {
     pub device_breakdown: Option<Vec<DeviceSummary>>,
     pub device_chart_buckets: Option<Vec<ChartBucket>>,
     pub provider_detected: Option<bool>,
+    /// True when Cursor remote data is still being fetched asynchronously.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cursor_loading: bool,
 }
 
 impl Default for UsagePayload {
@@ -70,6 +73,7 @@ impl Default for UsagePayload {
             device_breakdown: None,
             device_chart_buckets: None,
             provider_detected: None,
+            cursor_loading: false,
         }
     }
 }

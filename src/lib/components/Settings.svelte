@@ -10,7 +10,8 @@
     type Settings as SettingsType,
   } from "../stores/settings.js";
   import { clearUsageCache } from "../stores/usage.js";
-  import { updaterStore, checkNow, setAutoCheck } from "../stores/updater.js";
+  import { updaterStore, checkNow, setAutoCheck, setChannel, discoverChannels, fetchChannelPubkey } from "../stores/updater.js";
+  import type { ChannelInfo } from "../stores/updater.js";
   import { isMacOS } from "../utils/platform.js";
   import { currencySymbol } from "../utils/format.js";
   import { logger } from "../utils/logger.js";
@@ -23,6 +24,7 @@
   import TrayConfigSettings from "./TrayConfigSettings.svelte";
   import HiddenModelsSettings from "./HiddenModelsSettings.svelte";
   import SshHostsSettings from "./SshHostsSettings.svelte";
+  import CacheWarmupSettings from "./CacheWarmupSettings.svelte";
   import UpdateBanner from "./UpdateBanner.svelte";
   import PermissionDisclosure from "./PermissionDisclosure.svelte";
 
@@ -34,6 +36,31 @@
   let current = $derived($settings as SettingsType);
   let appVersion = $state("");
   let checking = $state(false);
+  let channels = $state<ChannelInfo[]>([]);
+  let channelsLoading = $state(false);
+
+  async function loadChannels() {
+    if (channels.length > 0 || channelsLoading) return;
+    channelsLoading = true;
+    try {
+      channels = await discoverChannels();
+    } catch {
+      channels = [{ id: "main", label: "Michael-OvO/TokenMonitor (official)", owner: "Michael-OvO", repo: "TokenMonitor", hasReleases: true }];
+    }
+    channelsLoading = false;
+  }
+
+  async function onChannelChange(channelId: string) {
+    if (channelId !== "main") {
+      try {
+        await fetchChannelPubkey(channelId);
+      } catch {
+        // pubkey fetch failed — user is warned by update check later
+      }
+    }
+    await setChannel(channelId);
+  }
+
   let cursorAuthStatus = $state<CursorAuthStatus | null>(null);
   let cursorAuthMessage = $state<string | null>(null);
   let cursorExpanded = $state(false);
@@ -544,14 +571,13 @@
             onChange={handleDebugLogging}
           />
         </div>
-        <div class="row center">
-          <div class="actions">
-            <button class="reset-btn" class:done={resetStatus === "done"} class:error={resetStatus === "error"} onclick={resetCache}>
-              {#if resetStatus === "done"}Cache Reset ✓
-              {:else if resetStatus === "error"}Reset Failed
-              {:else}Reset Cache{/if}
-            </button>
-          </div>
+        <div class="row cache-actions">
+          <button class="cache-btn" class:done={resetStatus === "done"} class:error={resetStatus === "error"} onclick={resetCache}>
+            {#if resetStatus === "done"}Cache Reset ✓
+            {:else if resetStatus === "error"}Reset Failed
+            {:else}Reset Cache{/if}
+          </button>
+          <CacheWarmupSettings />
         </div>
       </div>
     </div>
@@ -582,6 +608,28 @@
               <span class="status-dot"></span>{updateStatus.label}
             </span>
           </div>
+        </div>
+        <div class="row border">
+          <span class="label">Channel</span>
+          <select
+            class="channel-select"
+            value={$updaterStore.updateChannel}
+            onfocus={loadChannels}
+            onchange={(e) => onChannelChange((e.target as HTMLSelectElement).value)}
+          >
+            {#if channels.length === 0}
+              <option value={$updaterStore.updateChannel}>
+                {$updaterStore.updateChannel === "main" ? "Official" : $updaterStore.updateChannel}
+              </option>
+            {:else}
+              {#each channels as ch (ch.id)}
+                <option value={ch.id}>{ch.label}</option>
+              {/each}
+            {/if}
+          </select>
+          {#if channelsLoading}
+            <span class="channel-loading">...</span>
+          {/if}
         </div>
         <div class="row border">
           <span class="label">Last Checked</span>
@@ -913,21 +961,46 @@
     border-color: var(--t3);
   }
 
-  .reset-btn {
-    background: none;
-    border: none;
-    font: 400 9px/1 'Inter', sans-serif;
-    color: var(--t4);
+  .cache-actions {
+    justify-content: center;
+    gap: 16px;
+  }
+  .channel-select {
+    max-width: 150px;
+    padding: 2px 6px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--t1);
+    font: 400 9px/1.4 'Inter', sans-serif;
+    outline: none;
     cursor: pointer;
+  }
+  .channel-select:focus {
+    border-color: var(--t3);
+  }
+  .channel-loading {
+    font: 400 8px/1 'Inter', sans-serif;
+    color: var(--t4);
+  }
+  .cache-btn {
+    background: var(--surface-hover);
+    border: 1px solid var(--border);
+    border-radius: 4px;
     padding: 2px 8px;
-  }
-  .reset-btn:hover {
+    font: 400 8px/1.2 'Inter', sans-serif;
     color: var(--t2);
+    cursor: pointer;
+    white-space: nowrap;
   }
-  .reset-btn.done {
+  .cache-btn:hover {
+    color: var(--t1);
+    border-color: var(--t3);
+  }
+  .cache-btn.done {
     color: var(--ch-plus);
   }
-  .reset-btn.error {
+  .cache-btn.error {
     color: var(--ch-minus);
   }
   .secondary-btn {

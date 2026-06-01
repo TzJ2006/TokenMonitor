@@ -286,7 +286,7 @@ function normalizeSshHosts(value: unknown): SshHostConfig[] {
       alias: candidate.alias.trim(),
       enabled: candidate.enabled,
       include_in_stats:
-        typeof candidate.include_in_stats === "boolean" ? candidate.include_in_stats : false,
+        typeof candidate.include_in_stats === "boolean" ? candidate.include_in_stats : true,
     }];
   });
 }

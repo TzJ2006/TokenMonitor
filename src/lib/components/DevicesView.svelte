@@ -90,7 +90,9 @@
     syncing = true;
     try {
       for (const d of remoteDevices) {
-        await invoke("sync_ssh_host", { alias: d.device });
+        try {
+          await invoke("sync_ssh_host", { alias: d.device });
+        } catch (_) {}
       }
       await fetchDeviceData();
     } finally {

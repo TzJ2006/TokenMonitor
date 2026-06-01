@@ -16,16 +16,24 @@ impl PayloadDiskCache {
         Self { dir }
     }
 
-    pub fn save(&self, key: &str, payload: &UsagePayload) {
+    pub fn save(&self, key: &str, payload: &UsagePayload) -> bool {
         let path = self.path_for(key);
-        let json = match serde_json::to_string(payload) {
+        let json = match serde_json::to_vec(payload) {
             Ok(j) => j,
-            Err(_) => return,
+            Err(_) => return false,
         };
-        let tmp = path.with_extension("tmp");
-        if fs::write(&tmp, json.as_bytes()).is_ok() {
-            fs::rename(&tmp, &path).ok();
+        // Skip write if content is identical (avoids unnecessary disk IO during warmup).
+        if let Ok(existing) = fs::read(&path) {
+            if existing == json {
+                return false;
+            }
         }
+        let tmp = path.with_extension("tmp");
+        if fs::write(&tmp, &json).is_ok() {
+            fs::rename(&tmp, &path).ok();
+            return true;
+        }
+        false
     }
 
     pub fn load(&self, key: &str) -> Option<UsagePayload> {
@@ -34,16 +42,51 @@ impl PayloadDiskCache {
         serde_json::from_str(&data).ok()
     }
 
-    #[allow(dead_code)]
-    pub fn remove(&self, key: &str) {
-        let path = self.path_for(key);
-        fs::remove_file(&path).ok();
+    pub fn clear_all(&self) {
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                    fs::remove_file(entry.path()).ok();
+                }
+            }
+        }
+    }
+
+    pub fn clear_prefix(&self, prefix: &str) {
+        let safe_prefix: String = prefix
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if name.starts_with(&safe_prefix) {
+                    fs::remove_file(&path).ok();
+                }
+            }
+        }
     }
 
     fn path_for(&self, key: &str) -> PathBuf {
         let safe_name: String = key
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.dir.join(format!("{safe_name}.json"))
     }

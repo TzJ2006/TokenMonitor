@@ -208,7 +208,7 @@ describe("loadSettings", () => {
 
     expect(loaded.sshHosts).toEqual([
       { alias: "devbox", enabled: true, include_in_stats: true },
-      { alias: "lab", enabled: false, include_in_stats: false },
+      { alias: "lab", enabled: false, include_in_stats: true },
     ]);
   });
 });
