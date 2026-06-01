@@ -347,7 +347,7 @@ fn collect_cursor_entries_from_value(
 }
 
 pub(crate) fn parse_cursor_session_file(path: &Path) -> SessionParseResult {
-    tracing::debug!(path = %path.display(), "opening file (cursor session)");
+    tracing::trace!(path = %path.display(), "opening file (cursor session)");
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) => {
@@ -406,7 +406,7 @@ pub(crate) fn glob_cursor_chat_session_files(dir: &Path) -> Vec<PathBuf> {
     if !dir.exists() {
         return results;
     }
-    tracing::debug!(path = %dir.display(), "read_dir (glob_cursor_chat_session_files)");
+    tracing::trace!(path = %dir.display(), "read_dir (glob_cursor_chat_session_files)");
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(error) => {
@@ -1028,5 +1028,72 @@ mod tests {
     #[test]
     fn choose_auth_all_none() {
         assert!(choose_cursor_auth(None, None, None, None).is_none());
+    }
+
+    // THROWAWAY profiling probe (ccplan PROBE-002). Isolates the real cursor
+    // cold-start path into stages against live data. Remove after profiling.
+    #[test]
+    #[ignore = "manual profiling: real cursor path stage timing (needs logged-in Cursor IDE + network)"]
+    fn profile_cursor_real_path_stages() {
+        use chrono::Datelike;
+        use std::time::Instant;
+
+        let now = Local::now();
+        let today = now.date_naive();
+        let month_start = NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap();
+        let year_start = NaiveDate::from_ymd_opt(now.year(), 1, 1).unwrap();
+        let ranges = [("day", today), ("month", month_start), ("year", year_start)];
+
+        // Stage 1: sqlite token read from the (60MB) state.vscdb
+        let t = Instant::now();
+        let primed = prime_ide_access_token();
+        println!(
+            "[STAGE1 sqlite-token-read] primed={} elapsed={:?}",
+            primed,
+            t.elapsed()
+        );
+
+        let root = crate::paths::cursor_workspace_storage_default();
+        println!("[local root] {root:?}");
+
+        // Stage 2a: pure glob walk of the workspaceStorage tree
+        if let Some(root) = root.clone() {
+            let t = Instant::now();
+            let files = glob_cursor_chat_session_files(&root);
+            println!(
+                "[STAGE2a glob-walk] elapsed={:?} chatSession_files={}",
+                t.elapsed(),
+                files.len()
+            );
+        }
+
+        // Stage 2b: full local scan (glob + mtime filter + JSON parse) per range
+        if let Some(root) = root {
+            for (label, since) in ranges {
+                let t = Instant::now();
+                let (entries, report) = load_cursor_local_entries(&root, Some(since));
+                println!(
+                    "[STAGE2b local-scan {label}] elapsed={:?} discovered={} opened={} skipped_mtime={} lines_read={} emitted={}",
+                    t.elapsed(),
+                    report.discovered_paths,
+                    report.opened_paths,
+                    report.skipped_by_mtime,
+                    report.lines_read,
+                    entries.len()
+                );
+            }
+        }
+
+        // Stage 3: remote API fetch (paginated) per range
+        for (label, since) in ranges {
+            let t = Instant::now();
+            let res = fetch_cursor_remote_entries(Some(since));
+            let desc = match &res {
+                Ok(Some(v)) => format!("ok entries={}", v.len()),
+                Ok(None) => "ok none(no auth)".to_string(),
+                Err(e) => format!("ERR {e}"),
+            };
+            println!("[STAGE3 remote {label}] elapsed={:?} {desc}", t.elapsed());
+        }
     }
 }

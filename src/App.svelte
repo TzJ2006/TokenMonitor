@@ -664,10 +664,13 @@
     logResizeDebug("app:mount", captureSnapshot("mount"));
 
     const init = async () => {
+      const _t0 = performance.now();
+      console.log('[PROFILE] init:start');
       await resizeOrch!.refreshWindowMetrics();
       const fixedH0 = resizeOrch!.getFixedWindowH();
       const rawThreshold = resizeOrch!.getScrollThresholdH();
       scrollThresholdH = fixedH0 > 0 ? Math.min(rawThreshold, fixedH0) : rawThreshold;
+      console.log(`[PROFILE] init:window-metrics = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       // Load persisted settings and apply theme + defaults (non-blocking)
       try {
@@ -685,6 +688,7 @@
         // Settings load failed — continue with defaults
         logResizeDebug("app:settings-load-failed", {});
       }
+      console.log(`[PROFILE] init:settings+bootstrap = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       // Restore the window to its last-known height before the chart renders.
       // In fixed-height mode, don't restore persisted height — content will
@@ -707,11 +711,13 @@
           }
         }
       }
+      console.log(`[PROFILE] init:window-restore = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       if (get(settings).hasSeenWelcome) {
         await loadInitialData();
         if (cancelled) return;
       }
+      console.log(`[PROFILE] init:loadInitialData = ${(performance.now() - _t0).toFixed(1)}ms`);
       if (isWindows()) {
         try {
           const edge = await invoke<string>("get_window_anchor_edge");
@@ -721,6 +727,7 @@
 
       void refreshStatuslineProbe();
       appReady = true;
+      console.log(`[PROFILE] init:appReady = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       if (popEl) {
         observer = new ResizeObserver((entries) => {
@@ -742,6 +749,7 @@
         await tick();
         resizeOrch?.markInitialContentReady();
       }
+      console.log(`[PROFILE] init:TOTAL = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       unlisten = await listen("data-updated", () => {
         logResizeDebug("app:data-updated-event", {
