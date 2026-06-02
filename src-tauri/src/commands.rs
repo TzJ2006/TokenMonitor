@@ -75,6 +75,24 @@ impl AppState {
             payload_disk_cache: Arc::new(RwLock::new(None)),
         }
     }
+
+    /// Drop the persistent payload disk cache for every usage view.
+    ///
+    /// The disk cache has no TTL: once a per-view payload is written it is
+    /// re-served on every in-memory cache miss until the file is deleted. The
+    /// background refresh loops clear the in-memory payload cache as soon as
+    /// local source logs change, but unless the disk entries are dropped too a
+    /// stale per-provider payload (e.g. `usage-view:claude:day:0:<date>`) keeps
+    /// being served all day — freezing that tab while the `all` view (whose disk
+    /// entries are cleared by the cursor/SSH paths, or never persisted while
+    /// `cursor_loading`) keeps refreshing. Mirrors the SSH-sync path: clearing
+    /// the `usage-view:` prefix forces the next fetch to recompute from fresh
+    /// logs. The cold-start fallback is unaffected — the recompute re-persists.
+    pub(crate) async fn clear_payload_disk_cache(&self) {
+        if let Some(ref disk_cache) = *self.payload_disk_cache.read().await {
+            disk_cache.clear_prefix("usage-view:");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

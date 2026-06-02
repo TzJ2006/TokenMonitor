@@ -523,6 +523,12 @@ async fn fast_statusline_poll(app: tauri::AppHandle) {
         }
 
         state.parser.clear_payload_cache();
+        if parser_changed {
+            // Source logs changed: drop the no-TTL disk cache too, otherwise the
+            // next fetch re-serves a stale per-provider payload despite the
+            // memory clear above (see AppState::clear_payload_disk_cache).
+            state.clear_payload_disk_cache().await;
+        }
 
         if events_moved
             && state
@@ -664,6 +670,12 @@ async fn background_loop(app: tauri::AppHandle) {
         }
 
         if changed {
+            // Local source logs changed. `invalidate_if_changed()` above already
+            // dropped the in-memory payload cache, but the no-TTL disk cache
+            // would keep re-serving the pre-change per-provider payloads (the
+            // Claude/Codex tabs froze for the day while `all` stayed fresh). Drop
+            // the disk entries too so the next fetch recomputes from fresh logs.
+            state.clear_payload_disk_cache().await;
             let _ = app.emit("data-updated", update_counter);
         }
     }
