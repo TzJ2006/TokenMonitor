@@ -7,7 +7,7 @@ import {
   syncNativeWindowSurface,
   syncNativeWindowTheme,
 } from "./window/appearance.js";
-import { isMacOS, isWindows } from "./utils/platform.js";
+import { isMacOS } from "./utils/platform.js";
 import { logger } from "./utils/logger.js";
 import { hydrateUpdater, installUpdaterListeners } from "./stores/updater.js";
 import { setRates } from "./utils/format.js";
@@ -144,9 +144,8 @@ export async function initializeRuntimeFromSettings(
   if (saved.floatBall) {
     calls.push(invokeFn("create_float_ball"));
   }
-  if (isWindows() && saved.taskbarPanel) {
-    calls.push(invokeFn("init_taskbar_panel"));
-  }
+  // The Windows taskbar panel is retired (it froze the tray); the persisted
+  // `taskbarPanel` flag is intentionally ignored — never re-invoke it.
   await Promise.allSettled(calls);
 
   // Sync debug log level to Rust backend
