@@ -57,7 +57,7 @@ else
 fi
 
 # 2. src-tauri/tauri.conf.json
-python3 -c "
+python -c "
 import json, sys
 with open('src-tauri/tauri.conf.json') as f:
     d = json.load(f)
@@ -68,7 +68,7 @@ with open('src-tauri/tauri.conf.json', 'w') as f:
 "
 
 # 3. package.json
-python3 -c "
+python -c "
 import json
 with open('package.json') as f:
     d = json.load(f)
@@ -83,7 +83,7 @@ echo "Bumped version to $VERSION in all 3 files."
 # ── Verify consistency ────────────────────────────────────────────────────────
 
 CARGO_VERSION=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-TAURI_VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+TAURI_VERSION=$(python -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
 NPM_VERSION=$(node -p "require('./package.json').version")
 
 if [ "$CARGO_VERSION" != "$VERSION" ] || [ "$TAURI_VERSION" != "$VERSION" ] || [ "$NPM_VERSION" != "$VERSION" ]; then

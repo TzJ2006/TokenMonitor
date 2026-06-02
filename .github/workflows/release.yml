@@ -67,7 +67,7 @@ jobs:
           TAG="${{ inputs.tag || github.ref_name }}"
           TAG="${TAG#v}"
           CARGO_VERSION=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          TAURI_VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          TAURI_VERSION=$(python -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
           NPM_VERSION=$(node -p "require('./package.json').version")
 
           FAIL=0
