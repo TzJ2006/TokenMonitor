@@ -38,6 +38,7 @@
     barDisplay: "both",
     barProvider: "claude",
     barProviders: ["claude", "codex", "cursor"],
+    floatBallBarProviders: ["claude", "codex", "cursor"],
     showPercentages: false,
     percentageFormat: "compact",
     showCost: true,
@@ -121,8 +122,8 @@
   }
 
   let bars = $derived.by((): WidgetBar[] => {
-    const providers = summary.config.barProviders?.length
-      ? summary.config.barProviders
+    const providers = summary.config.floatBallBarProviders?.length
+      ? summary.config.floatBallBarProviders
       : FALLBACK_PROVIDERS;
     return providers.map((provider) => {
       const meta = PROVIDER_META[provider] ?? { label: provider, shortLabel: provider.slice(0, 2).toUpperCase(), color: "#888" };

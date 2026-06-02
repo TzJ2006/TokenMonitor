@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { getVersion } from "@tauri-apps/api/app";
   import { isMacOS } from "../utils/platform.js";
   import { settings, updateSetting } from "../stores/settings.js";
   import {
@@ -44,6 +45,17 @@
   }
 
   let { onFinish }: Props = $props();
+
+  /** The real, shipped app version (from tauri.conf.json via the Tauri API),
+   * shown in the version pills. This is the release/tag version — distinct
+   * from CURRENT_ONBOARDING_VERSION, which only gates the "What's New" flow
+   * and is deliberately bumped less often, so it must NOT drive the display. */
+  let appVersion = $state("");
+  $effect(() => {
+    void getVersion()
+      .then((v) => { appVersion = v; })
+      .catch((e) => logger.error("permissions", `getVersion failed: ${e}`));
+  });
 
   /** Returning user being re-onboarded into a newer build. We capture this
    * once at mount so the wizard's step layout doesn't shuffle if the
@@ -265,7 +277,7 @@
       </div>
       <h1 id="po-title" class="po-title po-title-large">TokenMonitor</h1>
       <span class="po-version-pill po-version-pill-welcome" aria-label="Current version">
-        v{CURRENT_ONBOARDING_VERSION}
+        v{appVersion}
       </span>
       <p class="po-tagline">
         {returningUser
@@ -302,7 +314,7 @@
     <div class="po-step po-step-whatsnew">
       <div class="po-whatsnew-header">
         <span class="po-version-pill" aria-label="Current version">
-          v{CURRENT_ONBOARDING_VERSION}
+          v{appVersion}
         </span>
         <h1 id="po-title" class="po-title">What's New</h1>
       </div>

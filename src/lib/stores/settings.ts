@@ -42,6 +42,9 @@ export interface Settings {
   glassEffect: boolean;
   showModelChangeStats: boolean;
   floatBall: boolean;
+  /** @deprecated Retired — the Windows taskbar panel froze the tray (it
+   * embedded a child window into explorer's Shell_TrayWnd). Kept only so
+   * persisted settings still parse; it has no effect and no UI toggle. */
   taskbarPanel: boolean;
   sshHosts: SshHostConfig[];
   debugLogging: boolean;
@@ -133,6 +136,7 @@ const DEFAULTS: Settings = {
     barDisplay: 'both',
     barProvider: DEFAULT_RATE_LIMIT_PROVIDER,
     barProviders: [...RATE_LIMIT_PROVIDER_ORDER],
+    floatBallBarProviders: [...RATE_LIMIT_PROVIDER_ORDER],
     showPercentages: false,
     percentageFormat: 'compact',
     showCost: true,
@@ -313,6 +317,18 @@ function normalizeTrayConfig(trayConfig?: Partial<TrayConfig> | null): TrayConfi
     else barProviders = [...RATE_LIMIT_PROVIDER_ORDER];
   }
 
+  // Floating-ball bars are an independent field. For installs that predate
+  // the split (no `floatBallBarProviders` saved), inherit the tray selection
+  // so the float ball keeps showing the same providers it did when both
+  // surfaces shared one field — no surprise behavior change on upgrade.
+  let floatBallBarProviders: RateLimitProviderId[];
+  if (Array.isArray(trayConfig?.floatBallBarProviders)) {
+    floatBallBarProviders = (trayConfig!.floatBallBarProviders as string[])
+      .filter((p): p is RateLimitProviderId => SUPPORTED_BAR_PROVIDERS.includes(p as RateLimitProviderId));
+  } else {
+    floatBallBarProviders = [...barProviders];
+  }
+
   const derivedDisplay: BarDisplay =
     barProviders.length === 0 ? 'off'
     : barProviders.length === 1 ? 'single'
@@ -322,6 +338,7 @@ function normalizeTrayConfig(trayConfig?: Partial<TrayConfig> | null): TrayConfi
     barDisplay: derivedDisplay,
     barProvider: barProviders[0] ?? barProvider,
     barProviders,
+    floatBallBarProviders,
     showPercentages: normalizeBoolean(
       trayConfig?.showPercentages,
       DEFAULTS.trayConfig.showPercentages,
