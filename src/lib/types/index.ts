@@ -203,7 +203,12 @@ export type CostPrecision = 'whole' | 'full';
 export interface TrayConfig {
   barDisplay: BarDisplay;
   barProvider: RateLimitProviderId;
+  /** Providers shown as bars on the menu-bar / tray icon. */
   barProviders: RateLimitProviderId[];
+  /** Providers shown as bars on the floating ball. Kept separate from
+   * `barProviders` so the tray and the floating ball can be configured
+   * independently. */
+  floatBallBarProviders: RateLimitProviderId[];
   showPercentages: boolean;
   percentageFormat: PercentageFormat;
   showCost: boolean;
