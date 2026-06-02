@@ -853,33 +853,27 @@ pub async fn get_float_ball_position(
     })
 }
 
-// ── Taskbar panel commands (Windows only) ────────────────────────────
+// ── Taskbar panel commands (retired) ─────────────────────────────────
 
-/// Initialize and embed the taskbar panel. Windows only; noop on other platforms.
+/// Retired, intentional no-op.
+///
+/// The Windows taskbar panel embedded a raw Win32 child window into explorer's
+/// `Shell_TrayWnd` via cross-process `SetParent`. Because the embedding ran
+/// from an async command (a tokio worker thread with no message pump), Windows
+/// attached explorer's taskbar input queue to a thread that never serviced
+/// messages — freezing the entire taskbar/tray (dead clicks, busy cursor, icon
+/// ghosting, the upstream "Error removing system tray icon") until explorer
+/// timed out and rebuilt the notification area. The feature also never
+/// displayed live metrics (`update_panel_metrics` was never wired up). It is
+/// retired; this command stays as a safe no-op so older persisted settings or
+/// frontends that still invoke it do nothing.
 #[tauri::command]
-pub async fn init_taskbar_panel(app: tauri::AppHandle) -> Result<bool, String> {
-    app.state::<AppState>()
-        .suppress_auto_hide
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::taskbar::init_taskbar_panel().map_err(|e| e.to_string())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(false)
-    }
+pub async fn init_taskbar_panel() -> Result<bool, String> {
+    Ok(false)
 }
 
-/// Destroy the taskbar panel. Windows only; noop on other platforms.
+/// Retired, intentional no-op. See [`init_taskbar_panel`].
 #[tauri::command]
 pub async fn destroy_taskbar_panel_cmd() -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        crate::platform::windows::taskbar::destroy_taskbar_panel();
-    }
-
     Ok(())
 }
