@@ -15,7 +15,6 @@
     fetchData,
     warmCache,
     warmAllPeriods,
-    clearUsageCache,
     clearUsageCacheForProviders,
     seedUsageCache,
   } from "./lib/stores/usage.js";
@@ -565,6 +564,9 @@
     let observer: ResizeObserver | undefined;
     let unlisten: (() => void) | undefined;
     let unlistenWindowResize: (() => void) | undefined;
+    let onViewportPointerEnter: (() => void) | undefined;
+    let onViewportPointerLeave: (() => void) | undefined;
+    let onViewportPointerMove: (() => void) | undefined;
 
     // Create the resize orchestrator (all resize state lives in its closure)
     let persistedWindowHeight = 0;
@@ -618,12 +620,15 @@
         logResizeDebug("window:focus", captureSnapshot("window-focus"));
         void syncNativeWindowSurface(undefined, get(settings).glassEffect).catch((e) => logger.debug("appearance", `syncNativeWindowSurface failed: ${e}`));
         syncSizeAndVerify("window-focus");
-        clearUsageCache();
-        fetchData(provider, period, offset);
+        // Refresh silently — never drop the live view back to the spinner.
+        fetchData(provider, period, offset, { silent: true });
         if (period === "5h") fetchRateLimits(provider);
       },
       onBlur: () => {
         logResizeDebug("window:blur", captureSnapshot("window-blur"));
+        // Safety net: if the popover is dismissed without a mouseleave firing,
+        // treat blur as "pointer gone" so a queued shrink still flushes.
+        resizeOrch?.setMouseOverWindow(false);
       },
       onError: (event) => {
         logResizeDebug("window:error", {
@@ -741,6 +746,26 @@
           resizeOrch?.resizeToContent("resize-observer");
         });
         observer.observe(popEl);
+        // Defer shrink-resizes while the cursor is anywhere over the popover
+        // window; collapse (eased) only once it leaves the window. Track at the
+        // viewport (documentElement), NOT popEl: while a shrink is deferred the
+        // window stays tall but the content is short, so popEl no longer fills
+        // the window. A pointer move into that bare strip — or any move that
+        // crosses popEl's shrunken box while the cursor is still inside the
+        // window — would fire popEl's mouseleave and flush the shrink early,
+        // collapsing the window out from under the user. documentElement is the
+        // root element and owns every viewport point a child doesn't cover, so
+        // its mouseleave fires only at the true window edge. The mousemove
+        // re-arm covers the case where the popover opens under a stationary
+        // cursor (no enter event fires); setMouseOverWindow early-returns when
+        // the state is unchanged, so these frequent calls are cheap no-ops.
+        const docEl = document.documentElement;
+        onViewportPointerEnter = () => resizeOrch?.setMouseOverWindow(true);
+        onViewportPointerLeave = () => resizeOrch?.setMouseOverWindow(false);
+        onViewportPointerMove = () => resizeOrch?.setMouseOverWindow(true);
+        docEl.addEventListener("mouseenter", onViewportPointerEnter);
+        docEl.addEventListener("mouseleave", onViewportPointerLeave);
+        window.addEventListener("mousemove", onViewportPointerMove);
         syncSizeAndVerify("initial-mount");
         // Wait one frame so the Chart finishes its first paint, then allow
         // shrink-direction resizes. Until now the orchestrator has buffered
@@ -757,8 +782,10 @@
           period,
           offset,
         });
-        clearUsageCache();
-        fetchData(provider, period, offset);
+        // Silent background refresh — the backend just recomputed. Clearing
+        // the cache + cold-fetching here re-showed the loading spinner over
+        // live data every ~120s; keep the view and swap in fresh numbers.
+        fetchData(provider, period, offset, { silent: true });
         if (period === "5h") fetchRateLimits(provider);
       });
 
@@ -790,6 +817,10 @@
       cancelled = true;
       unlisten?.();
       unlistenWindowResize?.();
+      const docEl = document.documentElement;
+      if (onViewportPointerEnter) docEl.removeEventListener("mouseenter", onViewportPointerEnter);
+      if (onViewportPointerLeave) docEl.removeEventListener("mouseleave", onViewportPointerLeave);
+      if (onViewportPointerMove) window.removeEventListener("mousemove", onViewportPointerMove);
       observer?.disconnect();
       window.removeEventListener("chart-hover", onChartHover);
       resizeOrch?.destroy();

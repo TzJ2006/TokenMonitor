@@ -191,6 +191,45 @@ describe("createResizeOrchestrator", () => {
     orchestrator.destroy();
   });
 
+  it("defers a shrink while the pointer is over the window, then flushes it on mouse-leave", async () => {
+    installWindowStub(420);
+    const { runNextFrame } = installRafStub();
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const popEl = createPopEl(420);
+    const invoke = vi.fn(() => Promise.resolve());
+    const orchestrator = createTestOrchestrator({
+      invoke,
+      popEl: popEl.element,
+    });
+
+    // Release the cold-launch shrink gate; lastWindowH settles at 420 with no resize.
+    orchestrator.markInitialContentReady();
+    await flushMicrotasks();
+    expect(invoke).not.toHaveBeenCalled();
+
+    // Pointer over the popover: a shrink request must be held back, not applied.
+    orchestrator.setMouseOverWindow(true);
+    popEl.setHeight(300);
+    orchestrator.syncSizeAndVerify("content-shrank");
+    await flushMicrotasks();
+    expect(invoke).not.toHaveBeenCalled();
+
+    // Pointer leaves: the deferred shrink flushes via the eased animation.
+    orchestrator.setMouseOverWindow(false);
+    now = 280;
+    runNextFrame(280);
+    await flushMicrotasks();
+
+    expect(invoke).toHaveBeenCalled();
+    expect(invoke).toHaveBeenLastCalledWith("set_window_size_and_align", {
+      width: WINDOW_WIDTH,
+      height: 300,
+    });
+
+    orchestrator.destroy();
+  });
+
   it("throttles follow-content updates so transitions do not resize every frame", async () => {
     installWindowStub(320);
     const { runNextFrame } = installRafStub();
