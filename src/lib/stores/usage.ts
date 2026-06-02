@@ -273,6 +273,7 @@ export async function fetchData(
   provider: UsageProvider,
   period: UsagePeriod,
   offset: number = 0,
+  opts: { silent?: boolean } = {},
 ) {
   const requestId = ++currentRequestId;
   const cacheEpoch = currentCacheEpoch;
@@ -282,6 +283,25 @@ export async function fetchData(
   logResizeDebug("usage:fetch-start", { ...ctx, hadFrontendCache: payloadCache.has(key) });
   const _fetchT0 = performance.now();
   console.log(`[PROFILE] fetchData:start provider=${provider} period=${period} offset=${offset}`);
+
+  // ── Silent refresh: never show a loading state ──
+  // Used by background `data-updated` and window-focus refreshes. Keeps the
+  // currently displayed payload on screen and swaps in fresh numbers when the
+  // IPC resolves. Without this, those callers cleared the cache and fell into
+  // the cold path below, re-showing the spinner over already-loaded data
+  // ("loading finishes, then loads again").
+  if (opts.silent) {
+    requestUsagePayload(provider, period, offset)
+      .then((fresh: UsagePayload) => {
+        logPayloadWarning(ctx, fresh, "silent-refresh");
+        cachePayload(key, fresh, cacheEpoch);
+        applyUsageDataIfCurrent(requestId, fresh);
+      })
+      .catch((error) => {
+        logResizeDebug("usage:silent-refresh-rejected", { ...ctx, error: formatDebugError(error) });
+      });
+    return;
+  }
 
   // ── Stale-while-revalidate: instant show + silent refresh ──
   const cached = payloadCache.get(key);

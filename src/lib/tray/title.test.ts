@@ -6,6 +6,7 @@ const DEFAULT_CONFIG: TrayConfig = {
   barDisplay: 'both',
   barProvider: 'claude',
   barProviders: ["claude", "codex"],
+  floatBallBarProviders: ["claude", "codex"],
   showPercentages: true,
   percentageFormat: 'compact',
   showCost: true,

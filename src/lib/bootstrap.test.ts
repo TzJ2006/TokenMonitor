@@ -43,6 +43,7 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
       barDisplay: 'both',
       barProvider: 'claude',
       barProviders: ["claude", "codex"],
+      floatBallBarProviders: ["claude", "codex"],
       showPercentages: false,
       percentageFormat: 'compact',
       showCost: true,

@@ -13,6 +13,7 @@
   import { updaterStore, checkNow, setAutoCheck, setChannel, discoverChannels, fetchChannelPubkey } from "../stores/updater.js";
   import type { ChannelInfo } from "../stores/updater.js";
   import { isMacOS } from "../utils/platform.js";
+  import type { PermissionSurfaceId } from "../permissions/surfaces.js";
   import { currencySymbol } from "../utils/format.js";
   import { logger } from "../utils/logger.js";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
@@ -35,6 +36,7 @@
   let { onBack }: Props = $props();
   let current = $derived($settings as SettingsType);
   let appVersion = $state("");
+  let autostartError = $state<string | null>(null);
   let checking = $state(false);
   let channels = $state<ChannelInfo[]>([]);
   let channelsLoading = $state(false);
@@ -222,16 +224,42 @@
 
   async function handleAutostart(checked: boolean) {
     logger.info("settings", `Autostart: ${checked}`);
+    // Optimistically reflect the user's intent so the controlled ToggleSwitch
+    // doesn't visually snap back while the plugin call is in flight. On
+    // failure (e.g. a blocked registry / LaunchAgent write) roll back AND show
+    // why, instead of silently reverting the switch with no feedback.
+    const previous = current.launchAtLogin;
+    autostartError = null;
+    updateSetting("launchAtLogin", checked);
     try {
       if (checked) {
         await enable();
       } else {
         await disable();
       }
-      updateSetting("launchAtLogin", checked);
+      // Reconcile against the real OS state in case the plugin coerced it.
+      const actual = await isEnabled().catch(() => checked);
+      if (actual !== checked) updateSetting("launchAtLogin", actual);
     } catch (e) {
-      console.error("Failed to toggle autostart:", e);
+      logger.error("settings", `Failed to toggle autostart: ${e}`);
+      autostartError = `Couldn't ${checked ? "enable" : "disable"} Launch at Login (${e}).`;
+      updateSetting("launchAtLogin", previous);
     }
+  }
+
+  /** "Manage →" from the read-only Permissions panel: scroll to the section
+   * that owns the real control. The panel never mutates these itself. */
+  function handleManagePermission(id: PermissionSurfaceId) {
+    const targetId =
+      id === "login_item"
+        ? "settings-system"
+        : id === "ssh_config"
+          ? "settings-visibility"
+          : null;
+    if (!targetId) return;
+    document
+      .getElementById(targetId)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
 
@@ -434,7 +462,7 @@
     </div>
 
     <!-- 3. Visibility -->
-    <div class="group">
+    <div class="group" id="settings-visibility">
       <div class="group-label">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
@@ -526,7 +554,7 @@
     </div>
 
     <!-- 6. System -->
-    <div class="group">
+    <div class="group" id="settings-system">
       <div class="group-label">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="3"></circle>
@@ -542,6 +570,11 @@
             onChange={handleAutostart}
           />
         </div>
+        {#if autostartError}
+          <div class="row border autostart-error-row">
+            <span class="autostart-error">{autostartError}</span>
+          </div>
+        {/if}
         {#if isMacOS()}
         <div class="row border">
           <span class="label">Show Dock Icon</span>
@@ -679,7 +712,7 @@
         </button>
         <div class="privacy-collapse" class:open={privacyExpanded}>
           <div class="collapse-inner">
-            <PermissionDisclosure mode="settings" />
+            <PermissionDisclosure mode="settings" onManage={handleManagePermission} />
           </div>
         </div>
       </div>
@@ -769,6 +802,14 @@
   }
   .row.center {
     justify-content: center;
+  }
+  .autostart-error-row {
+    justify-content: flex-start;
+    padding-top: 0;
+  }
+  .autostart-error {
+    font: 400 9px/1.35 'Inter', sans-serif;
+    color: var(--ch-minus);
   }
 
   .collapsible-toggle {
