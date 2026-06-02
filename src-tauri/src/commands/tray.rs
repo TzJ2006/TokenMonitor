@@ -36,6 +36,10 @@ pub struct TrayConfig {
     pub bar_provider: String, // "claude" | "codex"
     #[serde(default)]
     pub bar_providers: Vec<String>,
+    /// Providers shown as bars on the floating ball. Separate from
+    /// `bar_providers` (menu-bar/tray) so the two surfaces can diverge.
+    #[serde(default)]
+    pub float_ball_bar_providers: Vec<String>,
     pub show_percentages: bool,
     pub percentage_format: PercentageFormat,
     pub show_cost: bool,
@@ -48,6 +52,11 @@ impl Default for TrayConfig {
             bar_display: BarDisplay::Both,
             bar_provider: "claude".to_string(),
             bar_providers: vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "cursor".to_string(),
+            ],
+            float_ball_bar_providers: vec![
                 "claude".to_string(),
                 "codex".to_string(),
                 "cursor".to_string(),
