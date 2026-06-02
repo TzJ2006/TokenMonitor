@@ -596,26 +596,32 @@ pub async fn set_window_size_and_align(
     width: f64,
     height: f64,
 ) -> Result<(), String> {
-    use tauri::{LogicalSize, Manager, Size};
+    use tauri::Manager;
     if let Some(window) = app.get_webview_window("main") {
         #[cfg(target_os = "windows")]
         {
-            if let Some(monitor) = window.current_monitor().ok().flatten() {
-                let scale = monitor.scale_factor();
-                let physical_width = (width * scale).round() as u32;
-                let physical_height = (height * scale).round() as u32;
-                crate::platform::windows::window::set_size_and_align(
-                    &window,
-                    physical_width,
-                    physical_height,
-                );
-            } else {
-                let _ = window.set_size(Size::Logical(LogicalSize::new(width, height)));
-                crate::platform::windows::window::align_to_work_area(&window);
-            }
+            // `set_size_and_align` derives the work area from the window's
+            // monitor via MonitorFromWindow (Win32), which still succeeds when
+            // Tauri's `current_monitor()` returns None — it intermittently does
+            // around DPI changes, monitor sleep/wake, and RDP reconnects. The
+            // old `else` fallback used a non-atomic `set_size` that keeps the
+            // window's TOP-LEFT fixed, so a shrink moved the bottom edge UP and
+            // off the taskbar, and the follow-up `align_to_work_area` re-read a
+            // stale (pre-resize) rect and could not recover it. Always take the
+            // atomic move+resize path, using the window's own scale factor for
+            // the logical->physical conversion (no `current_monitor()` needed).
+            let scale = window.scale_factor().unwrap_or(1.0);
+            let physical_width = (width * scale).round() as u32;
+            let physical_height = (height * scale).round() as u32;
+            crate::platform::windows::window::set_size_and_align(
+                &window,
+                physical_width,
+                physical_height,
+            );
         }
         #[cfg(not(target_os = "windows"))]
         {
+            use tauri::{LogicalSize, Size};
             // Capture position before resize so we can keep the anchored edge fixed.
             let old_pos = window.outer_position().ok();
             let old_size = window.outer_size().ok();

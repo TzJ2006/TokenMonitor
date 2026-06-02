@@ -334,7 +334,10 @@
   to { opacity: 1; transform: translateX(0); }
 }
 @keyframes contentFade {
-  from { opacity: 0.4; }
+  /* Gentle settle, not a strobe: a 0.4 dip read as a flicker on Windows when
+     replayed on every usage/day/month/year tab switch. Start near-opaque so
+     the transition is a smooth re-affirm rather than a blink. */
+  from { opacity: 0.85; }
   to { opacity: 1; }
 }
 @keyframes skeletonShimmer {
@@ -353,6 +356,14 @@
 
 html, body {
   width: 100%;
+  /* Fill the window vertically so the app surface (#app, min-height:100%)
+     always paints down to the window's bottom edge. The window can legitimately
+     be taller than its content — e.g. while a shrink is deferred until the
+     pointer leaves the popover — and without a definite height here that extra
+     space was a transparent strip that showed the desktop through as an empty
+     gap below the card. Content height is still measured from .pop-content's
+     scrollHeight, so this does not affect window-to-content sizing. */
+  height: 100%;
   background: transparent;
 }
 
