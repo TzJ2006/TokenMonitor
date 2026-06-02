@@ -119,6 +119,64 @@ bug_fixes:
       - "src/lib/resizeOrchestrator.ts:298"
     test: "Visual verification: window stays at fixed height on cold launch"
 
+  - id: BUG-003
+    date: 2026-06-02
+    description: "Cap-mode clarification + deferred-shrink-on-mouse-leave (ccdebug DBG-008)"
+    root_cause: |
+      The original T2 invariants describe fixedWindowH as a HARD fixed size
+      that early-returns out of every dynamic-resize path. A later refactor
+      (commit 6d0e3e6) turned fixedWindowH into a MAX-HEIGHT CAP applied only
+      in getEffectiveWindowMaxHeight(); the window now genuinely follows
+      content and can shrink. The "fixedWindowH > 0 blocks
+      animate/follow/resize/accordion" invariants below are therefore
+      obsolete and retained only as history.
+    fix: |
+      Added a mouse-over-window shrink gate mirroring the existing
+      chartHoverActive gate: while the pointer is over the popover, shrink
+      requests are queued (deferredShrinkHeight) instead of applied; on
+      mouse-leave the latest queued height is flushed via animateWindowHeight
+      (SHRINK_ON_LEAVE_ANIM_MS, ~280ms ease-out). Grows still apply
+      immediately. Wired from App.svelte popEl mouseenter/mouseleave with a
+      window:blur safety flush.
+    files_changed:
+      - "src/lib/resizeOrchestrator.ts (mouseOverWindow gate + setMouseOverWindow + deferredShrinkHeight)"
+      - "src/lib/windowSizing.ts (SHRINK_ON_LEAVE_ANIM_MS)"
+      - "src/App.svelte (popEl mouse listeners + blur flush)"
+    test: "npx vitest run src/lib/resizeOrchestrator.test.ts (deferred-shrink test)"
+
+  - id: BUG-004
+    date: 2026-06-02
+    description: "Defer-shrink defeated on tab switch — mouse-over tracked on popEl, not the viewport"
+    root_cause: |
+      The mouseOverWindow gate (BUG-003) is structurally correct: every shrink
+      path on a usage/period/provider/offset switch routes through
+      applyWindowHeight, which defers the shrink while the pointer is over the
+      window. The defect was in HOW "over the window" was detected. The
+      mouseenter/mouseleave listeners were bound to popEl (.pop-content), which
+      is content-sized (no explicit height). While a shrink is deferred the
+      window stays tall but popEl is short, so popEl no longer fills the window.
+      Any natural pointer movement after a tab switch that crosses popEl's
+      shrunken box while the cursor is still inside the window fires popEl's
+      mouseleave -> setMouseOverWindow(false) -> the queued shrink flushes
+      immediately, collapsing the window out from under the user. Net effect:
+      the window still shrank "instantly" on tab switch, exactly the symptom the
+      defer was meant to prevent. (Reflow alone does not fire mouseleave; the
+      trigger is the user moving the mouse, which is the common case.)
+    fix: |
+      Track pointer-over-window at the VIEWPORT, not popEl. Bind
+      mouseenter/mouseleave to document.documentElement — the root element owns
+      every viewport point a child does not cover, so its mouseleave fires only
+      at the true window edge (moving into the bare strip below short content
+      stays "over the window"). Added a window mousemove -> setMouseOverWindow(true)
+      re-arm for the case where the popover opens under a stationary cursor (no
+      enter event); setMouseOverWindow early-returns when unchanged, so it is a
+      cheap no-op. The existing window:blur flush is retained as a safety net.
+      The orchestrator gate + setMouseOverWindow + deferredShrinkHeight logic is
+      UNCHANGED — only the App.svelte wiring moved from popEl to the viewport.
+    files_changed:
+      - "src/App.svelte (mouse-over tracking moved from popEl to document.documentElement + window mousemove re-arm)"
+    test: "npx vitest run src/lib/resizeOrchestrator.test.ts (deferred-shrink test still green; gate logic unchanged)"
+
 # ============================================================
 # FEATURE GUARD
 # ============================================================
@@ -152,8 +210,18 @@ feature_guard:
       invariants:
         - "resolveFixedWindowHeight exported from windowSizing.ts"
         - "refreshWindowMetrics computes fixedWindowH and calls applyWindowHeight + scroll lock"
-        - "fixedWindowH > 0 guards block animateWindowHeight, followContentDuringTransition, resizeToContent, handleBreakdownAccordionToggle"
-        - "applyWindowHeight does NOT block shrink when fixedWindowH > 0 (bypasses initialContentReady guard)"
+        # NOTE (BUG-003): cap-mode reality — fixedWindowH is a MAX-HEIGHT CAP via
+        # getEffectiveWindowMaxHeight(), NOT a hard fixed size. The next two
+        # lines describe the obsolete hard-fixed behavior and are retained as
+        # history only; dynamic resize (incl. shrink) is live.
+        - "(obsolete) fixedWindowH > 0 guards block animateWindowHeight, followContentDuringTransition, resizeToContent, handleBreakdownAccordionToggle"
+        - "(obsolete) applyWindowHeight does NOT block shrink when fixedWindowH > 0 (bypasses initialContentReady guard)"
+        - "getEffectiveWindowMaxHeight clamps to fixedWindowH only when fixedWindowH > 0 && < base"
+        - "applyWindowHeight defers shrink while mouseOverWindow is true (after initialContentReady) and flushes the queued height via animateWindowHeight on mouse-leave"
+        # BUG-004: 'over window' is tracked at the viewport (document.documentElement),
+        # NOT popEl — popEl is content-sized and does not fill the window while a
+        # shrink is deferred, so popEl-bound mouseleave flushed the shrink early.
+        - "mouseOverWindow is driven by document.documentElement mouseenter/mouseleave + window mousemove re-arm (App.svelte), with window:blur as a flush safety net"
         - "syncSizeAndVerify re-applies fixedWindowH when > 0"
       verification:
         command: "npx vitest run src/lib/windowSizing.test.ts"
