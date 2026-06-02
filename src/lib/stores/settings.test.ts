@@ -58,6 +58,9 @@ describe("loadSettings", () => {
         barDisplay: 'both',
         barProvider: 'claude',
         barProviders: ["claude", "codex"],
+        // Deliberately different from the tray bars to prove the two are
+        // independent fields after the split.
+        floatBallBarProviders: ["cursor"],
         showPercentages: false,
         percentageFormat: 'compact',
         showCost: false,
@@ -90,6 +93,7 @@ describe("loadSettings", () => {
         barDisplay: 'custom',
         barProvider: 'claude',
         barProviders: ["claude", "codex"],
+        floatBallBarProviders: ["cursor"],
         showPercentages: false,
         percentageFormat: 'compact',
         showCost: false,
@@ -151,6 +155,7 @@ describe("loadSettings", () => {
         barDisplay: 'custom',
         barProvider: 'claude',
         barProviders: ["claude", "codex", "cursor"],
+        floatBallBarProviders: ["claude", "codex", "cursor"],
         showPercentages: false,
         percentageFormat: 'compact',
         showCost: true,
@@ -283,6 +288,7 @@ describe("loadSettings migration", () => {
         barDisplay: "triple" as Settings["trayConfig"]["barDisplay"],
         barProvider: "all" as Settings["trayConfig"]["barProvider"],
         barProviders: ["claude", "codex"],
+        floatBallBarProviders: ["claude", "codex"],
         showPercentages: "yes" as unknown as Settings["trayConfig"]["showPercentages"],
         percentageFormat: "long" as Settings["trayConfig"]["percentageFormat"],
         showCost: "no" as unknown as Settings["trayConfig"]["showCost"],
