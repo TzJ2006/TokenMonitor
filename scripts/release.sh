@@ -80,6 +80,18 @@ with open('package.json', 'w') as f:
 
 echo "Bumped version to $VERSION in all 3 files."
 
+# 4. src-tauri/Cargo.lock (the token-monitor package entry)
+python -c "
+import re
+p = 'src-tauri/Cargo.lock'
+with open(p, encoding='utf-8', newline='') as f:
+    s = f.read()
+s = re.sub(r'(name = \"token-monitor\"\nversion = \")[^\"]*(\")', r'\g<1>$VERSION\g<2>', s, count=1)
+with open(p, 'w', encoding='utf-8', newline='') as f:
+    f.write(s)
+"
+echo "Bumped token-monitor version in Cargo.lock."
+
 # ── Verify consistency ────────────────────────────────────────────────────────
 
 CARGO_VERSION=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -98,7 +110,7 @@ fi
 # Note: the pre-commit hook runs all checks (svelte-check, vitest, cargo fmt,
 # cargo clippy, cargo test) before the commit is created.
 
-git add src-tauri/Cargo.toml src-tauri/tauri.conf.json package.json package-lock.json
+git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tauri.conf.json package.json package-lock.json
 git commit -m "chore: bump version to $VERSION"
 git tag "$TAG"
 git push origin main
