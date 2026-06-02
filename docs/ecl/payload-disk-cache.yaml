@@ -2,7 +2,7 @@ ecl_version: "1.0"
 feature: "payload-disk-cache"
 status: completed
 created: 2026-05-21
-updated: 2026-05-21
+updated: 2026-06-02
 
 prompt_calibration:
   raw_input: "持久化UsagePayload到磁盘，冷启动即显示，后台静默刷新"
@@ -79,7 +79,15 @@ feature_guard:
         - "get_usage_data_inner falls back to disk cache on memory miss"
         - "store_cache path persists payload to disk after computation"
         - "AppState.payload_disk_cache initialized in lib.rs setup"
+        # INV-006 (added 2026-06-02, DBG-010): the no-TTL disk cache MUST be
+        # invalidated wherever the in-memory payload cache is invalidated on a
+        # source change, or single-provider views freeze for the day while `all`
+        # stays fresh. Both refresh loops (background_loop, fast_statusline_poll)
+        # call AppState::clear_payload_disk_cache() on a detected source change.
+        - "A detected local source change clears the disk cache ('usage-view:' prefix), not just the in-memory cache"
       verification:
+        # On Windows hosts, scope to --lib to avoid the bin-target manifest
+        # conflict (CVT1100) with TM_EMBED_TEST_MANIFEST=1.
         command: "cd src-tauri && cargo test payload_disk_cache"
         expected: "3 passed"
       status: active

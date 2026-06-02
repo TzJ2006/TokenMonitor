@@ -833,6 +833,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_change_must_invalidate_disk_cache_so_per_provider_view_refreshes() {
+        // Regression for DBG-010: the no-TTL payload disk cache re-served a
+        // stale per-provider payload after the in-memory cache was cleared,
+        // freezing the Claude/Codex tabs for the day while the `all` view kept
+        // refreshing (its disk entries are cleared by the cursor/SSH paths).
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let app_data_dir = TempDir::new().unwrap();
+        let now = Local::now();
+
+        write_file(
+            &claude_dir.path().join("session.jsonl"),
+            &claude_assistant_entry(&now.to_rfc3339(), "claude-sonnet-4-6-20260301", 1_000, 500),
+        );
+
+        let mut state = AppState::new();
+        state
+            .usage_access_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.parser = Arc::new(UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        ));
+        *state.payload_disk_cache.write().await = Some(
+            crate::usage::payload_disk_cache::PayloadDiskCache::new(app_data_dir.path()),
+        );
+
+        // Real computation: establishes the true cost and persists it to disk.
+        let real = get_usage_data_inner(None, &state, "claude", "day", 0)
+            .await
+            .unwrap();
+        assert!(
+            real.total_cost > 0.0,
+            "fixture should produce nonzero claude usage"
+        );
+
+        // Plant a stale payload on disk under the same key — as if it had been
+        // written earlier in the day, before more usage was logged — then clear
+        // ONLY the in-memory cache, exactly what the refresh loops used to do.
+        let key = final_usage_cache_key("claude", "day", 0);
+        let stale = UsagePayload {
+            total_cost: 999_999.0,
+            ..UsagePayload::default()
+        };
+        state
+            .payload_disk_cache
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .save(&key, &stale);
+        state.parser.clear_payload_cache();
+
+        // Bug reproduction: a memory-only invalidation re-serves the stale disk
+        // entry instead of recomputing.
+        let stale_served = get_usage_data_inner(None, &state, "claude", "day", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_served.total_cost, 999_999.0,
+            "guard: the disk cache short-circuits recompute on a memory miss"
+        );
+
+        // The fix: clearing the disk cache (what the refresh loops now do on a
+        // source change) forces a recompute that reflects the real logs again.
+        state.parser.clear_payload_cache();
+        state.clear_payload_disk_cache().await;
+        let fresh = get_usage_data_inner(None, &state, "claude", "day", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.total_cost, real.total_cost,
+            "after disk invalidation the per-provider view recomputes fresh"
+        );
+        assert!(
+            (fresh.total_cost - 999_999.0).abs() > 1.0,
+            "the stale payload must not survive disk invalidation"
+        );
+    }
+
+    #[tokio::test]
     async fn get_usage_data_inner_returns_empty_until_usage_access_is_enabled() {
         let claude_dir = TempDir::new().unwrap();
         let codex_dir = TempDir::new().unwrap();
