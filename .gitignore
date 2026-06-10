@@ -54,3 +54,8 @@ profiler/target/
 profiling/
 __pycache__/
 *.pyc
+
+# AI Dev Companion generated files (machine-specific absolute paths - do not publish)
+.claude/settings.json
+.claude/commands/cc*.md
+.claude/commands/idea.md
