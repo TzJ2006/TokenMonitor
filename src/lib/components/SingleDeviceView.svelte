@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { formatCost, formatTokens, modelColor } from "../utils/format.js";
+  import { formatCost, formatModelCost, formatTokens, modelColor } from "../utils/format.js";
   import { activePeriod, activeOffset, activeProvider } from "../stores/usage.js";
   import type { UsagePayload } from "../types/index.js";
   import Chart from "./Chart.svelte";
@@ -105,7 +105,7 @@
               <div class="model-row">
                 <div class="model-bar" style:background={modelColor(model.model_key)}></div>
                 <span class="model-name">{model.display_name}</span>
-                <span class="model-cost">{formatCost(model.cost)}</span>
+                <span class="model-cost">{formatModelCost(model.cost, model.pricing_available)}</span>
                 <span class="model-tokens">{formatTokens(model.tokens)}</span>
               </div>
             {/each}
