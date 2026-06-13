@@ -17,11 +17,17 @@ pub struct ScopeModelUsage {
     pub display_name: String,
     pub model_key: String,
     pub cost: f64,
+    #[serde(default = "default_pricing_available")]
+    pub pricing_available: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_5m_tokens: u64,
     pub cache_write_1h_tokens: u64,
+}
+
+fn default_pricing_available() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,14 +52,28 @@ pub struct SubagentStats {
     pub subagents: ScopeUsageSummary,
 }
 
-#[derive(Default)]
 struct ModelAccum {
     cost: f64,
+    pricing_available: bool,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_5m_tokens: u64,
     cache_write_1h_tokens: u64,
+}
+
+impl Default for ModelAccum {
+    fn default() -> Self {
+        Self {
+            cost: 0.0,
+            pricing_available: true,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_5m_tokens: 0,
+            cache_write_1h_tokens: 0,
+        }
+    }
 }
 
 // ── Internal builder ────────────────────────────────────────────────────────
@@ -89,6 +109,7 @@ impl ScopeSummaryBuilder {
 
     fn add_entry(&mut self, entry: &crate::usage::parser::ParsedEntry) {
         let model_key = crate::models::normalized_model_key(&entry.model);
+        let pricing_available = crate::usage::pricing::pricing_available_for_key(&model_key);
         let entry_cost = crate::usage::pricing::calculate_cost_for_key(
             &model_key,
             entry.input_tokens,
@@ -111,6 +132,7 @@ impl ScopeSummaryBuilder {
 
         let ma = self.model_stats.entry(entry.model.clone()).or_default();
         ma.cost += entry_cost;
+        ma.pricing_available &= pricing_available;
         ma.input_tokens += entry.input_tokens;
         ma.output_tokens += entry.output_tokens;
         ma.cache_read_tokens += entry.cache_read_tokens;
@@ -155,6 +177,7 @@ impl ScopeSummaryBuilder {
                     display_name,
                     model_key,
                     cost: accum.cost,
+                    pricing_available: accum.pricing_available,
                     input_tokens: accum.input_tokens,
                     output_tokens: accum.output_tokens,
                     cache_read_tokens: accum.cache_read_tokens,

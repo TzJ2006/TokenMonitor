@@ -4,6 +4,7 @@ import {
   currencySymbol,
   convertCost,
   formatCost,
+  formatModelCost,
   formatTokens,
   formatTimeAgo,
   modelColor,
@@ -47,6 +48,21 @@ describe("formatCost", () => {
   it("falls back to USD for unknown currency", () => {
     setCurrency("XYZ");
     expect(formatCost(1.0)).toBe("$1.00");
+  });
+});
+
+describe("formatModelCost", () => {
+  it("returns N/A when model pricing is unavailable", () => {
+    expect(formatModelCost(0, false)).toBe("N/A");
+  });
+
+  it("returns Free when model pricing is known and the cost is zero", () => {
+    expect(formatModelCost(0, true)).toBe("Free");
+    expect(formatModelCost(0, undefined)).toBe("Free");
+  });
+
+  it("keeps normal cost formatting for non-zero costs when pricing is available or unspecified", () => {
+    expect(formatModelCost(1.5, undefined)).toBe("$1.50");
   });
 });
 

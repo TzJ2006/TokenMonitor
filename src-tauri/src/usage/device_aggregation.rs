@@ -34,10 +34,12 @@ pub(crate) fn build_device_summary_from_parsed(
     end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
-    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
+    use crate::usage::pricing::{
+        calculate_cost_for_key, pricing_available_for_key, provider_multiplier,
+    };
     use std::collections::HashMap;
 
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
 
     for entry in entries {
         if entry.timestamp.date_naive() >= end {
@@ -45,6 +47,7 @@ pub(crate) fn build_device_summary_from_parsed(
         }
 
         let (display_name, model_key) = normalize_model(&entry.model);
+        let pricing_available = pricing_available_for_key(&model_key);
         let cost = calculate_cost_for_key(
             &model_key,
             entry.input_tokens,
@@ -58,9 +61,10 @@ pub(crate) fn build_device_summary_from_parsed(
 
         let agg = model_map
             .entry(model_key)
-            .or_insert_with(|| (display_name, 0.0, 0));
+            .or_insert_with(|| (display_name, 0.0, 0, true));
         agg.1 += cost;
         agg.2 += tokens;
+        agg.3 &= pricing_available;
     }
 
     finish_device_summary(device_name, model_map)
@@ -74,10 +78,12 @@ pub(crate) fn build_device_summary_from_compact(
     end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
-    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
+    use crate::usage::pricing::{
+        calculate_cost_for_key, pricing_available_for_key, provider_multiplier,
+    };
     use std::collections::HashMap;
 
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
 
     for record in records {
         if record.model.starts_with('<') {
@@ -91,6 +97,7 @@ pub(crate) fn build_device_summary_from_compact(
         }
 
         let (display_name, model_key) = normalize_model(&record.model);
+        let pricing_available = pricing_available_for_key(&model_key);
         let cost = calculate_cost_for_key(
             &model_key,
             record.input_tokens,
@@ -104,9 +111,10 @@ pub(crate) fn build_device_summary_from_compact(
 
         let agg = model_map
             .entry(model_key)
-            .or_insert_with(|| (display_name, 0.0, 0));
+            .or_insert_with(|| (display_name, 0.0, 0, true));
         agg.1 += cost;
         agg.2 += tokens;
+        agg.3 &= pricing_available;
     }
 
     finish_device_summary(device_name, model_map)
@@ -120,10 +128,12 @@ pub(crate) fn build_device_summary_merged(
     end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
-    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
+    use crate::usage::pricing::{
+        calculate_cost_for_key, pricing_available_for_key, provider_multiplier,
+    };
     use std::collections::HashMap;
 
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
 
     for entry in archived_entries {
         let entry_date = entry.timestamp.date_naive();
@@ -131,6 +141,7 @@ pub(crate) fn build_device_summary_merged(
             continue;
         }
         let (display_name, model_key) = normalize_model(&entry.model);
+        let pricing_available = pricing_available_for_key(&model_key);
         let cost = calculate_cost_for_key(
             &model_key,
             entry.input_tokens,
@@ -143,9 +154,10 @@ pub(crate) fn build_device_summary_merged(
         let tokens = entry.input_tokens + entry.output_tokens;
         let agg = model_map
             .entry(model_key)
-            .or_insert_with(|| (display_name, 0.0, 0));
+            .or_insert_with(|| (display_name, 0.0, 0, true));
         agg.1 += cost;
         agg.2 += tokens;
+        agg.3 &= pricing_available;
     }
 
     for record in live_records {
@@ -157,6 +169,7 @@ pub(crate) fn build_device_summary_merged(
             continue;
         }
         let (display_name, model_key) = normalize_model(&record.model);
+        let pricing_available = pricing_available_for_key(&model_key);
         let cost = calculate_cost_for_key(
             &model_key,
             record.input_tokens,
@@ -169,9 +182,10 @@ pub(crate) fn build_device_summary_merged(
         let tokens = record.input_tokens + record.output_tokens;
         let agg = model_map
             .entry(model_key)
-            .or_insert_with(|| (display_name, 0.0, 0));
+            .or_insert_with(|| (display_name, 0.0, 0, true));
         agg.1 += cost;
         agg.2 += tokens;
+        agg.3 &= pricing_available;
     }
 
     finish_device_summary(device_name, model_map)
@@ -179,16 +193,17 @@ pub(crate) fn build_device_summary_merged(
 
 fn finish_device_summary(
     device_name: &str,
-    model_map: std::collections::HashMap<String, (String, f64, u64)>,
+    model_map: std::collections::HashMap<String, (String, f64, u64, bool)>,
 ) -> DeviceSummary {
     let mut model_breakdown: Vec<DeviceModelSummary> = model_map
         .into_iter()
         .map(
-            |(model_key, (display_name, cost, tokens))| DeviceModelSummary {
+            |(model_key, (display_name, cost, tokens, pricing_available))| DeviceModelSummary {
                 display_name: format!("{} -- {}", display_name, device_name),
                 model_key,
                 cost,
                 tokens,
+                pricing_available,
             },
         )
         .collect();
@@ -342,7 +357,9 @@ pub(crate) async fn build_included_devices_payload(
 ) -> Option<crate::models::UsagePayload> {
     use crate::commands::period::compute_date_bounds;
     use crate::models::{ModelSummary, UsagePayload, UsageSource};
-    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
+    use crate::usage::pricing::{
+        calculate_cost_for_key, pricing_available_for_key, provider_multiplier,
+    };
     use std::collections::HashMap;
 
     if !provider_includes_remote_ssh_usage(provider) {
@@ -360,9 +377,14 @@ pub(crate) async fn build_included_devices_payload(
     let mgr = cache_mgr.as_ref()?;
     let archive = state.parser.archive();
 
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
-    let mut chart_entries: Vec<(chrono::DateTime<chrono::FixedOffset>, String, f64, u64)> =
-        Vec::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
+    let mut chart_entries: Vec<(
+        chrono::DateTime<chrono::FixedOffset>,
+        String,
+        f64,
+        u64,
+        bool,
+    )> = Vec::new();
     let mut input_tokens = 0_u64;
     let mut output_tokens = 0_u64;
 
@@ -381,6 +403,7 @@ pub(crate) async fn build_included_devices_payload(
                     continue;
                 }
                 let (display_name, model_key) = crate::models::normalize_model(&entry.model);
+                let pricing_available = pricing_available_for_key(&model_key);
                 let cost = calculate_cost_for_key(
                     &model_key,
                     entry.input_tokens,
@@ -396,11 +419,18 @@ pub(crate) async fn build_included_devices_payload(
 
                 let agg = model_map
                     .entry(model_key.clone())
-                    .or_insert_with(|| (display_name, 0.0, 0));
+                    .or_insert_with(|| (display_name, 0.0, 0, true));
                 agg.1 += cost;
                 agg.2 += tokens;
+                agg.3 &= pricing_available;
 
-                chart_entries.push((entry.timestamp.fixed_offset(), model_key, cost, tokens));
+                chart_entries.push((
+                    entry.timestamp.fixed_offset(),
+                    model_key,
+                    cost,
+                    tokens,
+                    pricing_available,
+                ));
             }
         }
 
@@ -436,6 +466,7 @@ pub(crate) async fn build_included_devices_payload(
             }
 
             let (display_name, model_key) = crate::models::normalize_model(&record.model);
+            let pricing_available = pricing_available_for_key(&model_key);
             let cost = calculate_cost_for_key(
                 &model_key,
                 record.input_tokens,
@@ -451,11 +482,12 @@ pub(crate) async fn build_included_devices_payload(
 
             let agg = model_map
                 .entry(model_key.clone())
-                .or_insert_with(|| (display_name, 0.0, 0));
+                .or_insert_with(|| (display_name, 0.0, 0, true));
             agg.1 += cost;
             agg.2 += tokens;
+            agg.3 &= pricing_available;
 
-            chart_entries.push((parsed_ts, model_key, cost, tokens));
+            chart_entries.push((parsed_ts, model_key, cost, tokens, pricing_available));
         }
     }
 
@@ -465,13 +497,16 @@ pub(crate) async fn build_included_devices_payload(
 
     let mut model_breakdown: Vec<ModelSummary> = model_map
         .into_iter()
-        .map(|(model_key, (display_name, cost, tokens))| ModelSummary {
-            display_name,
-            model_key,
-            cost,
-            tokens,
-            change_stats: None,
-        })
+        .map(
+            |(model_key, (display_name, cost, tokens, pricing_available))| ModelSummary {
+                display_name,
+                model_key,
+                cost,
+                tokens,
+                pricing_available,
+                change_stats: None,
+            },
+        )
         .collect();
     model_breakdown.sort_by(|a, b| {
         b.cost
@@ -481,17 +516,19 @@ pub(crate) async fn build_included_devices_payload(
 
     use std::collections::BTreeMap;
 
-    let mut bucket_map: BTreeMap<String, BTreeMap<String, (String, f64, u64)>> = BTreeMap::new();
-    for (ts, model_key, cost, tokens) in &chart_entries {
+    type ModelBucket = BTreeMap<String, (String, f64, u64, bool)>;
+    let mut bucket_map: BTreeMap<String, ModelBucket> = BTreeMap::new();
+    for (ts, model_key, cost, tokens, pricing_available) in &chart_entries {
         let bkey = bucket_key_for_timestamp(ts, period);
         let model_entry = bucket_map.entry(bkey).or_default();
-        let (_, model_cost, model_tokens) =
+        let (_, model_cost, model_tokens, model_pricing_available) =
             model_entry.entry(model_key.clone()).or_insert_with(|| {
                 let (display, _) = crate::models::normalize_model(model_key);
-                (display, 0.0, 0)
+                (display, 0.0, 0, true)
             });
         *model_cost += cost;
         *model_tokens += tokens;
+        *model_pricing_available &= *pricing_available;
     }
 
     let chart_buckets: Vec<ChartBucket> = bucket_map
@@ -499,12 +536,15 @@ pub(crate) async fn build_included_devices_payload(
         .map(|(key, models)| {
             let mut segments: Vec<ChartSegment> = models
                 .into_iter()
-                .map(|(model_key, (display, cost, tokens))| ChartSegment {
-                    model: display,
-                    model_key,
-                    cost,
-                    tokens,
-                })
+                .map(
+                    |(model_key, (display, cost, tokens, pricing_available))| ChartSegment {
+                        model: display,
+                        model_key,
+                        cost,
+                        tokens,
+                        pricing_available,
+                    },
+                )
                 .collect();
             segments.sort_by(|a, b| {
                 b.cost
@@ -682,6 +722,7 @@ pub(crate) async fn build_device_time_chart_buckets(
                     model_key: device,
                     cost,
                     tokens: 0,
+                    pricing_available: true,
                 })
                 .collect();
             segments.sort_by(|a, b| {
@@ -759,6 +800,7 @@ pub(crate) fn build_device_chart_buckets(devices: &[DeviceSummary]) -> Vec<Chart
                     model_key: m.model_key.clone(),
                     cost: m.cost,
                     tokens: m.tokens,
+                    pricing_available: m.pricing_available,
                 })
                 .collect(),
         })

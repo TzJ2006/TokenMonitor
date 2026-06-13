@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { modelColor, formatCost, formatTokens } from "../utils/format.js";
+  import { modelColor, formatCost, formatModelCost, formatTokens } from "../utils/format.js";
   import type { SubagentStats } from "../types/index.js";
 
   interface Props { stats: SubagentStats }
@@ -42,7 +42,7 @@
             <div class="sa-model-row">
               <span class="sa-model-dot" style="background:{modelColor(m.model_key)}"></span>
               <span class="sa-model-name">{m.display_name}</span>
-              <span class="sa-model-cost">{formatCost(m.cost)}</span>
+              <span class="sa-model-cost">{formatModelCost(m.cost, m.pricing_available)}</span>
             </div>
           {/each}
         </div>
@@ -77,7 +77,7 @@
             <div class="sa-model-row">
               <span class="sa-model-dot" style="background:{modelColor(m.model_key)}"></span>
               <span class="sa-model-name">{m.display_name}</span>
-              <span class="sa-model-cost">{formatCost(m.cost)}</span>
+              <span class="sa-model-cost">{formatModelCost(m.cost, m.pricing_available)}</span>
             </div>
           {/each}
         </div>

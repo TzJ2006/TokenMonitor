@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { formatCost, formatTimeAgo, deviceColor } from "../utils/format.js";
+  import { formatCost, formatModelCost, formatTimeAgo, deviceColor } from "../utils/format.js";
   import { activePeriod, activeOffset, activeProvider } from "../stores/usage.js";
   import type { DeviceUsagePayload, DeviceSummary } from "../types/index.js";
 
@@ -193,7 +193,7 @@
               <div class="model-row">
                 <div class="model-dot" style:background={deviceColor(device.device)}></div>
                 <span class="model-name">{model.display_name}</span>
-                <span class="model-cost">{formatCost(model.cost)}</span>
+                <span class="model-cost">{formatModelCost(model.cost, model.pricing_available)}</span>
               </div>
             {/each}
           </div>

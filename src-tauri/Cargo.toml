@@ -55,6 +55,9 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
     "Win32_System_Registry",
     "Win32_Graphics_Dwm",
+    # Single-instance guard: map the lock port to its owning PID via
+    # GetExtendedTcpTable when a foreign process holds it.
+    "Win32_NetworkManagement_IpHelper",
 ] }
 # Cross-platform secret storage on Windows Credential Manager (CredRead/Write).
 keyring = { version = "3", default-features = false, features = ["windows-native"] }

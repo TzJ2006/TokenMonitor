@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { modelColor, formatCost, currencySymbol, convertCost, deviceColor } from "../utils/format.js";
+  import { modelColor, formatCost, formatModelCost, currencySymbol, convertCost, deviceColor } from "../utils/format.js";
   import { settings } from "../stores/settings.js";
   import { activeOffset, activePeriod, chartMode, chartSegmentMode } from "../stores/usage.js";
   import { logger } from "../utils/logger.js";
@@ -214,6 +214,7 @@
       if (existing) {
         existing.cost += seg.cost;
         existing.tokens += seg.tokens;
+        existing.pricing_available = existing.pricing_available !== false && seg.pricing_available !== false;
       } else {
         merged.set(seg.model_key, { ...seg });
       }
@@ -448,7 +449,7 @@
               <div class="detail-row">
                 <span class="detail-dot" style="background:{segmentColorFn(seg.model_key)}"></span>
                 <span class="detail-name">{seg.model}</span>
-                <span class="detail-cost">{formatCost(seg.cost)}</span>
+                <span class="detail-cost">{formatModelCost(seg.cost, seg.pricing_available)}</span>
               </div>
             {/each}
           </div>
