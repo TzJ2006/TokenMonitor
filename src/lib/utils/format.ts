@@ -46,6 +46,12 @@ export function formatCost(value: number): string {
   return `${symbol}${converted.toFixed(2)}`;
 }
 
+export function formatModelCost(value: number, pricingAvailable: boolean | undefined): string {
+  if (pricingAvailable === false) return "N/A";
+  if (value === 0) return "Free";
+  return formatCost(value);
+}
+
 export function formatTokens(count: number): string {
   if (count >= 1_000_000_000) return `${(count / 1_000_000_000).toFixed(1)}B`;
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
