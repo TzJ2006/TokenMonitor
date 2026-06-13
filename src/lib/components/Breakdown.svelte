@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { modelColor, formatCost, formatTokens, deviceColor } from "../utils/format.js";
+  import { modelColor, formatCost, formatModelCost, formatTokens, deviceColor } from "../utils/format.js";
   import { settings } from "../stores/settings.js";
   import { logger } from "../utils/logger.js";
   import type { AccordionToggleDetail, DeviceSummary, ModelSummary, SubagentStats } from "../types/index.js";
@@ -120,7 +120,7 @@
             <div class="sub-info">
               <div class="sub-name-row">
                 <span class="sub-name">{m.display_name}</span>
-                <span class="sub-cost">{formatCost(m.cost)}</span>
+                <span class="sub-cost">{formatModelCost(m.cost, m.pricing_available)}</span>
               </div>
               <div class="sub-tokens">{formatTokens(m.input_tokens)} in · {formatTokens(m.output_tokens)} out{#if m.cache_read_tokens > 0} · {formatTokens(m.cache_read_tokens)} cache{/if}</div>
             </div>
@@ -158,7 +158,7 @@
             <div class="sub-info">
               <div class="sub-name-row">
                 <span class="sub-name">{m.display_name}</span>
-                <span class="sub-cost">{formatCost(m.cost)}</span>
+                <span class="sub-cost">{formatModelCost(m.cost, m.pricing_available)}</span>
               </div>
               <div class="sub-tokens">{formatTokens(m.input_tokens)} in · {formatTokens(m.output_tokens)} out{#if m.cache_read_tokens > 0} · {formatTokens(m.cache_read_tokens)} cache{/if}</div>
             </div>
@@ -188,7 +188,7 @@
       <div class="model-row">
         <span class="model-bar" style="background:{modelColor(row.model_key)}"></span>
         <span class="model-name">{row.display_name}</span>
-        <span class="model-cost">{formatCost(row.cost)}</span>
+        <span class="model-cost">{formatModelCost(row.cost, row.pricing_available)}</span>
         <span class="model-tokens">{formatTokens(row.tokens)}</span>
       </div>
     {/each}

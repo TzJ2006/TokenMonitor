@@ -53,6 +53,7 @@ export interface ChartSegment {
   model_key: string;
   cost: number;
   tokens: number;
+  pricing_available?: boolean;
 }
 
 export interface ModelSummary {
@@ -60,6 +61,7 @@ export interface ModelSummary {
   model_key: string;
   cost: number;
   tokens: number;
+  pricing_available?: boolean;
   change_stats: ModelChangeSummary | null;
 }
 
@@ -106,6 +108,7 @@ export interface ScopeModelUsage {
   display_name: string;
   model_key: string;
   cost: number;
+  pricing_available?: boolean;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
@@ -267,6 +270,7 @@ export interface DeviceModelSummary {
   model_key: string;
   cost: number;
   tokens: number;
+  pricing_available?: boolean;
 }
 
 export interface DeviceSummary {
