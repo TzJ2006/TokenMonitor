@@ -527,6 +527,12 @@ const RATE_LIMIT_REFRESH_EVERY_N_CYCLES: u64 = 5;
 /// Pricing/exchange-rate TTL check: every 120 cycles (~1h at 30s interval).
 const PRICING_CHECK_EVERY_N_CYCLES: u64 = 120;
 
+/// When auto-refresh is "off" (refresh_interval == 0), the 2s statusline poll
+/// is the only thing detecting usage-log changes, so its (expensive) full-file
+/// scan falls back to this cadence instead of running every 2s. Matches the
+/// default refresh interval.
+const OFF_MODE_SWEEP_SECS: u64 = 30;
+
 async fn fast_statusline_poll(app: tauri::AppHandle) {
     use std::fs;
     use std::time::SystemTime;
@@ -538,6 +544,10 @@ async fn fast_statusline_poll(app: tauri::AppHandle) {
         fs::metadata(&path).ok().and_then(|m| m.modified().ok());
 
     let state = app.state::<AppState>();
+
+    // Accumulates elapsed time so the heavy usage-log scan runs at the
+    // configured refresh interval rather than on every 2s tick.
+    let mut secs_since_sweep: u64 = 0;
 
     loop {
         tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
@@ -554,7 +564,27 @@ async fn fast_statusline_poll(app: tauri::AppHandle) {
         if events_moved {
             last_mtime = now_mtime;
         }
-        let parser_changed = state.parser.invalidate_if_changed();
+
+        // Detecting in-place log appends means stat-ing every session file —
+        // far too heavy to run every 2s on a large log set. Throttle it to the
+        // user's configured refresh interval (Settings); the cheap events-file
+        // check above still runs every 2s for rate limits. "Off" (0) falls back
+        // to a sane cadence so usage numbers never freeze entirely.
+        secs_since_sweep += POLL_INTERVAL_SECS;
+        let sweep_interval_secs = {
+            let configured = *state.refresh_interval.read().await;
+            if configured == 0 {
+                OFF_MODE_SWEEP_SECS
+            } else {
+                configured
+            }
+        };
+        let parser_changed = if secs_since_sweep >= sweep_interval_secs {
+            secs_since_sweep = 0;
+            state.parser.invalidate_if_changed()
+        } else {
+            false
+        };
 
         if !events_moved && !parser_changed {
             continue;
