@@ -379,7 +379,9 @@ pub async fn get_single_device_usage(
     use crate::commands::period::{compute_date_bounds, format_day_label};
     use crate::models::{ModelSummary, UsagePayload, UsageSource};
     use crate::usage::integrations::provider_matches_model;
-    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
+    use crate::usage::pricing::{
+        calculate_cost_for_key, pricing_available_for_key, provider_multiplier,
+    };
     use std::collections::HashMap;
 
     validate_ssh_alias(&device).or_else(|_| {
@@ -400,8 +402,9 @@ pub async fn get_single_device_usage(
     let period_label = format_day_label(since);
     let parser = &state.parser;
 
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
-    let mut bucket_map: HashMap<String, HashMap<String, (String, f64, u64)>> = HashMap::new();
+    type ModelAggMap = HashMap<String, (String, f64, u64, bool)>;
+    let mut model_map: ModelAggMap = HashMap::new();
+    let mut bucket_map: HashMap<String, ModelAggMap> = HashMap::new();
 
     if device == "Local" {
         if !usage_access_enabled(&state) {
@@ -417,6 +420,7 @@ pub async fn get_single_device_usage(
                 continue;
             }
             let (display_name, model_key) = crate::models::normalize_model(&entry.model);
+            let pricing_available = pricing_available_for_key(&model_key);
             let cost = calculate_cost_for_key(
                 &model_key,
                 entry.input_tokens,
@@ -429,18 +433,20 @@ pub async fn get_single_device_usage(
             let tokens = entry.input_tokens + entry.output_tokens;
             let agg = model_map
                 .entry(model_key.clone())
-                .or_insert_with(|| (display_name.clone(), 0.0, 0));
+                .or_insert_with(|| (display_name.clone(), 0.0, 0, true));
             agg.1 += cost;
             agg.2 += tokens;
+            agg.3 &= pricing_available;
 
             let bk = bucket_key_for_timestamp(&entry.timestamp.fixed_offset(), &period);
             let bucket_model = bucket_map
                 .entry(bk)
                 .or_default()
                 .entry(model_key)
-                .or_insert_with(|| (display_name, 0.0, 0));
+                .or_insert_with(|| (display_name, 0.0, 0, true));
             bucket_model.1 += cost;
             bucket_model.2 += tokens;
+            bucket_model.3 &= pricing_available;
         }
     } else {
         let cache_mgr = state.ssh_cache.read().await;
@@ -467,6 +473,7 @@ pub async fn get_single_device_usage(
                 }
 
                 let (display_name, model_key) = crate::models::normalize_model(&record.model);
+                let pricing_available = pricing_available_for_key(&model_key);
                 let cost = calculate_cost_for_key(
                     &model_key,
                     record.input_tokens,
@@ -479,31 +486,36 @@ pub async fn get_single_device_usage(
                 let tokens = record.input_tokens + record.output_tokens;
                 let agg = model_map
                     .entry(model_key.clone())
-                    .or_insert_with(|| (display_name.clone(), 0.0, 0));
+                    .or_insert_with(|| (display_name.clone(), 0.0, 0, true));
                 agg.1 += cost;
                 agg.2 += tokens;
+                agg.3 &= pricing_available;
 
                 let bk = bucket_key_for_timestamp(&parsed_ts, &period);
                 let bucket_model = bucket_map
                     .entry(bk)
                     .or_default()
                     .entry(model_key)
-                    .or_insert_with(|| (display_name, 0.0, 0));
+                    .or_insert_with(|| (display_name, 0.0, 0, true));
                 bucket_model.1 += cost;
                 bucket_model.2 += tokens;
+                bucket_model.3 &= pricing_available;
             }
         }
     }
 
     let mut model_breakdown: Vec<ModelSummary> = model_map
         .into_iter()
-        .map(|(model_key, (display_name, cost, tokens))| ModelSummary {
-            display_name,
-            model_key,
-            cost,
-            tokens,
-            change_stats: None,
-        })
+        .map(
+            |(model_key, (display_name, cost, tokens, pricing_available))| ModelSummary {
+                display_name,
+                model_key,
+                cost,
+                tokens,
+                pricing_available,
+                change_stats: None,
+            },
+        )
         .collect();
     model_breakdown.sort_by(|a, b| {
         b.cost
@@ -516,12 +528,15 @@ pub async fn get_single_device_usage(
         .map(|(key, models)| {
             let mut segments: Vec<ChartSegment> = models
                 .into_iter()
-                .map(|(model_key, (display, cost, tokens))| ChartSegment {
-                    model: display,
-                    model_key,
-                    cost,
-                    tokens,
-                })
+                .map(
+                    |(model_key, (display, cost, tokens, pricing_available))| ChartSegment {
+                        model: display,
+                        model_key,
+                        cost,
+                        tokens,
+                        pricing_available,
+                    },
+                )
                 .collect();
             segments.sort_by(|a, b| {
                 b.cost

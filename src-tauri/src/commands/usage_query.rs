@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tauri::State;
 
+const USAGE_PAYLOAD_CACHE_VERSION: &str = "model-pricing-2026-06-13";
+
 /// Ensure every day in [start, end) has a chart bucket, inserting empty buckets
 /// for days with no data.  This prevents the chart from appearing "cut off" when
 /// the current month hasn't ended yet.
@@ -76,26 +78,30 @@ fn filter_buckets_to_range(payload: &mut UsagePayload, start: NaiveDate, end: Na
         .count() as u32;
 
     // Rebuild model_breakdown from retained buckets
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
     for bucket in &payload.chart_buckets {
         for seg in &bucket.segments {
             let entry =
                 model_map
                     .entry(seg.model_key.clone())
-                    .or_insert((seg.model.clone(), 0.0, 0));
+                    .or_insert((seg.model.clone(), 0.0, 0, true));
             entry.1 += seg.cost;
             entry.2 += seg.tokens;
+            entry.3 &= seg.pricing_available;
         }
     }
     payload.model_breakdown = model_map
         .into_iter()
-        .map(|(key, (name, cost, tokens))| ModelSummary {
-            display_name: name,
-            model_key: key,
-            cost,
-            tokens,
-            change_stats: None,
-        })
+        .map(
+            |(key, (name, cost, tokens, pricing_available))| ModelSummary {
+                display_name: name,
+                model_key: key,
+                cost,
+                tokens,
+                pricing_available,
+                change_stats: None,
+            },
+        )
         .collect();
 
     // Recalculate input/output/cache tokens (populated later from raw entries)
@@ -192,7 +198,7 @@ fn final_usage_cache_key(provider: &str, period: &str, offset: i32) -> String {
     let date_tag = resolve_period_bounds(period, offset)
         .map(|b| b.start.format("%Y%m%d").to_string())
         .unwrap_or_default();
-    format!("usage-view:{provider}:{period}:{offset}:{date_tag}")
+    format!("usage-view:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{date_tag}")
 }
 
 async fn finalize_usage_payload(
@@ -277,7 +283,7 @@ pub(crate) fn get_provider_data(
     offset: i32,
 ) -> Result<UsagePayload, String> {
     // Single cache layer: stores the complete payload including stats.
-    let cache_key = format!("full:{}:{}:{}", provider, period, offset);
+    let cache_key = format!("full:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}");
     if let Some(cached) = parser.check_cache(&cache_key) {
         return Ok(cached);
     }
@@ -335,10 +341,12 @@ fn merge_payloads(mut c: UsagePayload, x: UsagePayload) -> UsagePayload {
                 model_key: model.model_key,
                 cost: 0.0,
                 tokens: 0,
+                pricing_available: true,
                 change_stats: None,
             });
         entry.cost += model.cost;
         entry.tokens += model.tokens;
+        entry.pricing_available &= model.pricing_available;
     }
 
     c.total_cost += x.total_cost;
@@ -674,8 +682,7 @@ pub(crate) async fn get_usage_data_inner(
                         // recomputes with the freshly-fetched remote data
                         // instead of re-serving a stale or empty disk entry.
                         if let Some(ref disk_cache) = *disk_cache_arc.read().await {
-                            disk_cache.clear_prefix("usage-view:cursor");
-                            disk_cache.clear_prefix("usage-view:all");
+                            disk_cache.clear_prefix("usage-view:");
                         }
                         let _ = app_handle.emit("data-updated", 0u64);
                     }
@@ -727,6 +734,7 @@ mod tests {
             model_key: model_key.to_string(),
             cost,
             tokens,
+            pricing_available: true,
             change_stats: None,
         }
     }

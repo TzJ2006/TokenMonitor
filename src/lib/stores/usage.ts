@@ -64,7 +64,8 @@ export function shallowPayloadEqual(a: UsagePayload, b: UsagePayload): boolean {
     a.model_breakdown.every((model, i) =>
       model.model_key === b.model_breakdown[i]?.model_key &&
       model.cost === b.model_breakdown[i]?.cost &&
-      model.tokens === b.model_breakdown[i]?.tokens,
+      model.tokens === b.model_breakdown[i]?.tokens &&
+      model.pricing_available === b.model_breakdown[i]?.pricing_available,
     ) &&
     a.period_label === b.period_label &&
     a.has_earlier_data === b.has_earlier_data &&
