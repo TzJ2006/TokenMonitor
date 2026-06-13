@@ -5,6 +5,7 @@ mod paths;
 mod platform;
 mod rate_limits;
 mod secrets;
+mod single_instance;
 mod stats;
 #[allow(dead_code)]
 mod statusline;
@@ -104,6 +105,49 @@ fn move_window_near_tray(window: &tauri::WebviewWindow) {
     }
 }
 
+/// Show + position + focus the main window using the same per-OS logic as the
+/// tray "Show" menu item. Must run on the main thread (GTK/AppKit constraint).
+fn show_main_window_inner(window: &tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    {
+        platform::windows::window::position_near_tray(window);
+        let _ = window.show();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Pre-hint position before show (WM may respect this).
+        platform::linux::position_top_right(window);
+        let _ = window.show();
+        // Immediate re-position (works if WM realized fast enough).
+        platform::linux::position_top_right(window);
+        platform::clamp_window_to_work_area(window);
+        // Deferred re-position to catch slow WM realization.
+        platform::linux::deferred_reposition(window.clone());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        move_window_near_tray(window);
+        platform::clamp_window_to_work_area(window);
+        let _ = window.show();
+    }
+    #[cfg(target_os = "windows")]
+    platform::windows::window::activate_window(window);
+    #[cfg(not(target_os = "windows"))]
+    let _ = window.set_focus();
+}
+
+/// Thread-safe entry point to surface the main window. Dispatches the actual
+/// show to the main thread, so it is safe to call from the single-instance
+/// accept loop (a non-main thread) on FOCUS.
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = handle.get_webview_window("main") {
+            show_main_window_inner(&window);
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Force X11 backend on Wayland sessions so set_position() works.
@@ -113,6 +157,14 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     if std::env::var("GDK_BACKEND").is_err() && std::env::var("WAYLAND_DISPLAY").is_ok() {
         std::env::set_var("GDK_BACKEND", "x11");
+    }
+
+    // Single-instance guard: detect an already-running TokenMonitor (or a
+    // foreign process squatting the loopback lock port) and act on the user's
+    // choice — all BEFORE building any tray/window, so a declined launch exits
+    // cleanly without ever showing UI. See `single_instance` module.
+    if single_instance::acquire_or_exit() == single_instance::Acquire::Exit {
+        return;
     }
 
     tauri::Builder::default()
@@ -135,6 +187,11 @@ pub fn run() {
                 app.manage(logging_state);
             }
             tracing::info!("[PROFILE] setup:logging = {:?}", setup_t0.elapsed());
+
+            // Owner instance: start the lock-port accept loop now that the
+            // AppHandle exists. It answers PROBE / QUIT / FOCUS from any future
+            // launch attempt. No-op when the guard is bypassed or not held.
+            single_instance::spawn_accept_loop(app.handle().clone());
 
             // Build tray menu (right-click on macOS/Windows, any click on Linux).
             let show = MenuItemBuilder::with_id("show", "Show TokenMonitor").build(app)?;
@@ -163,29 +220,7 @@ pub fn run() {
                         app.exit(0);
                     } else if event.id() == "show" {
                         if let Some(window) = app.get_webview_window("main") {
-                            #[cfg(target_os = "windows")]
-                            {
-                                platform::windows::window::position_near_tray(&window);
-                                let _ = window.show();
-                            }
-                            #[cfg(target_os = "linux")]
-                            {
-                                // Pre-hint position before show (WM may respect this).
-                                platform::linux::position_top_right(&window);
-                                let _ = window.show();
-                                // Immediate re-position (works if WM realized fast enough).
-                                platform::linux::position_top_right(&window);
-                                platform::clamp_window_to_work_area(&window);
-                                // Deferred re-position to catch slow WM realization.
-                                platform::linux::deferred_reposition(window.clone());
-                            }
-                            #[cfg(target_os = "macos")]
-                            {
-                                move_window_near_tray(&window);
-                                platform::clamp_window_to_work_area(&window);
-                                let _ = window.show();
-                            }
-                            let _ = window.set_focus();
+                            show_main_window_inner(&window);
                         }
                     }
                 })
