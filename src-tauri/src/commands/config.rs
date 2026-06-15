@@ -540,6 +540,17 @@ pub async fn set_dock_icon_visible(app: tauri::AppHandle, visible: bool) -> Resu
     Ok(())
 }
 
+/// Suppress the next main-window auto-hide blur. Call this before opening a
+/// native OS dialog (Save/Open panel) that steals focus from the webview —
+/// without it the blur handler hides the window while the dialog is up,
+/// leaving the user unable to click the originating button afterwards.
+#[tauri::command]
+pub fn suppress_next_auto_hide(state: State<'_, AppState>) {
+    state
+        .suppress_auto_hide
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[tauri::command]
 pub async fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.parser.clear_cache();
