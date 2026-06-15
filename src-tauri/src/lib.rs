@@ -424,6 +424,7 @@ pub fn run() {
             commands::config::set_window_surface,
             commands::config::set_glass_effect,
             commands::config::set_dock_icon_visible,
+            commands::config::suppress_next_auto_hide,
             commands::config::set_refresh_interval,
             commands::config::set_rate_limits_enabled,
             commands::config::set_usage_access_enabled,

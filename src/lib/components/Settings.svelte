@@ -333,6 +333,9 @@
     if (ioBusy) return;
     let path: string | null;
     try {
+      // The native Save panel steals focus from the webview; suppress the
+      // resulting blur so the main window doesn't auto-hide while it's open.
+      await invoke("suppress_next_auto_hide");
       // Native Save dialog: user picks the destination + file name.
       path = await save({
         defaultPath: `TokenMonitor-Usage-${exportStamp()}.json`,
@@ -358,8 +361,11 @@
     }
   }
 
-  function triggerImport() {
+  async function triggerImport() {
     if (ioBusy) return;
+    // The native Open panel steals focus from the webview; suppress the
+    // resulting blur so the main window doesn't auto-hide while it's open.
+    await invoke("suppress_next_auto_hide");
     importInput?.click();
   }
 
