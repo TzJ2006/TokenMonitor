@@ -63,6 +63,28 @@ const MAX_JSONL_LINE_BYTES: usize = 1_048_576;
 pub struct AutoExportConfig {
     pub enabled: bool,
     pub folder: Option<String>,
+    /// Lowercased model keys hidden in the UI. Records for these models are
+    /// excluded from the exported file so the backup mirrors what the dashboard
+    /// shows. Mirrored from the frontend `hiddenModels` setting via
+    /// `set_auto_export_config`; a change forces a full rewrite (see that command)
+    /// so previously-written hidden rows are dropped and un-hidden rows reappear.
+    pub hidden_models: HashSet<String>,
+}
+
+/// Normalize a hidden-model list to the comparison form: trimmed, lowercased,
+/// de-duplicated, empties dropped. Mirrors the frontend `normalizeHiddenModels`
+/// and the archive's normalized `mk`, so export visibility == UI visibility.
+pub(crate) fn normalize_hidden_models(models: Vec<String>) -> HashSet<String> {
+    models
+        .into_iter()
+        .map(|m| m.trim().to_lowercase())
+        .filter(|m| !m.is_empty())
+        .collect()
+}
+
+/// True if a record's model is hidden and must be excluded from export.
+fn record_hidden(r: &ArchivedHourly, hidden: &HashSet<String>) -> bool {
+    !hidden.is_empty() && hidden.contains(&r.mk.to_lowercase())
 }
 
 /// Runtime (non-persisted) state for the JSONL auto-export. Defaults on launch
@@ -118,6 +140,11 @@ struct JsonlHeader<'a> {
     /// "Zijia's MacBook Pro (macOS)". Each record line also carries its own
     /// `device` (a remote SSH device's lines carry that device's alias).
     device: &'a str,
+    /// Stable, frozen slug identifying the producing machine. Survives computer
+    /// renames (unlike `device`), so a peer — and this machine itself — can
+    /// recognize a file written under a previous file name and avoid merging it
+    /// as a duplicate device.
+    device_id: &'a str,
 }
 
 /// One JSONL record line. `device` is which machine the row came from (this
@@ -149,13 +176,15 @@ struct ExportDocRef<'a> {
     app_version: String,
     /// The machine that produced this file (origin marker).
     device: &'a str,
+    /// Stable, frozen slug identifying the producing machine (see JsonlHeader).
+    device_id: &'a str,
     sources: Vec<ExportSourceRef<'a>>,
 }
 
 // ── Import wire types (deserialize-only, tolerant of old + new shapes) ────────
 
 /// Lenient probe used to detect the JSONL format / version from a single line.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct JsonlHeaderProbe {
     #[serde(default)]
     format: String,
@@ -166,6 +195,11 @@ struct JsonlHeaderProbe {
     /// it isn't merged back in as a phantom "peer device".
     #[serde(default)]
     device: String,
+    /// Stable, frozen origin slug. Primary signal for recognizing our own file
+    /// even after a computer rename (the `device` label drifts; this doesn't).
+    /// Empty for files written by builds predating the device-id header.
+    #[serde(default)]
+    device_id: String,
 }
 
 /// A record read from either export shape. Accepts both the legacy `p` tag and
@@ -385,34 +419,100 @@ fn device_label() -> &'static str {
 /// the per-device file name AND, when a peer reads this file, as the `device:`
 /// source alias — so it must satisfy `is_valid_source_key`'s device rules
 /// (`[A-Za-z0-9._-]`, ≤64, not "."/".."). Cached for the process.
+///
+/// FROZEN on first computation (persisted to the device-identity file): a
+/// computer rename, home-dir move, or a transient `scutil`/`hostname` lookup
+/// failure used to change this value across runs, so the same machine wrote a
+/// NEW file name and peers merged its data under a second `device:<slug>` —
+/// duplicate device records for one machine. Freezing keeps the local name and
+/// the name stored in the sync folder permanently in agreement.
 fn device_slug() -> &'static str {
     static SLUG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SLUG.get_or_init(|| {
-        // Human-readable part (capped) + a stable per-machine disambiguator hash.
-        // The hash (over the FULL label + home dir) guarantees two machines never
-        // share a file name / device alias even if their names truncate to the
-        // same 64-char prefix or are identical — which would otherwise reintroduce
-        // the cloud-sync conflicted-copy problem. DefaultHasher uses fixed keys, so
-        // the value is stable for a given machine across runs.
-        let base: String = slugify(device_label()).chars().take(48).collect();
-        let base = base.trim_matches('-');
-        let seed = format!(
-            "{}|{}",
-            device_label(),
-            dirs::home_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        );
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&seed, &mut hasher);
-        let id = std::hash::Hasher::finish(&hasher) as u32;
-        if base.is_empty() {
-            format!("device-{id:08x}")
-        } else {
-            format!("{base}-{id:08x}")
+    SLUG.get_or_init(load_or_create_device_slug).as_str()
+}
+
+/// Persisted device identity. Stored in `~/.tokenmonitor/device-identity.json`
+/// (alongside the statusline event log) — deliberately OUTSIDE the usage-archive
+/// directory so it survives `ArchiveManager::reset()` / "Clear Cache"; re-rolling
+/// it would re-introduce the duplicate it prevents.
+#[derive(Serialize, Deserialize, Default)]
+struct DeviceIdentity {
+    /// Frozen, filename-safe device slug. Once written it never changes.
+    slug: String,
+}
+
+/// Path to the persisted device-identity file, or None if no home dir is known.
+/// `TM_DEVICE_IDENTITY_DIR` overrides the directory (keeps tests/CI off the real
+/// home dir).
+fn device_identity_path() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("TM_DEVICE_IDENTITY_DIR") {
+        if !dir.is_empty() {
+            return Some(std::path::PathBuf::from(dir).join("device-identity.json"));
         }
-    })
-    .as_str()
+    }
+    dirs::home_dir().map(|h| h.join(".tokenmonitor").join("device-identity.json"))
+}
+
+/// Load the frozen device slug, or compute + persist it on first run.
+///
+/// First-run computation uses the EXACT same algorithm as before, so existing
+/// installs keep the slug they already use (no new file name, no migration) — it
+/// is merely frozen going forward. Falls back to a freshly computed, unpersisted
+/// slug if the identity file can't be read or written.
+fn load_or_create_device_slug() -> String {
+    let path = device_identity_path();
+    if let Some(p) = &path {
+        if let Ok(content) = std::fs::read_to_string(p) {
+            if let Ok(id) = serde_json::from_str::<DeviceIdentity>(&content) {
+                let slug = id.slug.trim().to_string();
+                if is_valid_source_key(&format!("device:{slug}")) {
+                    return slug;
+                }
+            }
+        }
+    }
+    let slug = compute_device_slug();
+    if let Some(p) = &path {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match serde_json::to_string(&DeviceIdentity { slug: slug.clone() }) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(p, json) {
+                    tracing::warn!(error = %e, "Failed to persist device identity");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "Failed to serialize device identity"),
+        }
+    }
+    slug
+}
+
+/// Compute this machine's filename-safe slug from its name + a stable hash.
+fn compute_device_slug() -> String {
+    // Human-readable part (capped) + a stable per-machine disambiguator hash.
+    // The hash (over the FULL label + home dir) guarantees two machines never
+    // share a file name / device alias even if their names truncate to the
+    // same 64-char prefix or are identical — which would otherwise reintroduce
+    // the cloud-sync conflicted-copy problem. DefaultHasher uses fixed keys, so
+    // the value is stable for a given machine across runs.
+    let base: String = slugify(device_label()).chars().take(48).collect();
+    let base = base.trim_matches('-');
+    let seed = format!(
+        "{}|{}",
+        device_label(),
+        dirs::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&seed, &mut hasher);
+    let id = std::hash::Hasher::finish(&hasher) as u32;
+    if base.is_empty() {
+        format!("device-{id:08x}")
+    } else {
+        format!("{base}-{id:08x}")
+    }
 }
 
 /// Collapse arbitrary text into a `[A-Za-z0-9._-]` slug (runs of other chars
@@ -508,16 +608,21 @@ pub async fn export_usage_data(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
+    hidden_models: Option<Vec<String>>,
 ) -> Result<ExportResult, String> {
-    run_export(&app, &state, &path).await
+    let hidden = normalize_hidden_models(hidden_models.unwrap_or_default());
+    run_export(&app, &state, &path, &hidden).await
 }
 
 /// Core snapshot routine for the manual Export button. Flushes completed local +
 /// SSH-device hours, then writes every archived source to one pretty JSON file.
+/// Records whose model is in `hidden` (the UI's hidden-models set) are excluded,
+/// so the snapshot reflects what the dashboard currently shows.
 pub(crate) async fn run_export(
     app: &AppHandle,
     state: &AppState,
     path: &str,
+    hidden: &HashSet<String>,
 ) -> Result<ExportResult, String> {
     let archive = state
         .parser
@@ -536,7 +641,11 @@ pub(crate) async fn run_export(
         .into_iter()
         .map(|source_key| {
             let frontier = archive.frontier_string(&source_key);
-            let records = archive.read_raw(&source_key);
+            let records: Vec<ArchivedHourly> = archive
+                .read_raw(&source_key)
+                .into_iter()
+                .filter(|r| !record_hidden(r, hidden))
+                .collect();
             (source_key, frontier, records)
         })
         .filter(|(_, _, records)| !records.is_empty())
@@ -563,6 +672,7 @@ pub(crate) async fn run_export(
         exported_at: chrono::Local::now().to_rfc3339(),
         app_version: app.package_info().version.to_string(),
         device: device_label(),
+        device_id: device_slug(),
         sources,
     };
 
@@ -596,13 +706,15 @@ pub(crate) async fn run_export(
 /// the common (nothing-changed) tick, so command handlers contending for the
 /// lock normally wait only microseconds.
 pub(crate) async fn run_auto_export(app: &AppHandle, state: &AppState) {
-    let (enabled, folder) = {
+    let (enabled, folder, hidden) = {
         let cfg = state.auto_export.read().await;
-        (cfg.enabled, cfg.folder.clone())
+        (cfg.enabled, cfg.folder.clone(), cfg.hidden_models.clone())
     };
-    if !enabled {
-        return;
-    }
+    // A configured FOLDER (not the write toggle) gates sync. Reading peers'
+    // files is decoupled from writing our own backup: as long as a folder is set
+    // we pull peers in even when "write my file" is off, so peer devices appear
+    // without the user having to manually Import. Writing our own file (below)
+    // still honors `enabled`.
     let Some(folder) = folder else {
         return;
     };
@@ -636,7 +748,7 @@ pub(crate) async fn run_auto_export(app: &AppHandle, state: &AppState) {
     // ── 1. Pull in peers: merge every OTHER device's file from this folder ──
     let merged = {
         let mut rt = state.auto_export_runtime.write().await;
-        merge_peer_files(&archive, folder_path, &own_file, &mut rt)
+        merge_peer_files(&archive, folder_path, &own_file, &ssh_aliases, &mut rt)
     };
     if merged {
         // Peer data landed in the archive — refresh caches + notify the UI,
@@ -648,16 +760,21 @@ pub(crate) async fn run_auto_export(app: &AppHandle, state: &AppState) {
         let _ = app.emit("data-updated", 0u64);
     }
 
-    // ── 2. Write THIS machine's own file (owned sources only) ──
-    let owned: Vec<String> = archive
-        .list_sources()
-        .into_iter()
-        .filter(|s| is_own_source(s, &ssh_aliases))
-        .collect();
-    let path = folder_path.join(&own_file);
-    let mut rt = state.auto_export_runtime.write().await;
-    if let Err(e) = do_auto_export(&archive, &path, app, local_device, &owned, &mut rt) {
-        tracing::warn!(error = %e, folder = folder.as_str(), "Auto-export failed");
+    // ── 2. Write THIS machine's own file (owned sources only) — only when the
+    // "sync out / write my backup" toggle is enabled. Reading peers above is
+    // unconditional once a folder is set.
+    if enabled {
+        let owned: Vec<String> = archive
+            .list_sources()
+            .into_iter()
+            .filter(|s| is_own_source(s, &ssh_aliases))
+            .collect();
+        let path = folder_path.join(&own_file);
+        let mut rt = state.auto_export_runtime.write().await;
+        if let Err(e) = do_auto_export(&archive, &path, app, local_device, &owned, &hidden, &mut rt)
+        {
+            tracing::warn!(error = %e, folder = folder.as_str(), "Auto-sync write failed");
+        }
     }
 }
 
@@ -694,6 +811,7 @@ fn merge_peer_files(
     archive: &ArchiveManager,
     folder: &Path,
     own_file: &str,
+    ssh_aliases: &HashSet<String>,
     rt: &mut AutoExportRuntime,
 ) -> bool {
     let read_dir = match std::fs::read_dir(folder) {
@@ -741,21 +859,39 @@ fn merge_peer_files(
             }
         };
 
-        // Skip a file THIS machine wrote under a previous name (the filename
-        // scheme changed across versions). Identify it by the header's `device`
-        // label == ours; merging it would re-import our own data as a phantom
-        // peer device and double-count it. Gate it (record mtime) so we don't
-        // re-read it every tick.
-        let header_device = content
+        // Recognize a file THIS machine wrote under a PREVIOUS file name (a
+        // computer rename, a transient hostname-lookup failure, or an old naming
+        // scheme). Merging it would re-import our own data as a phantom peer
+        // device and duplicate it. The frozen `device_id` survives renames and is
+        // the reliable signal; fall back to the `device` label for legacy files
+        // written before the device_id header existed.
+        let header = content
             .lines()
             .map(str::trim)
             .find(|l| !l.is_empty())
             .and_then(|first| serde_json::from_str::<JsonlHeaderProbe>(first).ok())
-            .map(|h| h.device)
             .unwrap_or_default();
-        if !header_device.is_empty() && header_device == device_label() {
-            tracing::debug!(file = name.as_str(), "Skipping our own stale export file");
-            rt.peer_mtimes.insert(name, mtime);
+        let is_own_stale = (!header.device_id.is_empty() && header.device_id == device_slug())
+            || (!header.device.is_empty() && header.device == device_label());
+        if is_own_stale {
+            // Delete the stale file so peers stop seeing it as a second device,
+            // and drop any phantom device:<slug> source a prior build already
+            // created from it — unless that slug is a real SSH host we sync (the
+            // hashed slug realistically never collides with a user alias, but be
+            // safe). This is the cleanup half of the duplicate fix.
+            tracing::debug!(file = name.as_str(), "Removing our own stale export file");
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                tracing::warn!(
+                    file = name.as_str(),
+                    error = %e,
+                    "Failed to remove stale own export file"
+                );
+            }
+            if !ssh_aliases.contains(slug) {
+                archive.remove_source(&format!("device:{slug}"));
+                changed = true;
+            }
+            rt.peer_mtimes.remove(&name);
             continue;
         }
 
@@ -800,12 +936,14 @@ fn do_auto_export(
     app: &AppHandle,
     local_device: &str,
     owned: &[String],
+    hidden: &HashSet<String>,
     rt: &mut AutoExportRuntime,
 ) -> Result<(), String> {
-    // Once-per-session (or post-import / folder-change / missing-file) full
-    // reconciliation guarantees the file holds everything archived so far.
+    // Once-per-session (or post-import / folder-change / hidden-models-change /
+    // missing-file) full reconciliation guarantees the file holds everything
+    // archived so far, filtered to the currently-visible models.
     if !rt.synced || !path.exists() {
-        let cursors = full_rewrite(archive, path, app, local_device, owned)?;
+        let cursors = full_rewrite(archive, path, app, local_device, owned, hidden)?;
         rt.cursors = cursors;
         rt.synced = true;
         tracing::debug!(path = %path.display(), "Auto-export full sync complete");
@@ -842,6 +980,13 @@ fn do_auto_export(
             };
             let is_new = prior.is_none_or(|f| !f.covers(date, record.h));
             if !is_new {
+                continue;
+            }
+            // Skip hidden models so the mirror matches the dashboard. A change to
+            // the hidden set resets synced+cursors (see set_auto_export_config),
+            // forcing a full_rewrite, so previously-appended hidden rows don't
+            // linger and un-hidden rows reappear.
+            if record_hidden(&record, hidden) {
                 continue;
             }
             batch.push_str(&record_line(source_key, &device, &record)?);
@@ -898,6 +1043,7 @@ fn full_rewrite(
     app: &AppHandle,
     local_device: &str,
     owned: &[String],
+    hidden: &HashSet<String>,
 ) -> Result<HashMap<String, ArchiveFrontier>, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -911,6 +1057,7 @@ fn full_rewrite(
         exported_at: chrono::Local::now().to_rfc3339(),
         app_version: app.package_info().version.to_string(),
         device: local_device,
+        device_id: device_slug(),
     };
     out.push_str(&serde_json::to_string(&header).map_err(|e| format!("Failed header: {e}"))?);
     out.push('\n');
@@ -924,6 +1071,10 @@ fn full_rewrite(
         }
         let device = source_device(source_key, local_device);
         for record in &records {
+            // Skip hidden models so the mirror matches the dashboard.
+            if record_hidden(record, hidden) {
+                continue;
+            }
             out.push_str(&record_line(source_key, &device, record)?);
             out.push('\n');
         }
@@ -1000,6 +1151,26 @@ pub async fn import_usage_data(
 
     let (sources, skipped) = parse_import_payload(&json)?;
 
+    // Decide whether this file is THIS machine's own backup (restore verbatim) or
+    // another machine's export. For a peer file, remap its `local:*` blocks to a
+    // `device:<slug>` source — exactly like the auto-sync peer merge — so the
+    // other machine's usage is attributed to that device instead of being summed
+    // into THIS machine's local total. Unknown origin (legacy / header-less file)
+    // → verbatim, preserving the original restore behavior.
+    let (origin_id, origin_dev) = detect_import_origin(&json);
+    let is_own = (!origin_id.is_empty() && origin_id == device_slug())
+        || (!origin_dev.is_empty() && origin_dev == device_label());
+    let peer_slug: Option<String> = if is_own || (origin_id.is_empty() && origin_dev.is_empty()) {
+        None
+    } else {
+        let raw = if !origin_id.is_empty() {
+            origin_id.clone()
+        } else {
+            slugify(&origin_dev)
+        };
+        is_valid_source_key(&format!("device:{raw}")).then_some(raw)
+    };
+
     // Flush local completed hours first so advancing a frontier on import never
     // hides un-archived live data (see ECL DEC-004).
     crate::archive_local_usage(&state);
@@ -1017,14 +1188,23 @@ pub async fn import_usage_data(
     };
 
     for (source_key, records) in &sources {
-        if !is_valid_source_key(source_key) {
+        // Verbatim for our own backup; remap local:* → device:<peerSlug> for a
+        // peer file (device:* peers pass through unchanged).
+        let target_key = match &peer_slug {
+            Some(slug) => match remap_peer_source(source_key, slug) {
+                Some(t) => t,
+                None => continue, // unrecognized source key in a peer file
+            },
+            None => source_key.clone(),
+        };
+        if !is_valid_source_key(&target_key) {
             tracing::warn!(
-                source = source_key.as_str(),
+                source = target_key.as_str(),
                 "Skipping import block with invalid source key"
             );
             continue;
         }
-        let stats = archive.import_source(source_key, records, current_date, current_hour);
+        let stats = archive.import_source(&target_key, records, current_date, current_hour);
         result.total_seen += stats.seen;
         result.total_new += stats.new_buckets;
         result.total_deduped += stats.deduped;
@@ -1053,7 +1233,35 @@ pub async fn import_usage_data(
     }
     run_auto_export(&app, &state).await;
 
+    // Purge any phantom self-duplicate device sources the merge may have surfaced
+    // (defense in depth; the remap above already keeps a peer's local out of ours).
+    crate::cleanup_self_duplicate_devices(&state).await;
+
     Ok(result)
+}
+
+/// Best-effort origin `(device_id, device_label)` of an import payload, read
+/// from the snapshot document's top-level fields or the JSONL header line.
+/// Returns empty strings for a legacy / header-less file. Used to decide whether
+/// an imported file is THIS machine's own backup (restore verbatim) or another
+/// machine's export (remap its `local:*` to a `device:*` source).
+fn detect_import_origin(input: &str) -> (String, String) {
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+    // Snapshot: a single JSON object carrying top-level device/device_id.
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(input) {
+        let id = map.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+        let dev = map.get("device").and_then(|v| v.as_str()).unwrap_or("");
+        if !id.is_empty() || !dev.is_empty() {
+            return (id.to_string(), dev.to_string());
+        }
+    }
+    // JSONL: header on the first non-empty line.
+    if let Some(first) = input.lines().map(str::trim).find(|l| !l.is_empty()) {
+        if let Ok(h) = serde_json::from_str::<JsonlHeaderProbe>(first) {
+            return (h.device_id, h.device);
+        }
+    }
+    (String::new(), String::new())
 }
 
 /// Parse an import payload in either supported shape into `(source_key, records)`
@@ -1269,6 +1477,52 @@ mod tests {
             serde_json::from_str(&record_line("local:cursor", "Mac (macOS)", &rec).unwrap())
                 .unwrap();
         assert_eq!(v["provider"], "cursor");
+    }
+
+    #[test]
+    fn normalize_hidden_models_lowercases_dedups_and_drops_empty() {
+        let h = normalize_hidden_models(vec![
+            " Haiku ".to_string(),
+            "haiku".to_string(),
+            "".to_string(),
+            "GPT-5".to_string(),
+        ]);
+        assert_eq!(h.len(), 2);
+        assert!(h.contains("haiku"));
+        assert!(h.contains("gpt-5"));
+    }
+
+    #[test]
+    fn record_hidden_matches_lowercased_model_key() {
+        let hidden = normalize_hidden_models(vec!["Sonnet-4-6".to_string()]);
+        let rec = sample_record("claude", "2026-06-15", 10); // mk = "sonnet-4-6"
+        assert!(record_hidden(&rec, &hidden), "matches case-insensitively");
+
+        let mut other = sample_record("claude", "2026-06-15", 10);
+        other.mk = "opus-4-6".to_string();
+        assert!(!record_hidden(&other, &hidden), "a visible model is not hidden");
+
+        // An empty hidden set never hides anything.
+        assert!(!record_hidden(&rec, &normalize_hidden_models(vec![])));
+    }
+
+    #[test]
+    fn detect_import_origin_reads_jsonl_and_snapshot_headers() {
+        // JSONL header carries device_id + device.
+        let jsonl = r#"{"format":"tokenmonitor-usage-export-jsonl","format_version":1,"device":"Peer (macOS)","device_id":"peer-abcd1234"}
+{"source_key":"local:claude","device":"Peer (macOS)","provider":"claude","record":{"d":"2026-06-15","h":10,"mk":"x","mn":"X","in":1,"out":1,"c5":0,"c1":0,"cr":0,"ws":0,"cost":0.0}}"#;
+        let (id, dev) = detect_import_origin(jsonl);
+        assert_eq!(id, "peer-abcd1234");
+        assert_eq!(dev, "Peer (macOS)");
+
+        // Snapshot doc carries top-level device + device_id.
+        let snap = r#"{"format":"tokenmonitor-usage-export","format_version":1,"device":"Snap (Linux)","device_id":"snap-9999","sources":[]}"#;
+        let (id, dev) = detect_import_origin(snap);
+        assert_eq!(id, "snap-9999");
+        assert_eq!(dev, "Snap (Linux)");
+
+        // Header-less / empty → unknown origin (import stays verbatim).
+        assert_eq!(detect_import_origin("   \n"), (String::new(), String::new()));
     }
 
     #[test]
