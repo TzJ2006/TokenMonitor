@@ -447,6 +447,13 @@ pub(crate) async fn build_included_devices_payload(
     let mut output_tokens = 0_u64;
 
     for dev in &agg_devices {
+        // Only devices flagged "include in stats" contribute to the MAIN total.
+        // This is the payload merged into the dashboard total; a device the user
+        // excluded (or that is double-counted elsewhere) must not inflate it.
+        // The per-device breakdown still lists excluded devices separately.
+        if !dev.include_in_stats {
+            continue;
+        }
         let source_key = format!("device:{}", dev.alias);
         let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
 
@@ -692,6 +699,11 @@ pub(crate) async fn build_device_time_chart_buckets(
         let cache_mgr = state.ssh_cache.read().await;
         let mgr = cache_mgr.as_ref();
         for dev in &agg_devices {
+            // Mirror the total: only devices included in stats contribute to the
+            // device cost chart, so the chart matches the headline total.
+            if !dev.include_in_stats {
+                continue;
+            }
             let source_key = format!("device:{}", dev.alias);
             let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
 

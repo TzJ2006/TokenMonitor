@@ -351,7 +351,7 @@
     ioError = false;
     ioMessage = null;
     try {
-      const result = await exportUsageData(path);
+      const result = await exportUsageData(path, current.hiddenModels);
       ioMessage = formatExportSummary(result);
     } catch (e) {
       ioError = true;
@@ -402,7 +402,13 @@
 
   async function pushAutoExportConfig(enabled: boolean, folder: string | null) {
     try {
-      await invoke("set_auto_export_config", { enabled, folder });
+      // Forward the current hidden-models set so the auto-export mirror filters
+      // the same models the dashboard hides.
+      await invoke("set_auto_export_config", {
+        enabled,
+        folder,
+        hiddenModels: current.hiddenModels,
+      });
     } catch (e) {
       logger.debug("settings", `set_auto_export_config failed: ${e}`);
     }
@@ -796,7 +802,7 @@
           onchange={onImportFileSelected}
         />
         <div class="row auto-export-row">
-          <span class="label">Auto Export</span>
+          <span class="label">Auto Sync</span>
           <div class="auto-export-right">
             <button
               class="cache-btn auto-export-folder"

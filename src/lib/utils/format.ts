@@ -253,6 +253,59 @@ export function deviceColor(alias: string): string {
   return DEVICE_COLOR_PALETTE[idx];
 }
 
+// ── Device display names ──
+// A device's raw name (`DeviceSummary.device` / a chart segment's device key)
+// doubles as its identity — used for color, selection, sync, and IPC — so it is
+// never mutated. These helpers derive a friendlier *display* string only:
+//   • drop a trailing OS-style parenthetical, e.g. "My Mac (macOS)" → "My Mac"
+//   • turn "-" into spaces, e.g. "AWS-RustDesk" → "AWS RustDesk"
+// When two distinct devices would collapse to the same display string, the
+// parenthetical is kept on both so they stay distinguishable.
+
+const DEVICE_TRAILING_PARENS = /\s*\(([^()]*)\)\s*$/;
+
+function deviceNameBase(raw: string): string {
+  const withoutParens = raw.replace(DEVICE_TRAILING_PARENS, "");
+  const spaced = withoutParens.replace(/-/g, " ").replace(/\s+/g, " ").trim();
+  return spaced || raw.trim();
+}
+
+function deviceNameParen(raw: string): string | null {
+  const inner = raw.match(DEVICE_TRAILING_PARENS)?.[1]?.trim();
+  return inner ? inner : null;
+}
+
+/** Friendly display form of a single device name (no collision awareness). */
+export function formatDeviceName(raw: string): string {
+  return deviceNameBase(raw);
+}
+
+/**
+ * Map each raw device name to its display name. When several distinct raw names
+ * share the same base form, the parenthetical (e.g. the OS) is kept so the
+ * collided devices stay distinguishable; a collided name with no parenthetical
+ * falls back to its raw form.
+ */
+export function deviceDisplayNames(rawNames: Iterable<string>): Map<string, string> {
+  const names = Array.from(new Set(rawNames));
+  const baseCounts = new Map<string, number>();
+  for (const raw of names) {
+    const base = deviceNameBase(raw);
+    baseCounts.set(base, (baseCounts.get(base) ?? 0) + 1);
+  }
+  const out = new Map<string, string>();
+  for (const raw of names) {
+    const base = deviceNameBase(raw);
+    if ((baseCounts.get(base) ?? 0) > 1) {
+      const paren = deviceNameParen(raw);
+      out.set(raw, paren ? `${base} (${paren})` : raw);
+    } else {
+      out.set(raw, base);
+    }
+  }
+  return out;
+}
+
 // ── Model colors ──
 
 export function modelColor(key: string): string {
