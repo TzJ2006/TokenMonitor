@@ -8,6 +8,8 @@ import {
   formatTokens,
   formatTimeAgo,
   modelColor,
+  formatDeviceName,
+  deviceDisplayNames,
 } from "./format.js";
 
 beforeEach(() => {
@@ -203,5 +205,49 @@ describe("modelColor", () => {
 
   it("returns a hashed fallback for unrecognized keys", () => {
     expect(modelColor("nonexistent")).toMatch(/^hsl\(/);
+  });
+});
+
+// ── device display names ───────────────────────────────────────────────
+
+describe("formatDeviceName", () => {
+  it("replaces dashes with spaces", () => {
+    expect(formatDeviceName("AWS-RustDesk")).toBe("AWS RustDesk");
+  });
+
+  it("strips a trailing OS parenthetical", () => {
+    expect(formatDeviceName("thomas-Linux-Desktop (Linux)")).toBe("thomas Linux Desktop");
+  });
+
+  it("leaves a plain name unchanged", () => {
+    expect(formatDeviceName("tianhe")).toBe("tianhe");
+    expect(formatDeviceName("Local")).toBe("Local");
+  });
+});
+
+describe("deviceDisplayNames", () => {
+  it("maps each name to its base form when there is no collision", () => {
+    const m = deviceDisplayNames(["AWS-RustDesk", "tianhe", "Local"]);
+    expect(m.get("AWS-RustDesk")).toBe("AWS RustDesk");
+    expect(m.get("tianhe")).toBe("tianhe");
+    expect(m.get("Local")).toBe("Local");
+  });
+
+  it("keeps the parenthetical when two names collide on the base", () => {
+    const m = deviceDisplayNames(["Desktop (Linux)", "Desktop (Windows)"]);
+    expect(m.get("Desktop (Linux)")).toBe("Desktop (Linux)");
+    expect(m.get("Desktop (Windows)")).toBe("Desktop (Windows)");
+  });
+
+  it("drops the parenthetical when names do not collide", () => {
+    const m = deviceDisplayNames(["Desktop (Linux)", "Laptop (Windows)"]);
+    expect(m.get("Desktop (Linux)")).toBe("Desktop");
+    expect(m.get("Laptop (Windows)")).toBe("Laptop");
+  });
+
+  it("falls back to the raw name for paren-less collisions", () => {
+    const m = deviceDisplayNames(["foo-bar", "foo bar"]);
+    expect(m.get("foo-bar")).toBe("foo-bar");
+    expect(m.get("foo bar")).toBe("foo bar");
   });
 });

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { formatCost, formatModelCost, formatTimeAgo, deviceColor } from "../utils/format.js";
+  import { formatCost, formatModelCost, formatTimeAgo, deviceColor, deviceDisplayNames } from "../utils/format.js";
   import { activePeriod, activeOffset, activeProvider } from "../stores/usage.js";
   import type { DeviceUsagePayload, DeviceSummary } from "../types/index.js";
 
@@ -85,6 +85,9 @@
     sortedDevices.filter((d) => !d.is_local),
   );
 
+  // Display names (raw `device` stays the identity used for color/selection/sync).
+  let deviceNames = $derived(deviceDisplayNames(sortedDevices.map((d) => d.device)));
+
   async function syncAll() {
     if (syncing || remoteDevices.length === 0) return;
     syncing = true;
@@ -161,7 +164,7 @@
                 style:background={STATUS_COLORS[device.status] ?? "#6b7280"}
                 title={device.status}
               ></span>
-              <span class="device-name">{device.device}</span>
+              <span class="device-name">{deviceNames.get(device.device) ?? device.device}</span>
               {#if device.is_local}
                 <span class="local-badge">This device</span>
               {/if}

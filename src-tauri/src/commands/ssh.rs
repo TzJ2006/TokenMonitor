@@ -41,6 +41,18 @@ fn usage_access_enabled(state: &AppState) -> bool {
     state.usage_access_enabled.load(Ordering::SeqCst)
 }
 
+/// Invalidate the cached usage-view payloads (in-memory + disk) so the next
+/// `get_usage_data` recomputes with the current device set. The enabled /
+/// include-in-stats flags only change a total on a cache MISS, so a config
+/// mutation that doesn't clear these caches leaves the displayed cost frozen
+/// until the 120s TTL lapses. Mirrors `sync_ssh_host`'s cache clear.
+async fn invalidate_usage_view_cache(state: &AppState) {
+    state.parser.clear_payload_cache_prefix("usage-view:");
+    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+        disk_cache.clear_prefix("usage-view:");
+    }
+}
+
 /// Get all SSH hosts discovered from ~/.ssh/config.
 #[tauri::command]
 pub async fn get_ssh_hosts() -> Result<Vec<SshHostInfo>, String> {
@@ -67,26 +79,33 @@ pub async fn get_ssh_host_statuses(
 pub async fn add_ssh_host(alias: String, state: State<'_, AppState>) -> Result<(), String> {
     validate_ssh_alias(&alias)?;
 
-    let mut configs = state.ssh_hosts.write().await;
+    {
+        let mut configs = state.ssh_hosts.write().await;
 
-    if configs.iter().any(|c| c.alias == alias) {
-        return Err(format!("Host '{alias}' is already configured"));
+        if configs.iter().any(|c| c.alias == alias) {
+            return Err(format!("Host '{alias}' is already configured"));
+        }
+
+        configs.push(SshHostConfig {
+            alias,
+            enabled: true,
+            include_in_stats: true,
+        });
     }
 
-    configs.push(SshHostConfig {
-        alias,
-        enabled: true,
-        include_in_stats: true,
-    });
-
+    // A newly-added host defaults to enabled+included, so it changes totals now.
+    invalidate_usage_view_cache(&state).await;
     Ok(())
 }
 
 /// Remove an SSH host from the monitored list.
 #[tauri::command]
 pub async fn remove_ssh_host(alias: String, state: State<'_, AppState>) -> Result<(), String> {
-    let mut configs = state.ssh_hosts.write().await;
-    configs.retain(|c| c.alias != alias);
+    {
+        let mut configs = state.ssh_hosts.write().await;
+        configs.retain(|c| c.alias != alias);
+    }
+    invalidate_usage_view_cache(&state).await;
     Ok(())
 }
 
@@ -97,12 +116,17 @@ pub async fn toggle_ssh_host(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut configs = state.ssh_hosts.write().await;
-
-    if let Some(cfg) = configs.iter_mut().find(|c| c.alias == alias) {
-        cfg.enabled = enabled;
+    {
+        let mut configs = state.ssh_hosts.write().await;
+        if let Some(cfg) = configs.iter_mut().find(|c| c.alias == alias) {
+            cfg.enabled = enabled;
+        }
     }
 
+    // Enabling/disabling a host adds/removes its cost from the totals; clear the
+    // usage-view caches so the next fetch recomputes instead of re-serving the
+    // pre-toggle total from the 120s in-memory / disk cache.
+    invalidate_usage_view_cache(&state).await;
     Ok(())
 }
 

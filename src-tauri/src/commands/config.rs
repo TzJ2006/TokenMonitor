@@ -563,21 +563,44 @@ pub fn suppress_next_auto_hide(state: State<'_, AppState>) {
 /// observes the new folder and synced=false together.
 #[tauri::command]
 pub async fn set_auto_export_config(
+    app: tauri::AppHandle,
     enabled: bool,
     folder: Option<String>,
+    hidden_models: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let folder_changed = {
+    let hidden =
+        crate::commands::usage_io::normalize_hidden_models(hidden_models.unwrap_or_default());
+    let has_folder = folder.is_some();
+    let needs_rewrite = {
         let mut cfg = state.auto_export.write().await;
-        let changed = cfg.folder != folder;
+        // A folder OR hidden-models change both invalidate the existing mirror:
+        // the folder points the writer at a fresh file, and a hidden-models change
+        // means previously-written rows must be re-filtered (a now-hidden model's
+        // rows dropped, a now-visible model's rows restored). Either way the next
+        // tick must do a full rewrite rather than an incremental append.
+        let changed = cfg.folder != folder || cfg.hidden_models != hidden;
         cfg.enabled = enabled;
         cfg.folder = folder;
+        cfg.hidden_models = hidden;
         changed
     };
-    if folder_changed {
+    if needs_rewrite {
         let mut rt = state.auto_export_runtime.write().await;
         rt.synced = false;
         rt.cursors.clear();
+    }
+
+    // Kick an immediate sync so a freshly-configured folder pulls peers in right
+    // away — e.g. on launch when the frontend pushes this config — instead of
+    // waiting for the next refresh tick. Spawned so the IPC call returns promptly.
+    if has_folder {
+        use tauri::Manager;
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app2.state::<AppState>();
+            crate::commands::usage_io::run_auto_export(&app2, &state).await;
+        });
     }
     Ok(())
 }
@@ -624,9 +647,15 @@ pub async fn reposition_window(app: tauri::AppHandle) -> Result<(), String> {
         {
             crate::platform::windows::window::align_to_work_area(&window);
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         {
             crate::platform::clamp_window_to_work_area(&window);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Re-anchor top-right (drift-gated) rather than merely clamping, so a
+            // WM-driven reposition toward another window doesn't stick.
+            crate::platform::linux::reanchor_top_right_if_drifted(&window);
         }
     }
     Ok(())
@@ -661,7 +690,7 @@ pub async fn set_window_size_and_align(
                 physical_height,
             );
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         {
             use tauri::{LogicalSize, Size};
             // Capture position before resize so we can keep the anchored edge fixed.
@@ -671,7 +700,7 @@ pub async fn set_window_size_and_align(
             let _ = window.set_size(Size::Logical(LogicalSize::new(width, height)));
 
             // For bottom-anchored windows, move upward so the bottom edge stays put.
-            // macOS/Linux keep top-left fixed after set_size, so top-anchored is free.
+            // macOS keeps top-left fixed after set_size, so top-anchored is free.
             if let (Some(pos), Some(old_sz)) = (old_pos, old_size) {
                 let old_bottom = pos.y + old_sz.height as i32;
                 if let Some(monitor) = window.current_monitor().ok().flatten() {
@@ -689,6 +718,18 @@ pub async fn set_window_size_and_align(
                 }
             }
             crate::platform::clamp_window_to_work_area(&window);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use tauri::{LogicalSize, Size};
+            let _ = window.set_size(Size::Logical(LogicalSize::new(width, height)));
+            // The Linux popover is a top-right tray window that is never user-movable.
+            // Unlike macOS, we must NOT preserve the window's current position here:
+            // a WM can drift/re-stack the window toward another window (e.g. a file
+            // manager that just opened), and the old `clamp`-only path would keep it
+            // wherever the WM left it. Re-anchor top-right (drift-gated so it's a
+            // no-op when already in place and doesn't cause jitter).
+            crate::platform::linux::reanchor_top_right_if_drifted(&window);
         }
     }
     Ok(())
