@@ -406,7 +406,13 @@ impl ArchiveManager {
             })
             .collect();
 
-        let mut entries = Vec::with_capacity(128);
+        // Collapse duplicate (date, hour, model_key, provider) lines with
+        // field-wise max before converting, for the same reason as `read_raw`:
+        // re-archived hours can leave duplicate lines on disk that would
+        // otherwise double-count at query time. Synthetic archive entries carry
+        // `unique_hash: None`, so they bypass the parser's entry-hash dedup —
+        // collapsing here is the only thing that protects the aggregate.
+        let mut buckets: HashMap<(String, u8, String, String), ArchivedHourly> = HashMap::new();
         for file_path in relevant_files {
             let file = match fs::File::open(file_path) {
                 Ok(f) => f,
@@ -438,29 +444,46 @@ impl ArchiveManager {
                     continue;
                 }
 
-                // Convert to synthetic ParsedEntry.
-                // Use model_key as model field — normalize_model() recognizes it.
-                let time = NaiveTime::from_hms_opt(record.h as u32, 0, 0).unwrap_or_default();
-                let naive_dt = record_date.and_time(time);
-                let timestamp = Local
-                    .from_local_datetime(&naive_dt)
-                    .single()
-                    .unwrap_or_else(Local::now);
-
-                entries.push(ParsedEntry {
-                    timestamp,
-                    model: record.mk,
-                    input_tokens: record.input_tokens,
-                    output_tokens: record.out,
-                    cache_creation_5m_tokens: record.c5,
-                    cache_creation_1h_tokens: record.c1,
-                    cache_read_tokens: record.cr,
-                    web_search_requests: record.ws,
-                    unique_hash: None,
-                    session_key: format!("archive:{source_key}"),
-                    agent_scope: crate::stats::subagent::AgentScope::Main,
-                });
+                match buckets.get_mut(&record.bucket_key()) {
+                    Some(existing) => {
+                        existing.merge_max_from(&record);
+                    }
+                    None => {
+                        buckets.insert(record.bucket_key(), record);
+                    }
+                }
             }
+        }
+
+        let mut entries = Vec::with_capacity(buckets.len());
+        for record in buckets.into_values() {
+            let record_date = match NaiveDate::parse_from_str(&record.d, "%Y-%m-%d") {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            // Convert to synthetic ParsedEntry.
+            // Use model_key as model field — normalize_model() recognizes it.
+            let time = NaiveTime::from_hms_opt(record.h as u32, 0, 0).unwrap_or_default();
+            let naive_dt = record_date.and_time(time);
+            let timestamp = Local
+                .from_local_datetime(&naive_dt)
+                .single()
+                .unwrap_or_else(Local::now);
+
+            entries.push(ParsedEntry {
+                timestamp,
+                model: record.mk,
+                input_tokens: record.input_tokens,
+                output_tokens: record.out,
+                cache_creation_5m_tokens: record.c5,
+                cache_creation_1h_tokens: record.c1,
+                cache_read_tokens: record.cr,
+                web_search_requests: record.ws,
+                unique_hash: None,
+                session_key: format!("archive:{source_key}"),
+                agent_scope: crate::stats::subagent::AgentScope::Main,
+            });
         }
 
         entries
@@ -507,10 +530,17 @@ impl ArchiveManager {
     /// and as the existing-data side of an import merge.
     pub fn read_raw(&self, source_key: &str) -> Vec<ArchivedHourly> {
         let source_dir = self.source_dir(source_key);
-        let mut records = Vec::new();
+        // Collapse duplicate (date, hour, model_key, provider) lines as we read.
+        // Duplicate lines for the same bucket can accumulate when a completed
+        // hour is re-archived (the append-based `archive_completed_hours` runs
+        // again after a frontier reset/loss, or two passes race). Merging with
+        // field-wise MAX is the same idempotent dedup `import_source` uses, so a
+        // re-archived hour collapses to a no-op instead of double-counting in
+        // every downstream consumer (export, device summaries, query merge).
+        let mut buckets: HashMap<(String, u8, String, String), ArchivedHourly> = HashMap::new();
         let read = match fs::read_dir(&source_dir) {
             Ok(rd) => rd,
-            Err(_) => return records,
+            Err(_) => return Vec::new(),
         };
         for entry in read.flatten() {
             let path = entry.path();
@@ -527,7 +557,14 @@ impl ArchiveManager {
                     _ => continue,
                 };
                 match serde_json::from_str::<ArchivedHourly>(&line) {
-                    Ok(r) => records.push(r),
+                    Ok(r) => match buckets.get_mut(&r.bucket_key()) {
+                        Some(existing) => {
+                            existing.merge_max_from(&r);
+                        }
+                        None => {
+                            buckets.insert(r.bucket_key(), r);
+                        }
+                    },
                     Err(e) => tracing::warn!(
                         "Skipping malformed archive record in {}: {e}",
                         path.display()
@@ -535,6 +572,9 @@ impl ArchiveManager {
                 }
             }
         }
+        // Deterministic order (date, hour, model_key, provider) for stable exports.
+        let mut records: Vec<ArchivedHourly> = buckets.into_values().collect();
+        records.sort_by(|a, b| (&a.d, a.h, &a.mk, &a.p).cmp(&(&b.d, b.h, &b.mk, &b.p)));
         records
     }
 
@@ -667,6 +707,89 @@ impl ArchiveManager {
             state.set_frontier(source_key, frontier);
             self.save_state(&state);
         }
+    }
+
+    /// Permanently remove a source: delete its archive directory and drop its
+    /// frontier state. Used to clean up a PHANTOM `device:<slug>` source — this
+    /// machine's own data that an older build duplicated under a stale device
+    /// slug after a computer rename / transient hostname-lookup failure. The
+    /// real history still lives under the `local:*` sources, so this deletes a
+    /// duplicate device entry, not genuine data.
+    pub fn remove_source(&self, source_key: &str) {
+        let dir = self.source_dir(source_key);
+        if dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&dir) {
+                tracing::warn!("Failed to remove archive source {source_key}: {e}");
+                return;
+            }
+        }
+        let mut state = self.load_state();
+        if state.sources.remove(source_key).is_some() {
+            self.save_state(&state);
+        }
+    }
+
+    /// Remove PHANTOM device sources: archive-only `device:<slug>` sources whose
+    /// every bucket EXACTLY matches a bucket in this machine's own `local:*`
+    /// archive. Such a source is this machine's own data that an older build
+    /// re-imported from its OWN export file under a drifted device slug (a
+    /// computer rename / transient hostname-lookup failure), so it double-counts
+    /// in the total. This is the cleanup half of the duplicate-device fix for
+    /// data created BEFORE the slug was frozen.
+    ///
+    /// Safety: matching is EXACT (all six token fields equal) on the shared
+    /// bucket identity `(date, hour, model_key, provider)`. A phantom holds only
+    /// completed-hour aggregates copied verbatim from our local archive, so it
+    /// matches exactly; a genuine SSH device archives under `p = "all"` (never in
+    /// local) and a genuine peer carries a different machine's token counts, so
+    /// neither is ever fully subsumed. `configured` SSH-host aliases are skipped
+    /// outright as a second guard. Returns the removed source keys.
+    pub fn remove_self_duplicate_devices(&self, configured: &HashSet<String>) -> Vec<String> {
+        // Index this machine's own local buckets (claude + codex + cursor).
+        let mut local: HashMap<(String, u8, String, String), ArchivedHourly> = HashMap::new();
+        for provider in ["claude", "codex", "cursor"] {
+            for r in self.read_raw(&format!("local:{provider}")) {
+                local.entry(r.bucket_key()).or_insert(r);
+            }
+        }
+        if local.is_empty() {
+            return Vec::new();
+        }
+
+        let mut removed = Vec::new();
+        for source_key in self.list_sources() {
+            let Some(alias) = source_key.strip_prefix("device:") else {
+                continue;
+            };
+            // Never touch a device we actively sync over SSH.
+            if configured.contains(alias) {
+                continue;
+            }
+            let records = self.read_raw(&source_key);
+            if records.is_empty() {
+                continue;
+            }
+            let subsumed = records.iter().all(|r| match local.get(&r.bucket_key()) {
+                Some(l) => {
+                    l.input_tokens == r.input_tokens
+                        && l.out == r.out
+                        && l.c5 == r.c5
+                        && l.c1 == r.c1
+                        && l.cr == r.cr
+                        && l.ws == r.ws
+                }
+                None => false,
+            });
+            if subsumed {
+                tracing::info!(
+                    source = source_key.as_str(),
+                    "Removing self-duplicate device (data exactly matches local archive)"
+                );
+                self.remove_source(&source_key);
+                removed.push(source_key);
+            }
+        }
+        removed
     }
 
     fn source_dir(&self, source_key: &str) -> PathBuf {
@@ -1058,6 +1181,140 @@ mod tests {
             .frontier("local:claude")
             .expect("frontier set for completed hour");
         assert_eq!(f.hour, 12);
+    }
+
+    #[test]
+    fn read_raw_collapses_duplicate_buckets() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        let dir = mgr.source_dir("local:claude");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Two lines for the SAME (date,hour,model,provider) bucket — the shape a
+        // re-archive after a frontier reset leaves on disk.
+        let a = arch("2026-04-10", 9, "sonnet-4-6", 1000, 500);
+        let mut b = arch("2026-04-10", 9, "sonnet-4-6", 1500, 400);
+        b.c5 = 50;
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
+        fs::write(dir.join("2026-04.jsonl"), body).unwrap();
+
+        // read_raw collapses to one bucket with field-wise max — no double count.
+        let raw = mgr.read_raw("local:claude");
+        assert_eq!(raw.len(), 1, "duplicate lines collapse to one bucket");
+        assert_eq!(raw[0].input_tokens, 1500);
+        assert_eq!(raw[0].out, 500);
+        assert_eq!(raw[0].c5, 50);
+
+        // load_archived collapses too — one synthetic entry, not two.
+        let loaded = mgr.load_archived("local:claude", None);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].input_tokens, 1500);
+        assert_eq!(loaded[0].output_tokens, 500);
+    }
+
+    #[test]
+    fn read_raw_keeps_distinct_buckets_separate() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        let dir = mgr.source_dir("local:claude");
+        fs::create_dir_all(&dir).unwrap();
+        // Distinct hour + distinct model → must NOT be merged.
+        let body = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&arch("2026-04-10", 9, "sonnet-4-6", 100, 50)).unwrap(),
+            serde_json::to_string(&arch("2026-04-10", 10, "sonnet-4-6", 100, 50)).unwrap(),
+            serde_json::to_string(&arch("2026-04-10", 9, "opus-4-6", 100, 50)).unwrap(),
+        );
+        fs::write(dir.join("2026-04.jsonl"), body).unwrap();
+        assert_eq!(mgr.read_raw("local:claude").len(), 3);
+    }
+
+    #[test]
+    fn remove_source_deletes_dir_and_frontier() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        mgr.import_source(
+            "device:phantom-abcd1234",
+            &[arch("2026-04-10", 9, "sonnet-4-6", 10, 5)],
+            future_date(),
+            0,
+        );
+        assert!(mgr
+            .list_sources()
+            .contains(&"device:phantom-abcd1234".to_string()));
+        assert!(mgr.frontier("device:phantom-abcd1234").is_some());
+
+        mgr.remove_source("device:phantom-abcd1234");
+        assert!(!mgr
+            .list_sources()
+            .contains(&"device:phantom-abcd1234".to_string()));
+        assert!(mgr.frontier("device:phantom-abcd1234").is_none());
+    }
+
+    #[test]
+    fn removes_self_duplicate_device_but_keeps_peers_and_configured() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        let fd = future_date();
+
+        // This machine's own local data.
+        mgr.import_source(
+            "local:claude",
+            &[arch("2026-04-10", 9, "sonnet-4-6", 1000, 500)],
+            fd,
+            0,
+        );
+        // A phantom: our own data re-imported under a drifted slug (EXACT match).
+        mgr.import_source(
+            "device:thismac-aaaa1111",
+            &[arch("2026-04-10", 9, "sonnet-4-6", 1000, 500)],
+            fd,
+            0,
+        );
+        // A genuine peer with DIFFERENT numbers → must be kept.
+        mgr.import_source(
+            "device:peer-bbbb2222",
+            &[arch("2026-04-10", 9, "sonnet-4-6", 7777, 3333)],
+            fd,
+            0,
+        );
+        // A configured SSH device whose data happens to equal local → kept (guard
+        // + it's archived as p="all" so it wouldn't match anyway).
+        let mut ssh = arch("2026-04-10", 9, "sonnet-4-6", 1000, 500);
+        ssh.p = "all".to_string();
+        mgr.import_source("device:myserver", &[ssh], fd, 0);
+
+        let configured: HashSet<String> = ["myserver".to_string()].into_iter().collect();
+        let removed = mgr.remove_self_duplicate_devices(&configured);
+
+        assert_eq!(removed, vec!["device:thismac-aaaa1111".to_string()]);
+        let sources = mgr.list_sources();
+        assert!(!sources.contains(&"device:thismac-aaaa1111".to_string()));
+        assert!(sources.contains(&"device:peer-bbbb2222".to_string()));
+        assert!(sources.contains(&"device:myserver".to_string()));
+        assert!(sources.contains(&"local:claude".to_string()));
+    }
+
+    #[test]
+    fn self_duplicate_cleanup_noop_without_local_data() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        // No local:* data → never remove anything (can't prove a device is ours).
+        mgr.import_source(
+            "device:peer-cccc3333",
+            &[arch("2026-04-10", 9, "sonnet-4-6", 1000, 500)],
+            future_date(),
+            0,
+        );
+        let removed = mgr.remove_self_duplicate_devices(&HashSet::new());
+        assert!(removed.is_empty());
+        assert!(mgr
+            .list_sources()
+            .contains(&"device:peer-cccc3333".to_string()));
     }
 
     #[test]

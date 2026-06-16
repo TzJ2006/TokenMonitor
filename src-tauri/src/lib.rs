@@ -631,6 +631,12 @@ async fn background_loop(app: tauri::AppHandle) {
         });
     }
 
+    // One-shot on launch: purge any phantom self-duplicate device sources left by
+    // older builds (the same machine counted under several drifted slugs). The
+    // local archive persists across sessions, so this works even before the first
+    // archive flush of this session.
+    cleanup_self_duplicate_devices(&state).await;
+
     let mut update_counter: u64 = 0;
     let mut ssh_sync_counter: u64 = 0;
     let mut rate_limit_counter: u64 = 0;
@@ -902,6 +908,34 @@ pub(crate) async fn archive_ssh_device_usage(state: &AppState) {
                 records = count,
                 "Archived {count} hourly aggregate records for device {alias}"
             );
+        }
+    }
+}
+
+/// Remove phantom self-duplicate device sources — this machine's own data that an
+/// older build re-imported from its own export file under a drifted device slug
+/// (a computer rename / transient hostname-lookup failure). These inflate the
+/// dashboard total by counting the machine's usage once as `local` and again as
+/// one or more `device:<slug>` entries. Safe + idempotent (a no-op once cleaned);
+/// invalidates the usage-view caches when it actually removes something.
+pub(crate) async fn cleanup_self_duplicate_devices(state: &AppState) {
+    let Some(archive) = state.parser.archive() else {
+        return;
+    };
+    let configured: std::collections::HashSet<String> = {
+        let hosts = state.ssh_hosts.read().await;
+        hosts.iter().map(|h| h.alias.clone()).collect()
+    };
+    let removed = archive.remove_self_duplicate_devices(&configured);
+    if !removed.is_empty() {
+        tracing::info!(
+            count = removed.len(),
+            "Removed {} self-duplicate device source(s) from the archive",
+            removed.len()
+        );
+        state.parser.clear_payload_cache();
+        if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+            disk_cache.clear_prefix("usage-view:");
         }
     }
 }
