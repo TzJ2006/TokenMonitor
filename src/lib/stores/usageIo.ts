@@ -24,9 +24,29 @@ export type ImportResult = {
   skipped: number;
 };
 
-/** Write the usage archive to a JSON file at the caller-chosen `path`. */
-export async function exportUsageData(path: string): Promise<ExportResult> {
-  return invoke<ExportResult>("export_usage_data", { path });
+/**
+ * Write the usage archive to a JSON file at the caller-chosen `path`.
+ * `hiddenModels` (the UI's hidden-models setting) is forwarded so the export
+ * excludes models hidden in the dashboard — export visibility == UI visibility.
+ */
+export async function exportUsageData(
+  path: string,
+  hiddenModels: string[] = [],
+): Promise<ExportResult> {
+  return invoke<ExportResult>("export_usage_data", { path, hiddenModels });
+}
+
+/**
+ * Push the background auto-export config to the backend. `hiddenModels` is
+ * included so the rolling mirror filters the same models the dashboard hides;
+ * changing it forces a full rewrite backend-side.
+ */
+export async function setAutoExportConfig(
+  enabled: boolean,
+  folder: string | null,
+  hiddenModels: string[] = [],
+): Promise<void> {
+  await invoke("set_auto_export_config", { enabled, folder, hiddenModels });
 }
 
 /** Merge a previously exported JSON document into the archive (dedup on import). */

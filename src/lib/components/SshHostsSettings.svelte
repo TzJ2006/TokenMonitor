@@ -1,8 +1,15 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
   import { invoke } from "@tauri-apps/api/core";
   import { settings, updateSetting, type Settings as SettingsType } from "../stores/settings.js";
-  import { clearUsageCache } from "../stores/usage.js";
+  import {
+    clearUsageCache,
+    fetchData,
+    activeProvider,
+    activePeriod,
+    activeOffset,
+  } from "../stores/usage.js";
   import { logger } from "../utils/logger.js";
   import ToggleSwitch from "./ToggleSwitch.svelte";
   import type { SshHostInfo, SshSyncResult, SshTestResult as SshTestResultType } from "../types/index.js";
@@ -87,7 +94,12 @@
         );
       }
       persistSshHosts(sshConfiguredHosts);
+      // The backend toggle already invalidated the Rust usage-view caches; drop
+      // the frontend payload cache (and bump the request id) then refetch the
+      // active view so the recomputed total appears immediately instead of after
+      // the next background refresh.
       clearUsageCache();
+      await fetchData(get(activeProvider), get(activePeriod), get(activeOffset));
     } catch (e) {
       console.error("Failed to toggle SSH host:", e);
     }
