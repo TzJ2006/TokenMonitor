@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { settings, updateSetting, type Settings as SettingsType } from "../stores/settings.js";
+  import { setAutoExportConfig } from "../stores/usageIo.js";
   import { modelColor } from "../utils/format.js";
   import type { KnownModel } from "../types/index.js";
   import ToggleSwitch from "./ToggleSwitch.svelte";
@@ -34,6 +35,12 @@
       ? current.hiddenModels.filter((m) => m !== key)
       : [...current.hiddenModels, key];
     updateSetting("hiddenModels", hidden);
+    // Keep the background auto-export mirror aligned with model visibility: the
+    // backend re-filters on the next tick (dropping now-hidden rows / restoring
+    // now-visible ones). No-op when auto-export is disabled.
+    if (current.autoExportEnabled) {
+      void setAutoExportConfig(current.autoExportEnabled, current.autoExportFolder, hidden);
+    }
   }
 </script>
 
