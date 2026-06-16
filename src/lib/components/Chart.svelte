@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { modelColor, formatCost, formatModelCost, currencySymbol, convertCost, deviceColor } from "../utils/format.js";
+  import { modelColor, formatCost, formatModelCost, currencySymbol, convertCost, deviceColor, deviceDisplayNames } from "../utils/format.js";
   import { settings } from "../stores/settings.js";
   import { activeOffset, activePeriod, chartMode, chartSegmentMode } from "../stores/usage.js";
   import { logger } from "../utils/logger.js";
@@ -162,6 +162,20 @@
     };
   });
 
+  // In device-segment mode, map raw device keys → friendly display names
+  // (collision-aware). Null in model mode so model names render unchanged.
+  let deviceNameMap = $derived.by(() => {
+    if ($chartSegmentMode !== "device") return null;
+    const keys = new Set<string>();
+    for (const b of visibleBuckets) {
+      for (const s of b.segments) keys.add(s.model_key);
+    }
+    return deviceDisplayNames(keys);
+  });
+  function segDisplayName(modelKey: string, modelName: string): string {
+    return deviceNameMap ? (deviceNameMap.get(modelKey) ?? modelName) : modelName;
+  }
+
   let legendModels = $derived(() => {
     const agg = new Map<string, { key: string; name: string; cost: number }>();
     for (const b of visibleBuckets) {
@@ -170,7 +184,7 @@
         if (existing) {
           existing.cost += s.cost;
         } else {
-          agg.set(s.model_key, { key: s.model_key, name: s.model, cost: s.cost });
+          agg.set(s.model_key, { key: s.model_key, name: segDisplayName(s.model_key, s.model), cost: s.cost });
         }
       }
     }
@@ -233,7 +247,7 @@
           existing.cost += s.cost;
           existing.tokens += s.tokens;
         } else {
-          merged.set(s.model_key, { key: s.model_key, name: s.model, cost: s.cost, tokens: s.tokens });
+          merged.set(s.model_key, { key: s.model_key, name: segDisplayName(s.model_key, s.model), cost: s.cost, tokens: s.tokens });
         }
       }
     }
@@ -448,7 +462,7 @@
             {#each segs as seg}
               <div class="detail-row">
                 <span class="detail-dot" style="background:{segmentColorFn(seg.model_key)}"></span>
-                <span class="detail-name">{seg.model}</span>
+                <span class="detail-name">{segDisplayName(seg.model_key, seg.model)}</span>
                 <span class="detail-cost">{formatModelCost(seg.cost, seg.pricing_available)}</span>
               </div>
             {/each}
