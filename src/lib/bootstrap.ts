@@ -131,6 +131,7 @@ export async function initializeRuntimeFromSettings(
     invokeFn("set_auto_export_config", {
       enabled: saved.autoExportEnabled,
       folder: saved.autoExportFolder,
+      hiddenModels: saved.hiddenModels,
     }),
     invokeFn("set_cursor_auth_config", {
       apiKey: saved.cursorApiKey,

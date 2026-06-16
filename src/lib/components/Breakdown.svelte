@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { modelColor, formatCost, formatModelCost, formatTokens, deviceColor } from "../utils/format.js";
+  import { modelColor, formatCost, formatModelCost, formatTokens, deviceColor, deviceDisplayNames } from "../utils/format.js";
   import { settings } from "../stores/settings.js";
   import { logger } from "../utils/logger.js";
   import type { AccordionToggleDetail, DeviceSummary, ModelSummary, SubagentStats } from "../types/index.js";
@@ -41,6 +41,9 @@
         })
       : []
   );
+
+  // Display names (raw `device` stays the identity used for color/selection/toggle).
+  let deviceNames = $derived(deviceDisplayNames(sortedDevices.map((d) => d.device)));
 
   let visibleDevices = $derived(sortedDevices.slice(0, MAX_VISIBLE_DEVICES));
   let hasMoreDevices = $derived(sortedDevices.length > MAX_VISIBLE_DEVICES);
@@ -215,7 +218,7 @@
             <span class="device-color-bar" style="background:{deviceColor(device.device)}"></span>
             <button class="device-info" type="button" onclick={() => onDeviceSelect?.(device.device)}>
               <span class="device-name-row">
-                <span class="device-name">{device.device}</span>
+                <span class="device-name">{deviceNames.get(device.device) ?? device.device}</span>
                 {#if device.is_local}
                   <span class="device-badge">This device</span>
                 {/if}
