@@ -7,7 +7,8 @@ use crate::models::{ChartBucket, ChartSegment, DeviceUsagePayload};
 use crate::usage::device_aggregation::{
     bucket_key_for_timestamp, bucket_label_for_key, build_device_chart_buckets,
     build_device_summary_from_parsed, build_device_summary_merged, compact_record_matches_provider,
-    enrich_cost_percentages, parse_remote_ts, provider_includes_remote_ssh_usage,
+    enrich_cost_percentages, enumerate_agg_devices, parse_remote_ts,
+    provider_includes_remote_ssh_usage,
 };
 use crate::usage::integrations::UsageIntegrationSelection;
 use crate::usage::ssh_config::{discover_ssh_hosts, SshHostInfo};
@@ -283,64 +284,77 @@ pub async fn get_device_usage(
     let archive = parser.archive();
 
     if include_remote {
-        if let Some(mgr) = cache_mgr.as_ref() {
-            let statuses = mgr.host_statuses(&configs);
-            for cfg in configs.iter().filter(|c| c.enabled) {
-                let source_key = format!("device:{}", cfg.alias);
-                let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
+        // Devices = enabled SSH hosts ∪ archive (file-imported / auto-synced
+        // peer) devices — the SAME enumeration as the Usage-page Per-Device
+        // breakdown. Without the archive set, a peer that has no live SSH
+        // connection (imported from another machine's export) never appeared on
+        // this page even though it shows in the breakdown.
+        let mgr = cache_mgr.as_ref();
+        let agg_devices = enumerate_agg_devices(&configs, archive.as_ref());
+        let statuses = mgr.map(|m| m.host_statuses(&configs)).unwrap_or_default();
+        for dev in &agg_devices {
+            let source_key = format!("device:{}", dev.alias);
+            let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
 
-                // Load archived entries for this device (completed hours),
-                // filtered to the selected provider's model family.
-                let archived_entries: Vec<_> = archive
-                    .as_ref()
-                    .map(|a| a.load_archived(&source_key, Some(since)))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|e| {
-                        crate::usage::integrations::provider_matches_model(&provider, &e.model)
-                    })
-                    .collect();
+            // Load archived entries for this device (completed hours),
+            // filtered to the selected provider's model family.
+            let archived_entries: Vec<_> = archive
+                .as_ref()
+                .map(|a| a.load_archived(&source_key, Some(since)))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| {
+                    crate::usage::integrations::provider_matches_model(&provider, &e.model)
+                })
+                .collect();
 
-                // Load live compact records from remote-cache.
-                let records = match mgr.load_cached_records(&cfg.alias) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("Failed to load cached records for {}: {e}", cfg.alias);
+            // Live compact rows only for configured SSH hosts; file-imported
+            // peers have no SSH cache and contribute from archived data alone.
+            let records: Vec<CompactUsageRecord> = if dev.configured {
+                match mgr {
+                    Some(m) => m.load_cached_records(&dev.alias).unwrap_or_else(|e| {
+                        tracing::warn!("Failed to load cached records for {}: {e}", dev.alias);
                         Vec::new()
-                    }
-                };
+                    }),
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
 
-                // Filter live records:
-                //  • drop model families outside the active provider tab
-                //  • drop hours already covered by the archive frontier
-                let live_records: Vec<&CompactUsageRecord> = records
-                    .iter()
-                    .filter(|r| compact_record_matches_provider(r, &provider))
-                    .filter(|r| {
-                        if let Some(ref f) = frontier {
-                            let dt =
-                                parse_remote_ts(&r.ts).map(|d| d.with_timezone(&chrono::Local));
-                            match dt {
-                                Some(local) => !f.covers(local.date_naive(), local.hour() as u8),
-                                None => true, // Can't parse → include as live.
-                            }
-                        } else {
-                            true
+            // Filter live records:
+            //  • drop model families outside the active provider tab
+            //  • drop hours already covered by the archive frontier
+            let live_records: Vec<&CompactUsageRecord> = records
+                .iter()
+                .filter(|r| compact_record_matches_provider(r, &provider))
+                .filter(|r| {
+                    if let Some(ref f) = frontier {
+                        let dt = parse_remote_ts(&r.ts).map(|d| d.with_timezone(&chrono::Local));
+                        match dt {
+                            Some(local) => !f.covers(local.date_naive(), local.hour() as u8),
+                            None => true, // Can't parse → include as live.
                         }
-                    })
-                    .collect();
+                    } else {
+                        true
+                    }
+                })
+                .collect();
 
-                // Build summary: archived entries + live compact records.
-                let mut summary = build_device_summary_merged(
-                    &cfg.alias,
-                    &archived_entries,
-                    &live_records,
-                    since,
-                    end,
-                );
+            // An archive-only peer with no data for the active provider would be
+            // an empty row — skip it (provider scoping). Configured SSH hosts
+            // always show, even with no data, so their status stays visible.
+            if !dev.configured && archived_entries.is_empty() && live_records.is_empty() {
+                continue;
+            }
 
-                // Enrich with status from cache manager.
-                if let Some(host_status) = statuses.iter().find(|s| s.alias == cfg.alias) {
+            // Build summary: archived entries + live compact records.
+            let mut summary =
+                build_device_summary_merged(&dev.alias, &archived_entries, &live_records, since, end);
+
+            if dev.configured {
+                // Enrich with live status from the SSH cache manager.
+                if let Some(host_status) = statuses.iter().find(|s| s.alias == dev.alias) {
                     summary.last_synced = host_status.last_sync.clone();
                     summary.error_message = host_status.last_error.clone();
                     summary.remote_tz = host_status.remote_tz.clone();
@@ -352,11 +366,14 @@ pub async fn get_device_usage(
                         String::from("offline")
                     };
                 }
-                summary.include_in_stats = cfg.include_in_stats;
-
-                total_cost += summary.total_cost;
-                devices.push(summary);
+            } else {
+                // File-synced peer — no live SSH connection.
+                summary.status = String::from("offline");
             }
+            summary.include_in_stats = dev.include_in_stats;
+
+            total_cost += summary.total_cost;
+            devices.push(summary);
         }
     }
 
@@ -473,6 +490,57 @@ pub async fn get_single_device_usage(
             bucket_model.3 &= pricing_available;
         }
     } else {
+        // Remote device = archive (completed hours) + live SSH cache (recent
+        // hours past the archive frontier). Reading the archive is what lets a
+        // file-imported / auto-synced peer (which has NO live SSH cache) render
+        // here at all, and gives configured hosts their full archived history.
+        let source_key = format!("device:{device}");
+        let archive = parser.archive();
+        let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
+
+        // Archived completed hours, filtered to the active provider's family.
+        if let Some(ref a) = archive {
+            for entry in a.load_archived(&source_key, Some(since)) {
+                if !provider_matches_model(&provider, &entry.model) {
+                    continue;
+                }
+                let date = entry.timestamp.date_naive();
+                if date < since || date >= end {
+                    continue;
+                }
+                let (display_name, model_key) = crate::models::normalize_model(&entry.model);
+                let pricing_available = pricing_available_for_key(&model_key);
+                let cost = calculate_cost_for_key(
+                    &model_key,
+                    entry.input_tokens,
+                    entry.output_tokens,
+                    entry.cache_creation_5m_tokens,
+                    entry.cache_creation_1h_tokens,
+                    entry.cache_read_tokens,
+                    0,
+                ) * provider_multiplier(&entry.model);
+                let tokens = entry.input_tokens + entry.output_tokens;
+                let agg = model_map
+                    .entry(model_key.clone())
+                    .or_insert_with(|| (display_name.clone(), 0.0, 0, true));
+                agg.1 += cost;
+                agg.2 += tokens;
+                agg.3 &= pricing_available;
+
+                let bk = bucket_key_for_timestamp(&entry.timestamp.fixed_offset(), &period);
+                let bucket_model = bucket_map
+                    .entry(bk)
+                    .or_default()
+                    .entry(model_key)
+                    .or_insert_with(|| (display_name, 0.0, 0, true));
+                bucket_model.1 += cost;
+                bucket_model.2 += tokens;
+                bucket_model.3 &= pricing_available;
+            }
+        }
+
+        // Live SSH-cache records for configured hosts, skipping hours already
+        // covered by the archive frontier (so they aren't double-counted).
         let cache_mgr = state.ssh_cache.read().await;
         if let Some(mgr) = cache_mgr.as_ref() {
             let records = match mgr.load_cached_records(&device) {
@@ -490,7 +558,13 @@ pub async fn get_single_device_usage(
                     Some(ts) => ts,
                     None => continue,
                 };
-                let record_date = parsed_ts.with_timezone(&chrono::Local).date_naive();
+                let local = parsed_ts.with_timezone(&chrono::Local);
+                if let Some(ref f) = frontier {
+                    if f.covers(local.date_naive(), local.hour() as u8) {
+                        continue;
+                    }
+                }
+                let record_date = local.date_naive();
 
                 if record_date < since || record_date >= end {
                     continue;
