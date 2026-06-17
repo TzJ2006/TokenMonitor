@@ -49,9 +49,17 @@ export async function setAutoExportConfig(
   await invoke("set_auto_export_config", { enabled, folder, hiddenModels });
 }
 
-/** Merge a previously exported JSON document into the archive (dedup on import). */
-export async function importUsageData(json: string): Promise<ImportResult> {
-  return invoke<ImportResult>("import_usage_data", { json });
+/**
+ * Merge a previously exported JSON document into the archive (dedup on import).
+ * `fileName` (the picked file's name) lets the backend attribute a
+ * `TokenMonitor-Usage-<slug>.jsonl` peer file to the SAME device alias that
+ * auto-sync would, so a manual import doesn't create a duplicate device.
+ */
+export async function importUsageData(
+  json: string,
+  fileName?: string,
+): Promise<ImportResult> {
+  return invoke<ImportResult>("import_usage_data", { json, fileName: fileName ?? null });
 }
 
 /** File name (without directory) of an export path, for compact UI display. */

@@ -631,11 +631,11 @@ async fn background_loop(app: tauri::AppHandle) {
         });
     }
 
-    // One-shot on launch: purge any phantom self-duplicate device sources left by
-    // older builds (the same machine counted under several drifted slugs). The
-    // local archive persists across sessions, so this works even before the first
-    // archive flush of this session.
-    cleanup_self_duplicate_devices(&state).await;
+    // One-shot on launch: purge duplicate device sources left by older builds
+    // (the same machine counted under several drifted slugs, or a peer under both
+    // its hash-less and canonical alias). The local archive persists across
+    // sessions, so this works even before the first archive flush of this session.
+    cleanup_duplicate_devices(&state).await;
 
     let mut update_counter: u64 = 0;
     let mut ssh_sync_counter: u64 = 0;
@@ -912,13 +912,18 @@ pub(crate) async fn archive_ssh_device_usage(state: &AppState) {
     }
 }
 
-/// Remove phantom self-duplicate device sources — this machine's own data that an
-/// older build re-imported from its own export file under a drifted device slug
-/// (a computer rename / transient hostname-lookup failure). These inflate the
-/// dashboard total by counting the machine's usage once as `local` and again as
-/// one or more `device:<slug>` entries. Safe + idempotent (a no-op once cleaned);
-/// invalidates the usage-view caches when it actually removes something.
-pub(crate) async fn cleanup_self_duplicate_devices(state: &AppState) {
+/// Clean up duplicate device sources in the archive. Handles two classes left by
+/// older builds:
+///  1. PHANTOM self-duplicates — this machine's own data re-imported from its own
+///     export file under a drifted device slug (a computer rename / transient
+///     hostname-lookup failure), counted once as `local` and again as a device.
+///  2. LEGACY hash-less peer aliases — a peer imported under `device:<slugify
+///     (label)>` (old manual-import path) when auto-sync keys off the filename
+///     slug `device:<slugify(label)>-<hash>`, so one machine became two devices.
+///
+/// Both are merged/removed safely and idempotently (a no-op once cleaned);
+/// invalidates the usage-view caches when it actually changes something.
+pub(crate) async fn cleanup_duplicate_devices(state: &AppState) {
     let Some(archive) = state.parser.archive() else {
         return;
     };
@@ -926,11 +931,17 @@ pub(crate) async fn cleanup_self_duplicate_devices(state: &AppState) {
         let hosts = state.ssh_hosts.read().await;
         hosts.iter().map(|h| h.alias.clone()).collect()
     };
-    let removed = archive.remove_self_duplicate_devices(&configured);
+    let now = chrono::Local::now();
+    let mut removed = archive.remove_self_duplicate_devices(&configured);
+    removed.extend(archive.merge_legacy_alias_duplicates(
+        &configured,
+        now.date_naive(),
+        now.hour() as u8,
+    ));
     if !removed.is_empty() {
         tracing::info!(
             count = removed.len(),
-            "Removed {} self-duplicate device source(s) from the archive",
+            "Cleaned up {} duplicate device source(s) from the archive",
             removed.len()
         );
         state.parser.clear_payload_cache();

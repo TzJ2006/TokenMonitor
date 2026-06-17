@@ -245,8 +245,11 @@ fn finish_device_summary(
     let mut model_breakdown: Vec<DeviceModelSummary> = model_map
         .into_iter()
         .map(
+            // The device name is NOT appended here: these rows always render
+            // nested under their device (the device card header / per-device
+            // chart bucket), so a "Model -- Device" suffix is redundant noise.
             |(model_key, (display_name, cost, tokens, pricing_available))| DeviceModelSummary {
-                display_name: format!("{} -- {}", display_name, device_name),
+                display_name,
                 model_key,
                 cost,
                 tokens,
