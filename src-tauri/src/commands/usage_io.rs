@@ -1143,6 +1143,7 @@ pub async fn import_usage_data(
     app: AppHandle,
     state: State<'_, AppState>,
     json: String,
+    file_name: Option<String>,
 ) -> Result<ImportResult, String> {
     let archive = state
         .parser
@@ -1158,17 +1159,29 @@ pub async fn import_usage_data(
     // into THIS machine's local total. Unknown origin (legacy / header-less file)
     // → verbatim, preserving the original restore behavior.
     let (origin_id, origin_dev) = detect_import_origin(&json);
+    // The auto-export FILE NAME encodes the writer's frozen device slug
+    // (`slugify(label)` + hash). Auto-sync's peer merge keys off THAT slug, so a
+    // manual import must use it too: an old-format file (no `device_id` header)
+    // would otherwise fall back to `slugify(label)` WITHOUT the hash and land
+    // under a SECOND `device:<slug>` for the same machine — the duplicate device.
+    let file_slug = file_name
+        .as_deref()
+        .and_then(peer_slug_from_export_filename);
     let is_own = (!origin_id.is_empty() && origin_id == device_slug())
-        || (!origin_dev.is_empty() && origin_dev == device_label());
-    let peer_slug: Option<String> = if is_own || (origin_id.is_empty() && origin_dev.is_empty()) {
+        || (!origin_dev.is_empty() && origin_dev == device_label())
+        || file_slug.as_deref() == Some(device_slug());
+    let peer_slug: Option<String> = if is_own {
         None
-    } else {
-        let raw = if !origin_id.is_empty() {
-            origin_id.clone()
-        } else {
-            slugify(&origin_dev)
-        };
+    } else if let Some(slug) = file_slug {
+        // Filename slug wins — exactly what auto-sync would attribute this file to.
+        Some(slug)
+    } else if !origin_id.is_empty() {
+        is_valid_source_key(&format!("device:{origin_id}")).then(|| origin_id.clone())
+    } else if !origin_dev.is_empty() {
+        let raw = slugify(&origin_dev);
         is_valid_source_key(&format!("device:{raw}")).then_some(raw)
+    } else {
+        None
     };
 
     // Flush local completed hours first so advancing a frontier on import never
@@ -1233,9 +1246,9 @@ pub async fn import_usage_data(
     }
     run_auto_export(&app, &state).await;
 
-    // Purge any phantom self-duplicate device sources the merge may have surfaced
-    // (defense in depth; the remap above already keeps a peer's local out of ours).
-    crate::cleanup_self_duplicate_devices(&state).await;
+    // Purge duplicate device sources the merge may have surfaced (defense in
+    // depth; the filename-slug remap above already keeps a peer under one alias).
+    crate::cleanup_duplicate_devices(&state).await;
 
     Ok(result)
 }
@@ -1262,6 +1275,23 @@ fn detect_import_origin(input: &str) -> (String, String) {
         }
     }
     (String::new(), String::new())
+}
+
+/// The peer device alias encoded in an auto-export FILE NAME
+/// (`TokenMonitor-Usage-<slug>.jsonl` → `<slug>`), or None if the name doesn't
+/// follow that convention or yields an invalid alias. Accepts a full path and
+/// uses its basename. This is the SAME slug auto-sync's `merge_peer_files` keys
+/// off, so importing a `TokenMonitor-Usage-*.jsonl` by hand attributes it to the
+/// exact same `device:<slug>` source — never a divergent second device.
+fn peer_slug_from_export_filename(name: &str) -> Option<String> {
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(name);
+    let slug = base
+        .strip_prefix(AUTO_EXPORT_FILE_PREFIX)?
+        .strip_suffix(AUTO_EXPORT_FILE_SUFFIX)?;
+    is_valid_source_key(&format!("device:{slug}")).then(|| slug.to_string())
 }
 
 /// Parse an import payload in either supported shape into `(source_key, records)`
@@ -1430,6 +1460,33 @@ mod tests {
         assert!(!is_valid_source_key("device:"));
         assert!(!is_valid_source_key("other:x"));
         assert!(!is_valid_source_key("garbage"));
+    }
+
+    #[test]
+    fn peer_slug_from_export_filename_matches_auto_sync_aliasing() {
+        // A conforming auto-export name yields its embedded slug — the SAME slug
+        // merge_peer_files derives from the file name, so manual import and
+        // auto-sync attribute the file to one device, not two.
+        assert_eq!(
+            peer_slug_from_export_filename("TokenMonitor-Usage-thomas-Linux-Desktop-Linux-3033b0e0.jsonl")
+                .as_deref(),
+            Some("thomas-Linux-Desktop-Linux-3033b0e0")
+        );
+        // A full path works too — basename is used.
+        assert_eq!(
+            peer_slug_from_export_filename(
+                "C:/Users/x/OneDrive/TokenMonitor/TokenMonitor-Usage-srv-a.jsonl"
+            )
+            .as_deref(),
+            Some("srv-a")
+        );
+        // Non-conforming names / unsafe slugs → None (fall back to header logic).
+        assert_eq!(peer_slug_from_export_filename("backup.json"), None);
+        assert_eq!(peer_slug_from_export_filename("TokenMonitor-Usage-.jsonl"), None);
+        assert_eq!(
+            peer_slug_from_export_filename("TokenMonitor-Usage-..jsonl"),
+            None
+        );
     }
 
     #[test]

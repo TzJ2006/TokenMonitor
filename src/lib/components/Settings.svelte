@@ -379,7 +379,7 @@
     ioMessage = null;
     try {
       const text = await file.text();
-      const result = await importUsageData(text);
+      const result = await importUsageData(text, file.name);
       ioMessage = formatImportSummary(result);
       // Drop the frontend payload cache so merged data shows immediately;
       // the backend also emits data-updated after the merge.

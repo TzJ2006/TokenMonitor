@@ -792,6 +792,61 @@ impl ArchiveManager {
         removed
     }
 
+    /// Collapse a LEGACY hash-less peer alias into its canonical `<base>-<hash>`
+    /// sibling. Older builds attributed a manually-imported peer file to
+    /// `device:<slugify(label)>` (no hash), while auto-sync keys off the export
+    /// FILE NAME = `device:<slugify(label)>-<hash>` (the frozen device slug) — so
+    /// the same machine showed up as TWO devices. When both a `device:<L>` and a
+    /// `device:<L>-<8hex>` source exist (and `<L>` is not a configured SSH host),
+    /// merge `<L>`'s records into the canonical sibling (idempotent field-wise
+    /// max — no data loss even if the legacy holds extra hours) and remove `<L>`.
+    /// Returns the removed legacy source keys. Idempotent (a no-op once merged).
+    pub fn merge_legacy_alias_duplicates(
+        &self,
+        configured: &HashSet<String>,
+        current_date: NaiveDate,
+        current_hour: u8,
+    ) -> Vec<String> {
+        let device_aliases: Vec<String> = self
+            .list_sources()
+            .iter()
+            .filter_map(|s| s.strip_prefix("device:").map(str::to_string))
+            .collect();
+
+        // The frozen device-slug hash is exactly 8 hex digits ("{id:08x}").
+        let is_hash = |s: &str| s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit());
+
+        let mut removed = Vec::new();
+        for legacy in &device_aliases {
+            // Never touch an alias the user actively syncs over SSH (intentional).
+            if configured.contains(legacy) {
+                continue;
+            }
+            // Canonical sibling = "<legacy>-<8hex>".
+            let canonical = device_aliases.iter().find(|c| {
+                c.strip_prefix(legacy.as_str())
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(is_hash)
+            });
+            let Some(canonical) = canonical else { continue };
+
+            let legacy_key = format!("device:{legacy}");
+            let canonical_key = format!("device:{canonical}");
+            let records = self.read_raw(&legacy_key);
+            if !records.is_empty() {
+                self.import_source(&canonical_key, &records, current_date, current_hour);
+            }
+            tracing::info!(
+                legacy = legacy_key.as_str(),
+                canonical = canonical_key.as_str(),
+                "Merging legacy hash-less device alias into its canonical sibling"
+            );
+            self.remove_source(&legacy_key);
+            removed.push(legacy_key);
+        }
+        removed
+    }
+
     fn source_dir(&self, source_key: &str) -> PathBuf {
         match source_key.split_once(':') {
             Some(("local", provider)) => self.base_dir.join("local").join(provider),
@@ -1334,5 +1389,55 @@ mod tests {
         let sources = mgr.list_sources();
         assert!(sources.contains(&"local:claude".to_string()));
         assert!(sources.contains(&"device:my-server".to_string()));
+    }
+
+    #[test]
+    fn merge_legacy_alias_collapses_into_canonical_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        let fd = future_date();
+
+        // Legacy hash-less alias holds an EXTRA hour the canonical lacks, to prove
+        // the merge preserves data (field-wise max, not a blind delete).
+        mgr.import_source(
+            "device:thomas-Linux-Desktop-Linux",
+            &[
+                arch("2026-04-10", 9, "opus-4-6", 100, 50),
+                arch("2026-04-10", 10, "opus-4-6", 200, 80),
+            ],
+            fd,
+            0,
+        );
+        // Canonical (frozen-slug) sibling — same machine, with the 8-hex hash.
+        mgr.import_source(
+            "device:thomas-Linux-Desktop-Linux-3033b0e0",
+            &[arch("2026-04-10", 9, "opus-4-6", 100, 50)],
+            fd,
+            0,
+        );
+        // A configured host that is a prefix of another source → must NOT merge.
+        mgr.import_source("device:srv", &[arch("2026-04-10", 9, "opus-4-6", 1, 1)], fd, 0);
+        mgr.import_source(
+            "device:srv-deadbeef",
+            &[arch("2026-04-10", 9, "opus-4-6", 2, 2)],
+            fd,
+            0,
+        );
+
+        let configured: HashSet<String> = ["srv".to_string()].into_iter().collect();
+        let removed = mgr.merge_legacy_alias_duplicates(&configured, fd, 0);
+
+        assert_eq!(removed, vec!["device:thomas-Linux-Desktop-Linux".to_string()]);
+        let sources = mgr.list_sources();
+        assert!(!sources.contains(&"device:thomas-Linux-Desktop-Linux".to_string()));
+        assert!(sources.contains(&"device:thomas-Linux-Desktop-Linux-3033b0e0".to_string()));
+        // The configured host and its hashed sibling are both untouched.
+        assert!(sources.contains(&"device:srv".to_string()));
+        assert!(sources.contains(&"device:srv-deadbeef".to_string()));
+
+        // Canonical now carries the legacy's extra hour (data merged, not lost).
+        let canonical = mgr.read_raw("device:thomas-Linux-Desktop-Linux-3033b0e0");
+        assert_eq!(canonical.len(), 2, "canonical should hold both hours after merge");
+        assert!(canonical.iter().any(|r| r.h == 10 && r.out == 80));
     }
 }
