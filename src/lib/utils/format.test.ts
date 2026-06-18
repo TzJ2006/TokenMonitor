@@ -9,6 +9,7 @@ import {
   formatTimeAgo,
   modelColor,
   formatDeviceName,
+  deviceIdentityKey,
   deviceDisplayNames,
 } from "./format.js";
 
@@ -223,6 +224,19 @@ describe("formatDeviceName", () => {
     expect(formatDeviceName("tianhe")).toBe("tianhe");
     expect(formatDeviceName("Local")).toBe("Local");
   });
+
+  it("strips auto-sync OS and hash suffixes", () => {
+    expect(formatDeviceName("thomas-Linux-Desktop-Linux-3033b0e0")).toBe("Thomas Linux Desktop");
+    expect(formatDeviceName("thomas-Linux-Desktop-Linux")).toBe("Thomas Linux Desktop");
+  });
+});
+
+describe("deviceIdentityKey", () => {
+  it("treats auto-sync slug variants and display names as the same device", () => {
+    const plain = deviceIdentityKey("Thomas Linux Desktop");
+    expect(deviceIdentityKey("thomas-Linux-Desktop-Linux-3033b0e0")).toBe(plain);
+    expect(deviceIdentityKey("thomas-Linux-Desktop-Linux")).toBe(plain);
+  });
 });
 
 describe("deviceDisplayNames", () => {
@@ -249,5 +263,14 @@ describe("deviceDisplayNames", () => {
     const m = deviceDisplayNames(["foo-bar", "foo bar"]);
     expect(m.get("foo-bar")).toBe("foo-bar");
     expect(m.get("foo bar")).toBe("foo bar");
+  });
+
+  it("collapses auto-sync slug variants to the friendly base", () => {
+    const m = deviceDisplayNames([
+      "thomas-Linux-Desktop-Linux",
+      "thomas-Linux-Desktop-Linux-3033b0e0",
+    ]);
+    expect(m.get("thomas-Linux-Desktop-Linux")).toBe("Thomas Linux Desktop");
+    expect(m.get("thomas-Linux-Desktop-Linux-3033b0e0")).toBe("Thomas Linux Desktop");
   });
 });

@@ -48,7 +48,10 @@ const AUTO_EXPORT_FILE_SUFFIX: &str = ".jsonl";
 
 /// This machine's auto-export file name, `TokenMonitor-Usage-<slug>.jsonl`.
 fn auto_export_file_name() -> String {
-    format!("{AUTO_EXPORT_FILE_PREFIX}{}{AUTO_EXPORT_FILE_SUFFIX}", device_slug())
+    format!(
+        "{AUTO_EXPORT_FILE_PREFIX}{}{AUTO_EXPORT_FILE_SUFFIX}",
+        device_slug()
+    )
 }
 
 /// Defensive per-line cap when importing JSONL. A record line is ~150 bytes;
@@ -345,15 +348,8 @@ fn is_valid_source_key(key: &str) -> bool {
 /// the model is unknown (same as the dashboard).
 fn bucket_cost_usd(r: &ArchivedHourly) -> f64 {
     use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
-    let raw = calculate_cost_for_key(
-        &r.mk,
-        r.input_tokens,
-        r.out,
-        r.c5,
-        r.c1,
-        r.cr,
-        r.ws,
-    ) * provider_multiplier(&r.mk);
+    let raw = calculate_cost_for_key(&r.mk, r.input_tokens, r.out, r.c5, r.c1, r.cr, r.ws)
+        * provider_multiplier(&r.mk);
     (raw * 1_000_000.0).round() / 1_000_000.0
 }
 
@@ -776,6 +772,13 @@ pub(crate) async fn run_auto_export(app: &AppHandle, state: &AppState) {
             tracing::warn!(error = %e, folder = folder.as_str(), "Auto-sync write failed");
         }
     }
+}
+
+/// Trigger one auto-sync pass from the Settings "Sync All" button.
+#[tauri::command]
+pub async fn sync_remote_devices(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    run_auto_export(&app, &state).await;
+    Ok(())
 }
 
 /// True if a source belongs to THIS machine (so it's ours to export): the local
@@ -1468,8 +1471,10 @@ mod tests {
         // merge_peer_files derives from the file name, so manual import and
         // auto-sync attribute the file to one device, not two.
         assert_eq!(
-            peer_slug_from_export_filename("TokenMonitor-Usage-thomas-Linux-Desktop-Linux-3033b0e0.jsonl")
-                .as_deref(),
+            peer_slug_from_export_filename(
+                "TokenMonitor-Usage-thomas-Linux-Desktop-Linux-3033b0e0.jsonl"
+            )
+            .as_deref(),
             Some("thomas-Linux-Desktop-Linux-3033b0e0")
         );
         // A full path works too — basename is used.
@@ -1482,7 +1487,10 @@ mod tests {
         );
         // Non-conforming names / unsafe slugs → None (fall back to header logic).
         assert_eq!(peer_slug_from_export_filename("backup.json"), None);
-        assert_eq!(peer_slug_from_export_filename("TokenMonitor-Usage-.jsonl"), None);
+        assert_eq!(
+            peer_slug_from_export_filename("TokenMonitor-Usage-.jsonl"),
+            None
+        );
         assert_eq!(
             peer_slug_from_export_filename("TokenMonitor-Usage-..jsonl"),
             None
@@ -1499,9 +1507,18 @@ mod tests {
         assert_eq!(v["provider"], "claude");
         assert_eq!(v["record"]["d"], "2026-06-15");
         // p is gone; cost is present (a number, ≥ 0 even when pricing is absent).
-        assert!(v["record"]["p"].is_null(), "record.p must not be serialized");
-        assert!(v["record"]["cost"].is_number(), "record.cost must be present");
-        assert!(v["record"].get("provider").is_none(), "JSONL line carries provider, not the record");
+        assert!(
+            v["record"]["p"].is_null(),
+            "record.p must not be serialized"
+        );
+        assert!(
+            v["record"]["cost"].is_number(),
+            "record.cost must be present"
+        );
+        assert!(
+            v["record"].get("provider").is_none(),
+            "JSONL line carries provider, not the record"
+        );
     }
 
     #[test]
@@ -1557,7 +1574,10 @@ mod tests {
 
         let mut other = sample_record("claude", "2026-06-15", 10);
         other.mk = "opus-4-6".to_string();
-        assert!(!record_hidden(&other, &hidden), "a visible model is not hidden");
+        assert!(
+            !record_hidden(&other, &hidden),
+            "a visible model is not hidden"
+        );
 
         // An empty hidden set never hides anything.
         assert!(!record_hidden(&rec, &normalize_hidden_models(vec![])));
@@ -1579,7 +1599,10 @@ mod tests {
         assert_eq!(dev, "Snap (Linux)");
 
         // Header-less / empty → unknown origin (import stays verbatim).
-        assert_eq!(detect_import_origin("   \n"), (String::new(), String::new()));
+        assert_eq!(
+            detect_import_origin("   \n"),
+            (String::new(), String::new())
+        );
     }
 
     #[test]
@@ -1622,7 +1645,10 @@ mod tests {
         assert_eq!(slugify(""), "device");
         assert_eq!(slugify("///"), "device");
         assert_eq!(slugify(".."), "device");
-        assert!(is_valid_source_key(&format!("device:{}", slugify("a/b\\c:d"))));
+        assert!(is_valid_source_key(&format!(
+            "device:{}",
+            slugify("a/b\\c:d")
+        )));
     }
 
     #[test]
@@ -1689,8 +1715,7 @@ mod tests {
 
     #[test]
     fn parses_jsonl_with_header() {
-        let header =
-            r#"{"format":"tokenmonitor-usage-export-jsonl","format_version":1,"device":"Mac (macOS)"}"#;
+        let header = r#"{"format":"tokenmonitor-usage-export-jsonl","format_version":1,"device":"Mac (macOS)"}"#;
         let r1 = sample_record("claude", "2026-06-15", 10);
         let r2 = sample_record("codex", "2026-06-15", 11);
         let body = format!(

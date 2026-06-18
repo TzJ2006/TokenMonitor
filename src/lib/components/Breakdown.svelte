@@ -15,9 +15,8 @@
     deviceBreakdown?: DeviceSummary[] | null;
     onDeviceSelect?: (device: string) => void;
     onShowAllDevices?: () => void;
-    onToggleDeviceStats?: (device: string, includeInStats: boolean) => void;
   }
-  let { models, onAccordionToggle, subagentStats, deviceBreakdown, onDeviceSelect, onShowAllDevices, onToggleDeviceStats }: Props = $props();
+  let { models, onAccordionToggle, subagentStats, deviceBreakdown, onDeviceSelect, onShowAllDevices }: Props = $props();
 
   let hiddenModels = $state<string[]>([]);
   $effect(() => {
@@ -225,24 +224,6 @@
                 <span class="device-cost">{formatCost(device.total_cost)}</span>
               </span>
             </button>
-            {#if !device.is_local}
-              <button
-                class="device-stats-toggle"
-                class:active={device.include_in_stats}
-                type="button"
-                title={device.include_in_stats ? "Included in stats — click to exclude" : "Excluded from stats — click to include"}
-                onclick={() => onToggleDeviceStats?.(device.device, !device.include_in_stats)}
-              >
-                <svg width="14" height="14" viewBox="0 0 14 14">
-                  {#if device.include_in_stats}
-                    <rect x="1" y="1" width="12" height="12" rx="2" fill="currentColor"/>
-                    <path d="M4 7.2 L5.8 9 L10 4.5" stroke="var(--surface-2, #fff)" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-                  {:else}
-                    <rect x="1.5" y="1.5" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.2" fill="none"/>
-                  {/if}
-                </svg>
-              </button>
-            {/if}
           </div>
           {/each}
           {#if hasMoreDevices}
@@ -399,20 +380,6 @@
     -webkit-app-region: no-drag;
   }
   .device-more:hover { color: var(--t2); }
-
-  .device-stats-toggle {
-    display: flex; align-items: center; justify-content: center;
-    width: 24px; height: 24px; flex-shrink: 0;
-    border: none; background: none; cursor: pointer;
-    color: var(--t4); border-radius: 4px;
-    transition: color 0.15s ease, background 0.15s ease;
-    position: relative;
-    z-index: 1;
-    -webkit-app-region: no-drag;
-  }
-  .device-stats-toggle:hover { color: var(--t2); background: var(--surface-hover, rgba(128,128,128,0.12)); }
-  .device-stats-toggle.active { color: var(--accent, #4a9eff); }
-  .device-stats-toggle svg { pointer-events: none; }
 
   /* ── Model rows ── */
   .model-row {

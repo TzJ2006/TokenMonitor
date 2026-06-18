@@ -28,6 +28,10 @@ use std::time::{Duration, Instant};
 
 /// Holds the bound lock socket for the process lifetime so it stays occupied.
 static LOCK_LISTENER: OnceLock<TcpListener> = OnceLock::new();
+/// Windows-only fallback when the fixed lock port is owned by an unkillable
+/// foreign process. The handle is intentionally held for the process lifetime.
+#[cfg(target_os = "windows")]
+static FALLBACK_MUTEX_HANDLE: OnceLock<usize> = OnceLock::new();
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const REBIND_BUDGET: Duration = Duration::from_secs(5);
@@ -38,6 +42,13 @@ const REBIND_STEP: Duration = Duration::from_millis(100);
 pub enum Acquire {
     Continue,
     Exit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FallbackLock {
+    Acquired,
+    AlreadyRunning,
+    Unavailable(String),
 }
 
 fn should_bypass() -> bool {
@@ -57,6 +68,66 @@ fn try_bind_lock(port: u16) -> std::io::Result<TcpListener> {
     // fails while another instance holds the port — exactly the mutual
     // exclusion we want, on every platform.
     TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+}
+
+#[cfg(target_os = "windows")]
+fn try_acquire_fallback_lock() -> FallbackLock {
+    const FALLBACK_MUTEX_NAME: &str = "Local\\TokenMonitor.SingleInstanceFallback";
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    if FALLBACK_MUTEX_HANDLE.get().is_some() {
+        return FallbackLock::Acquired;
+    }
+
+    let name: Vec<u16> = FALLBACK_MUTEX_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = match unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => handle,
+        Err(e) => return FallbackLock::Unavailable(format!("无法创建备用锁：{e}")),
+    };
+
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let _ = unsafe { CloseHandle(handle) };
+        return FallbackLock::AlreadyRunning;
+    }
+
+    match FALLBACK_MUTEX_HANDLE.set(handle.0 as usize) {
+        Ok(()) => FallbackLock::Acquired,
+        Err(_) => {
+            let _ = unsafe { CloseHandle(handle) };
+            FallbackLock::Acquired
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn try_acquire_fallback_lock() -> FallbackLock {
+    FallbackLock::Unavailable("当前平台没有可用的备用锁。".into())
+}
+
+fn continue_with_fallback_lock(reason: &str) -> Acquire {
+    match try_acquire_fallback_lock() {
+        FallbackLock::Acquired => {
+            tracing::warn!("Continuing with fallback single-instance lock because {reason}");
+            Acquire::Continue
+        }
+        FallbackLock::AlreadyRunning => {
+            dialog::show_error(
+                "检测到已有一个 TokenMonitor 正在运行（备用单实例锁）。\n\n\
+                 请先关闭旧实例后再重试。",
+            );
+            Acquire::Exit
+        }
+        FallbackLock::Unavailable(e) => {
+            dialog::show_error(&format!("{reason}\n\n备用单实例锁不可用：{e}"));
+            Acquire::Exit
+        }
+    }
 }
 
 /// The synchronous startup state machine. Runs at the top of `run()`.
@@ -125,8 +196,9 @@ pub fn acquire_or_exit() -> Acquire {
             if dialog::confirm_free_port(holder.as_ref(), port) {
                 if let Some(ref h) = holder {
                     if let Err(e) = port::kill_pid(h.pid) {
-                        dialog::show_error(&format!("无法结束占用端口的进程：{e}"));
-                        return Acquire::Exit;
+                        return continue_with_fallback_lock(&format!(
+                            "无法结束占用端口的进程：{e}"
+                        ));
                     }
                 }
                 match poll_rebind(port) {
@@ -135,10 +207,7 @@ pub fn acquire_or_exit() -> Acquire {
                         tracing::info!("Foreign holder cleared; lock acquired");
                         Acquire::Continue
                     }
-                    None => {
-                        dialog::show_error("端口释放失败，无法继续。");
-                        Acquire::Exit
-                    }
+                    None => continue_with_fallback_lock("端口释放失败。"),
                 }
             } else {
                 Acquire::Exit
