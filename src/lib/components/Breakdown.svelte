@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { modelColor, formatCost, formatTokens, deviceColor } from "../utils/format.js";
+  import { modelColor, formatCost, formatModelCost, formatTokens, deviceColor, deviceDisplayNames } from "../utils/format.js";
   import { settings } from "../stores/settings.js";
   import { logger } from "../utils/logger.js";
   import type { AccordionToggleDetail, DeviceSummary, ModelSummary, SubagentStats } from "../types/index.js";
@@ -15,9 +15,8 @@
     deviceBreakdown?: DeviceSummary[] | null;
     onDeviceSelect?: (device: string) => void;
     onShowAllDevices?: () => void;
-    onToggleDeviceStats?: (device: string, includeInStats: boolean) => void;
   }
-  let { models, onAccordionToggle, subagentStats, deviceBreakdown, onDeviceSelect, onShowAllDevices, onToggleDeviceStats }: Props = $props();
+  let { models, onAccordionToggle, subagentStats, deviceBreakdown, onDeviceSelect, onShowAllDevices }: Props = $props();
 
   let hiddenModels = $state<string[]>([]);
   $effect(() => {
@@ -41,6 +40,9 @@
         })
       : []
   );
+
+  // Display names (raw `device` stays the identity used for color/selection/toggle).
+  let deviceNames = $derived(deviceDisplayNames(sortedDevices.map((d) => d.device)));
 
   let visibleDevices = $derived(sortedDevices.slice(0, MAX_VISIBLE_DEVICES));
   let hasMoreDevices = $derived(sortedDevices.length > MAX_VISIBLE_DEVICES);
@@ -120,7 +122,7 @@
             <div class="sub-info">
               <div class="sub-name-row">
                 <span class="sub-name">{m.display_name}</span>
-                <span class="sub-cost">{formatCost(m.cost)}</span>
+                <span class="sub-cost">{formatModelCost(m.cost, m.pricing_available)}</span>
               </div>
               <div class="sub-tokens">{formatTokens(m.input_tokens)} in · {formatTokens(m.output_tokens)} out{#if m.cache_read_tokens > 0} · {formatTokens(m.cache_read_tokens)} cache{/if}</div>
             </div>
@@ -158,7 +160,7 @@
             <div class="sub-info">
               <div class="sub-name-row">
                 <span class="sub-name">{m.display_name}</span>
-                <span class="sub-cost">{formatCost(m.cost)}</span>
+                <span class="sub-cost">{formatModelCost(m.cost, m.pricing_available)}</span>
               </div>
               <div class="sub-tokens">{formatTokens(m.input_tokens)} in · {formatTokens(m.output_tokens)} out{#if m.cache_read_tokens > 0} · {formatTokens(m.cache_read_tokens)} cache{/if}</div>
             </div>
@@ -188,7 +190,7 @@
       <div class="model-row">
         <span class="model-bar" style="background:{modelColor(row.model_key)}"></span>
         <span class="model-name">{row.display_name}</span>
-        <span class="model-cost">{formatCost(row.cost)}</span>
+        <span class="model-cost">{formatModelCost(row.cost, row.pricing_available)}</span>
         <span class="model-tokens">{formatTokens(row.tokens)}</span>
       </div>
     {/each}
@@ -215,31 +217,13 @@
             <span class="device-color-bar" style="background:{deviceColor(device.device)}"></span>
             <button class="device-info" type="button" onclick={() => onDeviceSelect?.(device.device)}>
               <span class="device-name-row">
-                <span class="device-name">{device.device}</span>
+                <span class="device-name">{deviceNames.get(device.device) ?? device.device}</span>
                 {#if device.is_local}
                   <span class="device-badge">This device</span>
                 {/if}
                 <span class="device-cost">{formatCost(device.total_cost)}</span>
               </span>
             </button>
-            {#if !device.is_local}
-              <button
-                class="device-stats-toggle"
-                class:active={device.include_in_stats}
-                type="button"
-                title={device.include_in_stats ? "Included in stats — click to exclude" : "Excluded from stats — click to include"}
-                onclick={() => onToggleDeviceStats?.(device.device, !device.include_in_stats)}
-              >
-                <svg width="14" height="14" viewBox="0 0 14 14">
-                  {#if device.include_in_stats}
-                    <rect x="1" y="1" width="12" height="12" rx="2" fill="currentColor"/>
-                    <path d="M4 7.2 L5.8 9 L10 4.5" stroke="var(--surface-2, #fff)" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-                  {:else}
-                    <rect x="1.5" y="1.5" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.2" fill="none"/>
-                  {/if}
-                </svg>
-              </button>
-            {/if}
           </div>
           {/each}
           {#if hasMoreDevices}
@@ -396,20 +380,6 @@
     -webkit-app-region: no-drag;
   }
   .device-more:hover { color: var(--t2); }
-
-  .device-stats-toggle {
-    display: flex; align-items: center; justify-content: center;
-    width: 24px; height: 24px; flex-shrink: 0;
-    border: none; background: none; cursor: pointer;
-    color: var(--t4); border-radius: 4px;
-    transition: color 0.15s ease, background 0.15s ease;
-    position: relative;
-    z-index: 1;
-    -webkit-app-region: no-drag;
-  }
-  .device-stats-toggle:hover { color: var(--t2); background: var(--surface-hover, rgba(128,128,128,0.12)); }
-  .device-stats-toggle.active { color: var(--accent, #4a9eff); }
-  .device-stats-toggle svg { pointer-events: none; }
 
   /* ── Model rows ── */
   .model-row {
