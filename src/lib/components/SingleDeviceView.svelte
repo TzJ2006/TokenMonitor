@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { formatCost, formatTokens, modelColor } from "../utils/format.js";
+  import { formatCost, formatModelCost, formatTokens, modelColor, formatDeviceName } from "../utils/format.js";
   import { activePeriod, activeOffset, activeProvider } from "../stores/usage.js";
   import type { UsagePayload } from "../types/index.js";
   import Chart from "./Chart.svelte";
@@ -58,7 +58,7 @@
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <polyline points="15 18 9 12 15 6"></polyline>
       </svg>
-      <span>{device}</span>
+      <span>{formatDeviceName(device)}</span>
     </button>
     {#if data}
       <span class="total">{formatCost(data.total_cost)}</span>
@@ -105,7 +105,7 @@
               <div class="model-row">
                 <div class="model-bar" style:background={modelColor(model.model_key)}></div>
                 <span class="model-name">{model.display_name}</span>
-                <span class="model-cost">{formatCost(model.cost)}</span>
+                <span class="model-cost">{formatModelCost(model.cost, model.pricing_available)}</span>
                 <span class="model-tokens">{formatTokens(model.tokens)}</span>
               </div>
             {/each}

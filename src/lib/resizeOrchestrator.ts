@@ -4,6 +4,7 @@ import {
   MIN_WINDOW_HEIGHT,
   RESIZE_HYSTERESIS_PX,
   RESIZE_SETTLE_DELAY_MS,
+  SHRINK_ON_LEAVE_ANIM_MS,
   WINDOW_WIDTH,
   clampWindowHeight,
   classifyResize,
@@ -44,6 +45,10 @@ export interface ResizeOrchestrator {
   handleBreakdownAccordionToggle: (detail: AccordionToggleDetail) => void;
   refreshWindowMetrics: () => Promise<void>;
   setChartHoverActive: (active: boolean) => void;
+  /** Track whether the pointer is over the popover. While true, shrink
+   * requests are deferred and the latest desired height is flushed (eased)
+   * when the pointer leaves. */
+  setMouseOverWindow: (active: boolean) => void;
   /** Release the "no shrink before first data" gate; shrink requests were buffered until now. */
   markInitialContentReady: () => void;
   destroy: () => void;
@@ -71,6 +76,12 @@ export function createResizeOrchestrator(
   let observerResizeRaf = 0;
   let pendingObserverSource = "observer";
   let chartHoverActive = false;
+  // While the pointer is over the popover, shrink requests are held back so
+  // the window doesn't collapse under the cursor mid-interaction. The latest
+  // desired (smaller) height is queued here and flushed with a slow ease once
+  // the pointer leaves. Grows always apply immediately.
+  let mouseOverWindow = false;
+  let deferredShrinkHeight: number | null = null;
 
   // Resize throttle: max 3 operations per 500ms window
   const ANIMATED_RESIZE_FRAME_INTERVAL_MS = 32;
@@ -311,6 +322,23 @@ export function createResizeOrchestrator(
       });
       return;
     }
+    // Defer shrink while the pointer is over the popover; remember the latest
+    // target and collapse on mouse-leave. Only engage after the first paint so
+    // the cold-launch settle (handled by the initialContentReady gate above)
+    // is never deferred.
+    if (initialContentReady && mouseOverWindow && nextHeight < lastWindowH) {
+      deferredShrinkHeight = nextHeight;
+      deps.logDebug("resize:shrink-deferred-mouse-over", {
+        source,
+        nextHeight,
+        lastWindowH,
+      });
+      return;
+    }
+    // Any height we actually apply supersedes a queued shrink (e.g. a grow
+    // arrived while a shrink was pending) — keep the queue holding only the
+    // latest still-pending desired height.
+    deferredShrinkHeight = null;
     lastWindowH = nextHeight;
     pendingWindowHeightRequest = {
       height: nextHeight,
@@ -595,6 +623,23 @@ export function createResizeOrchestrator(
     }
   }
 
+  function setMouseOverWindow(active: boolean): void {
+    if (active === mouseOverWindow) return;
+    mouseOverWindow = active;
+    deps.logDebug("resize:mouse-over-window", {
+      active,
+      hasDeferredShrink: deferredShrinkHeight !== null,
+    });
+    if (!active && deferredShrinkHeight !== null) {
+      // Pointer left — collapse to the latest desired height with a slow ease
+      // rather than a hard snap. animateWindowHeight already eases + throttles
+      // its per-frame setSize calls and bypasses the (now-cleared) mouse gate.
+      const target = deferredShrinkHeight;
+      deferredShrinkHeight = null;
+      animateWindowHeight(target, SHRINK_ON_LEAVE_ANIM_MS, "mouse-leave-flush");
+    }
+  }
+
   function destroy(): void {
     if (resizeTimer) clearTimeout(resizeTimer);
     cancelAnimationFrame(resizeRaf);
@@ -626,6 +671,7 @@ export function createResizeOrchestrator(
     handleBreakdownAccordionToggle,
     refreshWindowMetrics,
     setChartHoverActive,
+    setMouseOverWindow,
     markInitialContentReady,
     destroy,
     getMaxWindowH: () => maxWindowH,

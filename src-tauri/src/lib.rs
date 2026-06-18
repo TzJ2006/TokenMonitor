@@ -5,6 +5,7 @@ mod paths;
 mod platform;
 mod rate_limits;
 mod secrets;
+mod single_instance;
 mod stats;
 #[allow(dead_code)]
 mod statusline;
@@ -104,6 +105,49 @@ fn move_window_near_tray(window: &tauri::WebviewWindow) {
     }
 }
 
+/// Show + position + focus the main window using the same per-OS logic as the
+/// tray "Show" menu item. Must run on the main thread (GTK/AppKit constraint).
+fn show_main_window_inner(window: &tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    {
+        platform::windows::window::position_near_tray(window);
+        let _ = window.show();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Pre-hint position before show (WM may respect this).
+        platform::linux::position_top_right(window);
+        let _ = window.show();
+        // Immediate re-position (works if WM realized fast enough).
+        platform::linux::position_top_right(window);
+        platform::clamp_window_to_work_area(window);
+        // Deferred re-position to catch slow WM realization.
+        platform::linux::deferred_reposition(window.clone());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        move_window_near_tray(window);
+        platform::clamp_window_to_work_area(window);
+        let _ = window.show();
+    }
+    #[cfg(target_os = "windows")]
+    platform::windows::window::activate_window(window);
+    #[cfg(not(target_os = "windows"))]
+    let _ = window.set_focus();
+}
+
+/// Thread-safe entry point to surface the main window. Dispatches the actual
+/// show to the main thread, so it is safe to call from the single-instance
+/// accept loop (a non-main thread) on FOCUS.
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = handle.get_webview_window("main") {
+            show_main_window_inner(&window);
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Force X11 backend on Wayland sessions so set_position() works.
@@ -113,6 +157,14 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     if std::env::var("GDK_BACKEND").is_err() && std::env::var("WAYLAND_DISPLAY").is_ok() {
         std::env::set_var("GDK_BACKEND", "x11");
+    }
+
+    // Single-instance guard: detect an already-running TokenMonitor (or a
+    // foreign process squatting the loopback lock port) and act on the user's
+    // choice — all BEFORE building any tray/window, so a declined launch exits
+    // cleanly without ever showing UI. See `single_instance` module.
+    if single_instance::acquire_or_exit() == single_instance::Acquire::Exit {
+        return;
     }
 
     tauri::Builder::default()
@@ -125,6 +177,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .setup(|app| {
             let setup_t0 = std::time::Instant::now();
@@ -134,6 +187,11 @@ pub fn run() {
                 app.manage(logging_state);
             }
             tracing::info!("[PROFILE] setup:logging = {:?}", setup_t0.elapsed());
+
+            // Owner instance: start the lock-port accept loop now that the
+            // AppHandle exists. It answers PROBE / QUIT / FOCUS from any future
+            // launch attempt. No-op when the guard is bypassed or not held.
+            single_instance::spawn_accept_loop(app.handle().clone());
 
             // Build tray menu (right-click on macOS/Windows, any click on Linux).
             let show = MenuItemBuilder::with_id("show", "Show TokenMonitor").build(app)?;
@@ -162,29 +220,7 @@ pub fn run() {
                         app.exit(0);
                     } else if event.id() == "show" {
                         if let Some(window) = app.get_webview_window("main") {
-                            #[cfg(target_os = "windows")]
-                            {
-                                platform::windows::window::position_near_tray(&window);
-                                let _ = window.show();
-                            }
-                            #[cfg(target_os = "linux")]
-                            {
-                                // Pre-hint position before show (WM may respect this).
-                                platform::linux::position_top_right(&window);
-                                let _ = window.show();
-                                // Immediate re-position (works if WM realized fast enough).
-                                platform::linux::position_top_right(&window);
-                                platform::clamp_window_to_work_area(&window);
-                                // Deferred re-position to catch slow WM realization.
-                                platform::linux::deferred_reposition(window.clone());
-                            }
-                            #[cfg(target_os = "macos")]
-                            {
-                                move_window_near_tray(&window);
-                                platform::clamp_window_to_work_area(&window);
-                                let _ = window.show();
-                            }
-                            let _ = window.set_focus();
+                            show_main_window_inner(&window);
                         }
                     }
                 })
@@ -388,6 +424,8 @@ pub fn run() {
             commands::config::set_window_surface,
             commands::config::set_glass_effect,
             commands::config::set_dock_icon_visible,
+            commands::config::suppress_next_auto_hide,
+            commands::config::set_auto_export_config,
             commands::config::set_refresh_interval,
             commands::config::set_rate_limits_enabled,
             commands::config::set_usage_access_enabled,
@@ -428,6 +466,7 @@ pub fn run() {
             commands::ssh::get_ssh_hosts,
             commands::ssh::get_ssh_host_statuses,
             commands::ssh::init_ssh_hosts,
+            commands::ssh::init_remote_device_include_flags,
             commands::ssh::add_ssh_host,
             commands::ssh::remove_ssh_host,
             commands::ssh::toggle_ssh_host,
@@ -454,6 +493,9 @@ pub fn run() {
             commands::config::start_cache_warmup,
             commands::config::cancel_cache_warmup,
             commands::config::get_warmup_status,
+            commands::usage_io::export_usage_data,
+            commands::usage_io::import_usage_data,
+            commands::usage_io::sync_remote_devices,
         ])
         .run(tauri::generate_context!())
         .expect("error running TokenMonitor");
@@ -489,6 +531,12 @@ const RATE_LIMIT_REFRESH_EVERY_N_CYCLES: u64 = 5;
 /// Pricing/exchange-rate TTL check: every 120 cycles (~1h at 30s interval).
 const PRICING_CHECK_EVERY_N_CYCLES: u64 = 120;
 
+/// When auto-refresh is "off" (refresh_interval == 0), the 2s statusline poll
+/// is the only thing detecting usage-log changes, so its (expensive) full-file
+/// scan falls back to this cadence instead of running every 2s. Matches the
+/// default refresh interval.
+const OFF_MODE_SWEEP_SECS: u64 = 30;
+
 async fn fast_statusline_poll(app: tauri::AppHandle) {
     use std::fs;
     use std::time::SystemTime;
@@ -500,6 +548,10 @@ async fn fast_statusline_poll(app: tauri::AppHandle) {
         fs::metadata(&path).ok().and_then(|m| m.modified().ok());
 
     let state = app.state::<AppState>();
+
+    // Accumulates elapsed time so the heavy usage-log scan runs at the
+    // configured refresh interval rather than on every 2s tick.
+    let mut secs_since_sweep: u64 = 0;
 
     loop {
         tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
@@ -516,13 +568,39 @@ async fn fast_statusline_poll(app: tauri::AppHandle) {
         if events_moved {
             last_mtime = now_mtime;
         }
-        let parser_changed = state.parser.invalidate_if_changed();
+
+        // Detecting in-place log appends means stat-ing every session file —
+        // far too heavy to run every 2s on a large log set. Throttle it to the
+        // user's configured refresh interval (Settings); the cheap events-file
+        // check above still runs every 2s for rate limits. "Off" (0) falls back
+        // to a sane cadence so usage numbers never freeze entirely.
+        secs_since_sweep += POLL_INTERVAL_SECS;
+        let sweep_interval_secs = {
+            let configured = *state.refresh_interval.read().await;
+            if configured == 0 {
+                OFF_MODE_SWEEP_SECS
+            } else {
+                configured
+            }
+        };
+        let parser_changed = if secs_since_sweep >= sweep_interval_secs {
+            secs_since_sweep = 0;
+            state.parser.invalidate_if_changed()
+        } else {
+            false
+        };
 
         if !events_moved && !parser_changed {
             continue;
         }
 
         state.parser.clear_payload_cache();
+        if parser_changed {
+            // Source logs changed: drop the no-TTL disk cache too, otherwise the
+            // next fetch re-serves a stale per-provider payload despite the
+            // memory clear above (see AppState::clear_payload_disk_cache).
+            state.clear_payload_disk_cache().await;
+        }
 
         if events_moved
             && state
@@ -555,6 +633,12 @@ async fn background_loop(app: tauri::AppHandle) {
         });
     }
 
+    // One-shot on launch: purge duplicate device sources left by older builds
+    // (the same machine counted under several drifted slugs, or a peer under both
+    // its hash-less and canonical alias). The local archive persists across
+    // sessions, so this works even before the first archive flush of this session.
+    cleanup_duplicate_devices(&state).await;
+
     let mut update_counter: u64 = 0;
     let mut ssh_sync_counter: u64 = 0;
     let mut rate_limit_counter: u64 = 0;
@@ -567,6 +651,11 @@ async fn background_loop(app: tauri::AppHandle) {
         };
 
         if interval_secs == 0 {
+            // Auto-export has its own toggle independent of the refresh interval,
+            // so honor it even when periodic refresh is Off. It's a cheap no-op
+            // when nothing changed, but still lands the once-per-session full
+            // sync and any import-triggered reconciliation.
+            commands::usage_io::run_auto_export(&app, &state).await;
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -663,7 +752,18 @@ async fn background_loop(app: tauri::AppHandle) {
             archive_ssh_device_usage(&state).await;
         }
 
+        // Mirror the latest archive to the user's auto-export folder if enabled.
+        // Runs on the refresh cadence like everything else in this loop; a fast
+        // no-op when disabled or no folder is configured.
+        commands::usage_io::run_auto_export(&app, &state).await;
+
         if changed {
+            // Local source logs changed. `invalidate_if_changed()` above already
+            // dropped the in-memory payload cache, but the no-TTL disk cache
+            // would keep re-serving the pre-change per-provider payloads (the
+            // Claude/Codex tabs froze for the day while `all` stayed fresh). Drop
+            // the disk entries too so the next fetch recomputes from fresh logs.
+            state.clear_payload_disk_cache().await;
             let _ = app.emit("data-updated", update_counter);
         }
     }
@@ -671,7 +771,7 @@ async fn background_loop(app: tauri::AppHandle) {
 
 /// Archive completed hours for all local providers.
 /// Fast no-op when no new hours have completed since the last archive.
-fn archive_local_usage(state: &AppState) {
+pub(crate) fn archive_local_usage(state: &AppState) {
     let Some(archive) = state.parser.archive() else {
         return;
     };
@@ -684,6 +784,7 @@ fn archive_local_usage(state: &AppState) {
     for (provider, integration_id) in [
         ("claude", usage::integrations::UsageIntegrationId::Claude),
         ("codex", usage::integrations::UsageIntegrationId::Codex),
+        ("cursor", usage::integrations::UsageIntegrationId::Cursor),
     ] {
         let source_key = format!("local:{provider}");
 
@@ -716,7 +817,7 @@ fn archive_local_usage(state: &AppState) {
 }
 
 /// Archive SSH device usage data from remote-cache into hourly aggregates.
-async fn archive_ssh_device_usage(state: &AppState) {
+pub(crate) async fn archive_ssh_device_usage(state: &AppState) {
     let Some(archive) = state.parser.archive() else {
         return;
     };
@@ -724,7 +825,7 @@ async fn archive_ssh_device_usage(state: &AppState) {
     let configs = state.ssh_hosts.read().await;
     let enabled: Vec<String> = configs
         .iter()
-        .filter(|c| c.enabled)
+        .filter(|c| c.enabled && c.include_in_stats)
         .map(|c| c.alias.clone())
         .collect();
     drop(configs);
@@ -813,12 +914,51 @@ async fn archive_ssh_device_usage(state: &AppState) {
     }
 }
 
-/// Sync all enabled SSH hosts sequentially. Returns true if any data changed.
+/// Clean up duplicate device sources in the archive. Handles two classes left by
+/// older builds:
+///  1. PHANTOM self-duplicates — this machine's own data re-imported from its own
+///     export file under a drifted device slug (a computer rename / transient
+///     hostname-lookup failure), counted once as `local` and again as a device.
+///  2. LEGACY hash-less peer aliases — a peer imported under `device:<slugify
+///     (label)>` (old manual-import path) when auto-sync keys off the filename
+///     slug `device:<slugify(label)>-<hash>`, so one machine became two devices.
+///
+/// Both are merged/removed safely and idempotently (a no-op once cleaned);
+/// invalidates the usage-view caches when it actually changes something.
+pub(crate) async fn cleanup_duplicate_devices(state: &AppState) {
+    let Some(archive) = state.parser.archive() else {
+        return;
+    };
+    let configured: std::collections::HashSet<String> = {
+        let hosts = state.ssh_hosts.read().await;
+        hosts.iter().map(|h| h.alias.clone()).collect()
+    };
+    let now = chrono::Local::now();
+    let mut removed = archive.remove_self_duplicate_devices(&configured);
+    removed.extend(archive.merge_legacy_alias_duplicates(
+        &configured,
+        now.date_naive(),
+        now.hour() as u8,
+    ));
+    if !removed.is_empty() {
+        tracing::info!(
+            count = removed.len(),
+            "Cleaned up {} duplicate device source(s) from the archive",
+            removed.len()
+        );
+        state.parser.clear_payload_cache();
+        if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+            disk_cache.clear_prefix("usage-view:");
+        }
+    }
+}
+
+/// Sync all active SSH hosts sequentially. Returns true if any data changed.
 async fn sync_ssh_hosts(state: &AppState) -> bool {
     let configs = state.ssh_hosts.read().await;
     let enabled: Vec<String> = configs
         .iter()
-        .filter(|c| c.enabled)
+        .filter(|c| c.enabled && c.include_in_stats)
         .map(|c| c.alias.clone())
         .collect();
     drop(configs); // Release read lock before async work.

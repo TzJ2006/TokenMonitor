@@ -67,7 +67,7 @@ jobs:
           TAG="${{ inputs.tag || github.ref_name }}"
           TAG="${TAG#v}"
           CARGO_VERSION=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          TAURI_VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          TAURI_VERSION=$(python -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
           NPM_VERSION=$(node -p "require('./package.json').version")
 
           FAIL=0
@@ -134,12 +134,13 @@ jobs:
             echo "::notice::No TAURI_SIGNING_PRIVATE_KEY set — updater signing disabled"
             exit 0
           fi
-          if [[ "$RAW_KEY" == untrusted\ comment:* ]]; then
-            FINAL_KEY="$RAW_KEY"
-          else
-            FINAL_KEY="$(printf 'untrusted comment: minisign secret key\n%s' "$RAW_KEY")"
-            echo "::notice::Prepended missing comment line to TAURI_SIGNING_PRIVATE_KEY"
-          fi
+          # `tauri signer generate` writes the key as a single base64 blob whose
+          # decoded form is the `untrusted comment: …\n<key>` minisign text. Tauri
+          # base64-decodes the env value verbatim, so it MUST be that pure base64
+          # blob — never the decoded comment+key text, and never with a prepended
+          # comment line (a leading "untrusted comment:" makes the base64 decode
+          # fail at the first space). Strip surrounding whitespace and pass through.
+          FINAL_KEY="$(printf '%s' "$RAW_KEY" | tr -d '[:space:]')"
           {
             echo "TAURI_SIGNING_PRIVATE_KEY<<SIGNING_KEY_EOF"
             echo "$FINAL_KEY"
@@ -236,7 +237,7 @@ jobs:
             exit 1
           fi
 
-          base="https://github.com/Michael-OvO/TokenMonitor/releases/download/${TAG}"
+          base="https://github.com/${{ github.repository }}/releases/download/${TAG}"
 
           read_sig() {
             if [ -n "$1" ] && [ -f "$1" ]; then cat "$1"; else echo ""; fi
@@ -283,6 +284,11 @@ jobs:
 
           cat latest.json
 
+      # ── Emit updater-pubkey.txt so fork-channel clients can fetch this fork's key ─
+      - name: Write updater pubkey
+        if: vars.TAURI_SIGNING_PUBLIC_KEY != ''
+        run: printf '%s' "${{ vars.TAURI_SIGNING_PUBLIC_KEY }}" > updater-pubkey.txt
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -293,3 +299,4 @@ jobs:
             artifacts/installers-windows/*
             artifacts/installers-linux/*
             latest.json
+            updater-pubkey.txt

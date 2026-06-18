@@ -2,12 +2,22 @@
   import { settings } from "../stores/settings.js";
   import { isMacOS } from "../utils/platform.js";
   import { getPermissionSurfaces } from "../permissions/surfaces.js";
+  import type { PermissionSurfaceId } from "../permissions/surfaces.js";
 
   interface Props {
     mode?: "welcome" | "settings" | "rate-limit";
+    /** When provided (settings mode), actionable surfaces render a
+     * "Manage →" link that routes the user to the section owning the real
+     * control (Launch at Login → System, SSH remote devices → Visibility).
+     * The disclosure panel itself stays read-only and never mutates state. */
+    onManage?: (id: PermissionSurfaceId) => void;
   }
 
-  let { mode = "settings" }: Props = $props();
+  let { mode = "settings", onManage }: Props = $props();
+
+  /** Surfaces whose toggle lives in another Settings section. In settings
+   * mode these get a "Manage →" link so the row is no longer a dead end. */
+  const MANAGEABLE_SURFACES: PermissionSurfaceId[] = ["login_item", "ssh_config"];
   let surfaces = $derived.by(() => {
     const all = getPermissionSurfaces($settings, { macos: isMacOS() });
     if (mode === "rate-limit") {
@@ -41,6 +51,11 @@
               <code>{path}</code>
             {/each}
           </div>
+        {/if}
+        {#if mode === "settings" && onManage && MANAGEABLE_SURFACES.includes(surface.id)}
+          <button type="button" class="permission-manage" onclick={() => onManage?.(surface.id)}>
+            Manage<span class="permission-manage-arrow" aria-hidden="true">→</span>
+          </button>
         {/if}
       {:else}
         <p class="permission-policy compact">{surface.requestCopy}</p>
@@ -111,6 +126,27 @@
 
   .permission-policy.compact {
     display: none;
+  }
+
+  .permission-manage {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 2px;
+    padding: 0;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--accent, #6366f1);
+    font: 500 9.5px/1 "Inter", sans-serif;
+  }
+  .permission-manage:hover {
+    text-decoration: underline;
+  }
+  .permission-manage-arrow {
+    font-size: 11px;
+    line-height: 1;
   }
 
   .permission-paths {
