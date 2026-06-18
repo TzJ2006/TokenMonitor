@@ -4,7 +4,7 @@
   import { rateLimitsData } from "../stores/rateLimits.js";
   import { syncTrayConfig } from "../tray/sync.js";
   import { formatTrayTitle } from "../tray/title.js";
-  import { usesFloatingStatusWidget, isWindows } from "../utils/platform.js";
+  import { usesFloatingStatusWidget } from "../utils/platform.js";
   import { logger } from "../utils/logger.js";
   import {
     getRateLimitPrimaryWindowId,
@@ -59,6 +59,7 @@
   });
 
   let previewBarProviders = $derived(current.trayConfig.barProviders ?? []);
+  let previewFloatBallBarProviders = $derived(current.trayConfig.floatBallBarProviders ?? []);
 
   let verbosePercentagePreview = $derived.by(() => {
     const providers = previewBarProviders.length ? previewBarProviders : RATE_LIMIT_PROVIDER_ORDER;
@@ -107,6 +108,20 @@
     void syncTrayConfig(next, $rateLimitsData).catch(() => {});
   }
 
+  function toggleFloatBallBarProvider(provider: RateLimitProviderId) {
+    const providers = current.trayConfig.floatBallBarProviders ?? [];
+    const next = providers.includes(provider)
+      ? providers.filter((p) => p !== provider)
+      : [...providers, provider];
+    applyFloatBallBarProviders(next);
+  }
+
+  function applyFloatBallBarProviders(providers: RateLimitProviderId[]) {
+    // Float-ball bars don't drive the legacy barDisplay/barProvider fields
+    // (those stay tied to the tray), so a direct field update is enough.
+    handleTrayConfig("floatBallBarProviders", providers);
+  }
+
   async function handleFloatBall(checked: boolean) {
     logger.info("settings", `Float ball: ${checked}`);
     updateSetting("floatBall", checked);
@@ -121,19 +136,6 @@
     }
   }
 
-  async function handleTaskbarPanel(checked: boolean) {
-    logger.info("settings", `Taskbar panel: ${checked}`);
-    updateSetting("taskbarPanel", checked);
-    try {
-      if (checked) {
-        await invoke("init_taskbar_panel");
-      } else {
-        await invoke("destroy_taskbar_panel_cmd");
-      }
-    } catch (e) {
-      console.error("Failed to toggle taskbar panel:", e);
-    }
-  }
 </script>
 
 <div class="card">
@@ -186,9 +188,9 @@
           <div class="fb-preview">
             <div class="fb-capsule">
               <div class="fb-panel">
-                {#if previewBarProviders.length > 0}
+                {#if previewFloatBallBarProviders.length > 0}
                   <div class="fb-bars">
-                    {#each previewBarProviders as provider}
+                    {#each previewFloatBallBarProviders as provider}
                       <div class="fb-row">
                         <span class="fb-tag" style:color={getUsageProviderBrandColor(provider, 1)}>{PROVIDER_SHORT_LABELS[provider] ?? provider[0]?.toUpperCase()}</span>
                         <div class="fb-track">
@@ -212,29 +214,20 @@
 
   {#if usesFloatingStatusWidget()}
     <div class="section border-top">
-      <div class="row" class:border={isWindows()}>
+      <div class="row">
         <span class="label">Floating Ball</span>
         <ToggleSwitch
           checked={current.floatBall}
           onChange={handleFloatBall}
         />
       </div>
-      {#if isWindows()}
-      <div class="row">
-        <span class="label">Taskbar Panel</span>
-        <ToggleSwitch
-          checked={current.taskbarPanel}
-          onChange={handleTaskbarPanel}
-        />
-      </div>
-      {/if}
     </div>
   {/if}
 
-  <!-- Bars card -->
+  <!-- Bars card — tray and floating-ball bars are configured separately -->
   <div class="section border-top">
-    <div class="row">
-      <span class="label">Bars</span>
+    <div class="row" class:border={usesFloatingStatusWidget() && current.floatBall}>
+      <span class="label">{usesFloatingStatusWidget() && current.floatBall ? "Menu Bar Bars" : "Bars"}</span>
       <div class="provider-chips">
         <button
           class="chip off-chip"
@@ -251,6 +244,26 @@
         {/each}
       </div>
     </div>
+    {#if usesFloatingStatusWidget() && current.floatBall}
+      <div class="row">
+        <span class="label">Floating Ball Bars</span>
+        <div class="provider-chips">
+          <button
+            class="chip off-chip"
+            class:active={previewFloatBallBarProviders.length === 0}
+            onclick={() => applyFloatBallBarProviders([])}
+          >Off</button>
+          {#each RATE_LIMIT_PROVIDER_ORDER as provider}
+            <button
+              class="chip"
+              class:active={previewFloatBallBarProviders.includes(provider)}
+              style:--chip-color={getUsageProviderBrandColor(provider, 1)}
+              onclick={() => toggleFloatBallBarProvider(provider)}
+            >{getUsageProviderLabel(provider)}</button>
+          {/each}
+        </div>
+      </div>
+    {/if}
   </div>
 
   <!-- Percentages card -->
