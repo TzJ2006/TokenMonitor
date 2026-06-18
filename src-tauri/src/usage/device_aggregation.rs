@@ -29,7 +29,8 @@ pub(crate) fn compact_record_matches_provider(record: &CompactUsageRecord, provi
 /// A device to aggregate in the dashboard: either a configured+enabled SSH host
 /// (live SSH cache + status) or a device present only in the archive — e.g.
 /// imported from a peer machine's synced export file. Archive-only devices have
-/// no SSH connection; they default to included-in-stats.
+/// no SSH connection; they default to included-in-stats unless a saved include
+/// flag says otherwise.
 pub(crate) struct AggDevice {
     pub alias: String,
     pub include_in_stats: bool,
@@ -37,19 +38,20 @@ pub(crate) struct AggDevice {
     pub configured: bool,
 }
 
-/// Devices to aggregate = enabled SSH hosts ∪ `device:*` sources present in the
+/// Devices to aggregate = active SSH hosts ∪ `device:*` sources present in the
 /// archive (deduped by alias; a configured host wins). A DISABLED configured
 /// host stays hidden — its alias is suppressed from the archive set too, so a
 /// disabled host can't reappear as an "archive-only" device.
 pub(crate) fn enumerate_agg_devices(
     configs: &[SshHostConfig],
     archive: Option<&ArchiveManager>,
+    remote_include_flags: &std::collections::HashMap<String, bool>,
 ) -> Vec<AggDevice> {
     use std::collections::HashSet;
     let configured_aliases: HashSet<&str> = configs.iter().map(|c| c.alias.as_str()).collect();
     let mut out: Vec<AggDevice> = configs
         .iter()
-        .filter(|c| c.enabled)
+        .filter(|c| c.enabled && c.include_in_stats)
         .map(|c| AggDevice {
             alias: c.alias.clone(),
             include_in_stats: c.include_in_stats,
@@ -62,7 +64,7 @@ pub(crate) fn enumerate_agg_devices(
                 if !configured_aliases.contains(alias) {
                     out.push(AggDevice {
                         alias: alias.to_string(),
-                        include_in_stats: true,
+                        include_in_stats: remote_include_flags.get(alias).copied().unwrap_or(true),
                         configured: false,
                     });
                 }
@@ -307,7 +309,10 @@ pub(crate) async fn build_device_breakdown_for_payload(
     // Devices to show = enabled SSH hosts ∪ archive (file-imported peer) devices.
     // None when there are no remote devices at all (preserves the prior behavior
     // of suppressing the per-device breakdown when only Local exists).
-    let agg_devices = enumerate_agg_devices(&configs, archive.as_ref());
+    let agg_devices = {
+        let remote_include_flags = state.remote_device_include_flags.read().await;
+        enumerate_agg_devices(&configs, archive.as_ref(), &remote_include_flags)
+    };
     if agg_devices.is_empty() {
         return None;
     }
@@ -429,7 +434,10 @@ pub(crate) async fn build_included_devices_payload(
     let configs = state.ssh_hosts.read().await;
     let archive = state.parser.archive();
     // Devices = enabled SSH hosts ∪ archive (file-imported peer) devices.
-    let agg_devices = enumerate_agg_devices(&configs, archive.as_ref());
+    let agg_devices = {
+        let remote_include_flags = state.remote_device_include_flags.read().await;
+        enumerate_agg_devices(&configs, archive.as_ref(), &remote_include_flags)
+    };
     if agg_devices.is_empty() {
         return None;
     }
@@ -664,7 +672,10 @@ pub(crate) async fn build_device_time_chart_buckets(
     let parser = &state.parser;
     let archive = parser.archive();
     // Devices = enabled SSH hosts ∪ archive (file-imported peer) devices.
-    let agg_devices = enumerate_agg_devices(&configs, archive.as_ref());
+    let agg_devices = {
+        let remote_include_flags = state.remote_device_include_flags.read().await;
+        enumerate_agg_devices(&configs, archive.as_ref(), &remote_include_flags)
+    };
     if agg_devices.is_empty() {
         return None;
     }
@@ -957,12 +968,12 @@ mod tests {
             },
         ];
 
-        // Config-only (archive=None): enabled shown, disabled hidden, flags kept.
-        let only_cfg = enumerate_agg_devices(&configs, None);
+        // Config-only (archive=None): active shown, disabled/hidden hosts omitted.
+        let flags = std::collections::HashMap::new();
+        let only_cfg = enumerate_agg_devices(&configs, None, &flags);
         let aliases: Vec<&str> = only_cfg.iter().map(|d| d.alias.as_str()).collect();
-        assert_eq!(aliases, vec!["A", "C"]);
+        assert_eq!(aliases, vec!["A"]);
         assert!(only_cfg.iter().all(|d| d.configured));
-        assert!(!only_cfg.iter().find(|d| d.alias == "C").unwrap().include_in_stats);
 
         // With archive holding device:Peer (new) and device:B (a DISABLED config):
         let tmp = TempDir::new().unwrap();
@@ -994,9 +1005,15 @@ mod tests {
             now.hour() as u8,
         );
 
-        let merged = enumerate_agg_devices(&configs, Some(&archive));
+        let mut flags = std::collections::HashMap::new();
+        flags.insert(String::from("Peer"), false);
+        let merged = enumerate_agg_devices(&configs, Some(&archive), &flags);
         let names: Vec<&str> = merged.iter().map(|d| d.alias.as_str()).collect();
-        assert!(names.contains(&"A") && names.contains(&"C"));
+        assert!(names.contains(&"A"));
+        assert!(
+            !names.contains(&"C"),
+            "an include-disabled config must stay hidden"
+        );
         assert!(names.contains(&"Peer"), "file-imported peer should surface");
         assert!(
             !names.contains(&"B"),
@@ -1004,7 +1021,7 @@ mod tests {
         );
         let peer = merged.iter().find(|d| d.alias == "Peer").unwrap();
         assert!(!peer.configured);
-        assert!(peer.include_in_stats);
+        assert!(!peer.include_in_stats);
     }
 
     async fn build_state_with_remote_claude_data() -> (AppState, TempDir, TempDir, TempDir) {
@@ -1315,7 +1332,7 @@ mod tests {
         *state.ssh_hosts.write().await = vec![SshHostConfig {
             alias: String::from("remote-mixed"),
             enabled: true,
-            include_in_stats: false,
+            include_in_stats: true,
         }];
         *state.ssh_cache.write().await = Some(SshCacheManager::new(app_data_dir.path()));
 
