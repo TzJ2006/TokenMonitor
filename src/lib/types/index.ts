@@ -242,6 +242,11 @@ export interface SshHostConfig {
   include_in_stats?: boolean;
 }
 
+export interface RemoteDeviceIncludeConfig {
+  alias: string;
+  include_in_stats: boolean;
+}
+
 export interface SshHostStatus {
   alias: string;
   enabled: boolean;

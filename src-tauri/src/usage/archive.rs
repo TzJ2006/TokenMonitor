@@ -1416,7 +1416,12 @@ mod tests {
             0,
         );
         // A configured host that is a prefix of another source → must NOT merge.
-        mgr.import_source("device:srv", &[arch("2026-04-10", 9, "opus-4-6", 1, 1)], fd, 0);
+        mgr.import_source(
+            "device:srv",
+            &[arch("2026-04-10", 9, "opus-4-6", 1, 1)],
+            fd,
+            0,
+        );
         mgr.import_source(
             "device:srv-deadbeef",
             &[arch("2026-04-10", 9, "opus-4-6", 2, 2)],
@@ -1427,7 +1432,10 @@ mod tests {
         let configured: HashSet<String> = ["srv".to_string()].into_iter().collect();
         let removed = mgr.merge_legacy_alias_duplicates(&configured, fd, 0);
 
-        assert_eq!(removed, vec!["device:thomas-Linux-Desktop-Linux".to_string()]);
+        assert_eq!(
+            removed,
+            vec!["device:thomas-Linux-Desktop-Linux".to_string()]
+        );
         let sources = mgr.list_sources();
         assert!(!sources.contains(&"device:thomas-Linux-Desktop-Linux".to_string()));
         assert!(sources.contains(&"device:thomas-Linux-Desktop-Linux-3033b0e0".to_string()));
@@ -1437,7 +1445,11 @@ mod tests {
 
         // Canonical now carries the legacy's extra hour (data merged, not lost).
         let canonical = mgr.read_raw("device:thomas-Linux-Desktop-Linux-3033b0e0");
-        assert_eq!(canonical.len(), 2, "canonical should hold both hours after merge");
+        assert_eq!(
+            canonical.len(),
+            2,
+            "canonical should hold both hours after merge"
+        );
         assert!(canonical.iter().any(|r| r.h == 10 && r.out == 80));
     }
 }

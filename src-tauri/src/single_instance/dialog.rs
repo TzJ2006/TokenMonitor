@@ -29,7 +29,7 @@ pub fn confirm_free_port(holder: Option<&PortHolder>, port: u16) -> bool {
     };
     confirm(&format!(
         "端口 {port} 正被{who}占用，TokenMonitor 需要它来防止重复启动。\n\n\
-         是否结束该进程以释放端口？"
+         是否尝试结束该进程以释放端口？如果系统拒绝结束进程，TokenMonitor 将使用备用单实例锁继续启动。"
     ))
 }
 
