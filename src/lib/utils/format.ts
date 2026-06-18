@@ -263,11 +263,44 @@ export function deviceColor(alias: string): string {
 // parenthetical is kept on both so they stay distinguishable.
 
 const DEVICE_TRAILING_PARENS = /\s*\(([^()]*)\)\s*$/;
+const DEVICE_HASH_SUFFIX = /(?:[-\s]+)[0-9a-fA-F]{8}$/;
+const DEVICE_OS_SUFFIX = /(?:[-\s]+)(macOS|Windows|Linux)$/i;
+
+type DeviceNameInfo = {
+  base: string;
+  paren: string | null;
+  slugLike: boolean;
+};
+
+function normalizeDeviceIdentity(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+}
+
+function capitalizeFirstWord(value: string): string {
+  return value.replace(/[A-Za-z]/, (letter) => letter.toLocaleUpperCase());
+}
+
+function deviceNameInfo(raw: string): DeviceNameInfo {
+  const trimmed = raw.trim();
+  const paren = deviceNameParen(trimmed);
+  let stem = trimmed.replace(DEVICE_TRAILING_PARENS, "");
+  const hadHash = DEVICE_HASH_SUFFIX.test(stem);
+  stem = stem.replace(DEVICE_HASH_SUFFIX, "");
+  const hadOsSuffix = !paren && DEVICE_OS_SUFFIX.test(stem);
+  stem = stem.replace(DEVICE_OS_SUFFIX, "");
+
+  const spaced = stem.replace(/-/g, " ").replace(/\s+/g, " ").trim();
+  const slugLike = hadHash || hadOsSuffix;
+  const base = spaced || trimmed;
+  return {
+    base: slugLike ? capitalizeFirstWord(base) : base,
+    paren,
+    slugLike,
+  };
+}
 
 function deviceNameBase(raw: string): string {
-  const withoutParens = raw.replace(DEVICE_TRAILING_PARENS, "");
-  const spaced = withoutParens.replace(/-/g, " ").replace(/\s+/g, " ").trim();
-  return spaced || raw.trim();
+  return deviceNameInfo(raw).base;
 }
 
 function deviceNameParen(raw: string): string | null {
@@ -278,6 +311,13 @@ function deviceNameParen(raw: string): string | null {
 /** Friendly display form of a single device name (no collision awareness). */
 export function formatDeviceName(raw: string): string {
   return deviceNameBase(raw);
+}
+
+/** Stable key for deciding whether two raw device aliases represent one device. */
+export function deviceIdentityKey(raw: string): string {
+  const info = deviceNameInfo(raw);
+  if (info.paren) return normalizeDeviceIdentity(raw.replace(/-/g, " "));
+  return normalizeDeviceIdentity(info.base);
 }
 
 /**
@@ -295,10 +335,14 @@ export function deviceDisplayNames(rawNames: Iterable<string>): Map<string, stri
   }
   const out = new Map<string, string>();
   for (const raw of names) {
-    const base = deviceNameBase(raw);
+    const info = deviceNameInfo(raw);
+    const base = info.base;
     if ((baseCounts.get(base) ?? 0) > 1) {
-      const paren = deviceNameParen(raw);
-      out.set(raw, paren ? `${base} (${paren})` : raw);
+      if (info.slugLike) {
+        out.set(raw, base);
+      } else {
+        out.set(raw, info.paren ? `${base} (${info.paren})` : raw);
+      }
     } else {
       out.set(raw, base);
     }

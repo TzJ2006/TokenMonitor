@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { UsagePayload } from "../types/index.js";
-import { setDeviceIncludeFlag, setSshHostIncludeFlag } from "./deviceStats.js";
+import {
+  setDeviceIncludeFlag,
+  setRemoteDeviceIncludeFlag,
+  setSshHostIncludeFlag,
+} from "./deviceStats.js";
 
 function makePayload(overrides: Partial<UsagePayload> = {}): UsagePayload {
   return {
@@ -87,6 +91,26 @@ describe("setSshHostIncludeFlag", () => {
     expect(setSshHostIncludeFlag(hosts, "remote-a", true)).toEqual([
       { alias: "remote-a", enabled: true, include_in_stats: true },
       { alias: "remote-b", enabled: true, include_in_stats: true },
+    ]);
+  });
+});
+
+describe("setRemoteDeviceIncludeFlag", () => {
+  it("updates an existing archive-only device include flag", () => {
+    const devices = [
+      { alias: "peer-a", include_in_stats: true },
+      { alias: "peer-b", include_in_stats: true },
+    ];
+
+    expect(setRemoteDeviceIncludeFlag(devices, "peer-a", false)).toEqual([
+      { alias: "peer-a", include_in_stats: false },
+      { alias: "peer-b", include_in_stats: true },
+    ]);
+  });
+
+  it("adds a new archive-only device include flag", () => {
+    expect(setRemoteDeviceIncludeFlag([], "peer-a", false)).toEqual([
+      { alias: "peer-a", include_in_stats: false },
     ]);
   });
 });

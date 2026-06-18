@@ -19,6 +19,7 @@ use crate::usage::parser::{UsageParser, UsageQueryDebugReport};
 use crate::usage::payload_disk_cache::PayloadDiskCache;
 use crate::usage::ssh_remote::{SshCacheManager, SshHostConfig};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -34,6 +35,7 @@ pub struct AppState {
     pub glass_enabled: Arc<RwLock<bool>>,
     pub float_ball_state: Arc<RwLock<float_ball::FloatBallState>>,
     pub ssh_hosts: Arc<RwLock<Vec<SshHostConfig>>>,
+    pub remote_device_include_flags: Arc<RwLock<HashMap<String, bool>>>,
     pub ssh_cache: Arc<RwLock<Option<SshCacheManager>>>,
     pub updater: Arc<RwLock<crate::updater::UpdaterState>>,
     /// When true, the main window blur handler skips hiding once.
@@ -74,6 +76,7 @@ impl AppState {
             glass_enabled: Arc::new(RwLock::new(true)),
             float_ball_state: Arc::new(RwLock::new(float_ball::FloatBallState::default())),
             ssh_hosts: Arc::new(RwLock::new(Vec::new())),
+            remote_device_include_flags: Arc::new(RwLock::new(HashMap::new())),
             ssh_cache: Arc::new(RwLock::new(None)),
             updater: Arc::new(RwLock::new(crate::updater::UpdaterState::new())),
             suppress_auto_hide: Arc::new(AtomicBool::new(false)),

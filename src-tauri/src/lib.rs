@@ -466,6 +466,7 @@ pub fn run() {
             commands::ssh::get_ssh_hosts,
             commands::ssh::get_ssh_host_statuses,
             commands::ssh::init_ssh_hosts,
+            commands::ssh::init_remote_device_include_flags,
             commands::ssh::add_ssh_host,
             commands::ssh::remove_ssh_host,
             commands::ssh::toggle_ssh_host,
@@ -494,6 +495,7 @@ pub fn run() {
             commands::config::get_warmup_status,
             commands::usage_io::export_usage_data,
             commands::usage_io::import_usage_data,
+            commands::usage_io::sync_remote_devices,
         ])
         .run(tauri::generate_context!())
         .expect("error running TokenMonitor");
@@ -823,7 +825,7 @@ pub(crate) async fn archive_ssh_device_usage(state: &AppState) {
     let configs = state.ssh_hosts.read().await;
     let enabled: Vec<String> = configs
         .iter()
-        .filter(|c| c.enabled)
+        .filter(|c| c.enabled && c.include_in_stats)
         .map(|c| c.alias.clone())
         .collect();
     drop(configs);
@@ -951,12 +953,12 @@ pub(crate) async fn cleanup_duplicate_devices(state: &AppState) {
     }
 }
 
-/// Sync all enabled SSH hosts sequentially. Returns true if any data changed.
+/// Sync all active SSH hosts sequentially. Returns true if any data changed.
 async fn sync_ssh_hosts(state: &AppState) -> bool {
     let configs = state.ssh_hosts.read().await;
     let enabled: Vec<String> = configs
         .iter()
-        .filter(|c| c.enabled)
+        .filter(|c| c.enabled && c.include_in_stats)
         .map(|c| c.alias.clone())
         .collect();
     drop(configs); // Release read lock before async work.

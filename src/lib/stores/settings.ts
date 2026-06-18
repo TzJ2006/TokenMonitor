@@ -14,6 +14,7 @@ import type {
   CostPrecision,
   DefaultPeriod,
   RateLimitProviderId,
+  RemoteDeviceIncludeConfig,
   HeaderTabs,
   PercentageFormat,
   SshHostConfig,
@@ -47,6 +48,7 @@ export interface Settings {
    * persisted settings still parse; it has no effect and no UI toggle. */
   taskbarPanel: boolean;
   sshHosts: SshHostConfig[];
+  remoteDeviceIncludes: RemoteDeviceIncludeConfig[];
   debugLogging: boolean;
   /**
    * Whether to compute live rate-limit data. The fetch is fully local now
@@ -155,6 +157,7 @@ const DEFAULTS: Settings = {
   floatBall: false,
   taskbarPanel: false,
   sshHosts: [],
+  remoteDeviceIncludes: [],
   debugLogging: false,
   rateLimitsEnabled: false,
   cursorApiKey: "",
@@ -305,6 +308,29 @@ function normalizeSshHosts(value: unknown): SshHostConfig[] {
   });
 }
 
+function normalizeRemoteDeviceIncludes(value: unknown): RemoteDeviceIncludeConfig[] {
+  if (!Array.isArray(value)) return [];
+
+  const seen = new Set<string>();
+  const normalized: RemoteDeviceIncludeConfig[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) continue;
+    const candidate = item as Record<string, unknown>;
+    if (typeof candidate.alias !== "string") continue;
+
+    const alias = candidate.alias.trim();
+    if (!alias || seen.has(alias)) continue;
+    seen.add(alias);
+    normalized.push({
+      alias,
+      include_in_stats:
+        typeof candidate.include_in_stats === "boolean" ? candidate.include_in_stats : true,
+    });
+  }
+
+  return normalized;
+}
+
 function normalizeTrayConfig(trayConfig?: Partial<TrayConfig> | null): TrayConfig {
   const barDisplay = normalizeStringChoice(
     trayConfig?.barDisplay,
@@ -395,6 +421,7 @@ export function normalizeSettings(saved?: Partial<Settings> | null): Settings {
     floatBall: normalizeBoolean(saved?.floatBall, DEFAULTS.floatBall),
     taskbarPanel: normalizeBoolean(saved?.taskbarPanel, DEFAULTS.taskbarPanel),
     sshHosts: normalizeSshHosts(saved?.sshHosts),
+    remoteDeviceIncludes: normalizeRemoteDeviceIncludes(saved?.remoteDeviceIncludes),
     debugLogging: normalizeBoolean(saved?.debugLogging, DEFAULTS.debugLogging),
     rateLimitsEnabled: normalizeBoolean(saved?.rateLimitsEnabled, DEFAULTS.rateLimitsEnabled),
     cursorApiKey: normalizeSecretString(saved?.cursorApiKey),
