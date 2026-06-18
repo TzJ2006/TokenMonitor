@@ -15,8 +15,6 @@
     fetchData,
     warmCache,
     warmAllPeriods,
-    clearUsageCacheForProviders,
-    seedUsageCache,
   } from "./lib/stores/usage.js";
   import {
     ALL_USAGE_PROVIDER_ID,
@@ -37,7 +35,6 @@
   } from "./lib/stores/rateLimits.js";
   import { providerPayload } from "./lib/views/rateLimitMonitor.js";
   import { hasRateLimitWindows } from "./lib/views/rateLimits.js";
-  import { setDeviceIncludeFlag, setSshHostIncludeFlag } from "./lib/views/deviceStats.js";
   import {
     DEFAULT_HEADER_TABS,
     areHeaderTabsEqual,
@@ -87,7 +84,7 @@
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import PermissionDisclosure from "./lib/components/PermissionDisclosure.svelte";
   import PermissionsOnboarding from "./lib/components/PermissionsOnboarding.svelte";
-  import type { HeaderTabs, UsagePayload, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
+  import type { HeaderTabs, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
 
   let showSplash = $state(true);
   let appReady = $state(false);
@@ -144,9 +141,7 @@
   // @ts-expect-error Assigned via callback, read access planned
   let isScrollLocked = $state(false);
   let dismissedWarningText = $state<string | null>(null);
-  let deviceToggleGuard = 0;
   let initialDataLoad: Promise<void> | null = null;
-  const REMOTE_USAGE_CACHE_PROVIDERS: UsageProvider[] = [ALL_USAGE_PROVIDER_ID, "claude"];
 
   // ── View transition logic ──
   type ViewKey = 'splash' | 'welcome' | 'setup' | 'settings' | 'calendar' | 'single-device' | 'devices' | 'main' | 'loading';
@@ -215,7 +210,7 @@
   );
   // Subscribe to stores
   $effect(() => {
-    const unsub1 = usageData.subscribe((v) => { if (deviceToggleGuard === 0) data = v; });
+    const unsub1 = usageData.subscribe((v) => (data = v));
     const unsub2 = isLoading.subscribe((v) => (loading = v));
     const unsubPL = isPlaceholderLoading.subscribe((v) => {
       placeholderLoading = v;
@@ -481,68 +476,6 @@
     selectedDevice = null;
     await tick();
     syncSizeAndVerify("device-back");
-  }
-
-  async function handleToggleDeviceStats(device: string, includeInStats: boolean) {
-    logger.info("device", `Stats toggle: ${device} include=${includeInStats}`);
-    const previousData = data;
-    const previousHosts = get(settings).sshHosts;
-
-    // Guard: prevent background fetchData refreshes from overwriting the
-    // optimistic update via the usageData subscription during the async flow.
-    // Without this, a pending stale-while-revalidate background refresh can
-    // resolve mid-toggle and revert the checkbox via usageData.set(oldData).
-    deviceToggleGuard++;
-    // Reject any in-flight background refreshes by bumping the request ID.
-    clearUsageCacheForProviders(REMOTE_USAGE_CACHE_PROVIDERS);
-
-    // Optimistic UI: immediately flip the checkbox so the user sees instant feedback.
-    data = setDeviceIncludeFlag(data, device, includeInStats);
-
-    let failed = false;
-    try {
-      // 1. Update Rust in-memory state + persist to settings.
-      await invoke("toggle_device_include_in_stats", { alias: device, includeInStats });
-      const updatedHosts = setSshHostIncludeFlag(previousHosts, device, includeInStats);
-      await updateSetting("sshHosts", updatedHosts);
-
-      // 2. Clear only the final usage-view cache so provider aggregates stay warm.
-      await invoke("clear_usage_view_cache");
-
-      // 3. Direct IPC fetch + store update (bypasses fetchData's stale-while-revalidate).
-      const freshData = await invoke<UsagePayload>("get_usage_data", { provider, period, offset });
-      seedUsageCache(provider, period, offset, freshData);
-      data = freshData;
-      usageData.set(freshData);
-    } catch (err) {
-      console.error("Failed to toggle device stats:", err);
-      failed = true;
-      data = previousData;
-      if (previousData) {
-        seedUsageCache(provider, period, offset, previousData);
-        usageData.set(previousData);
-      }
-    } finally {
-      deviceToggleGuard--;
-    }
-
-    // Rollback Rust state + settings after the guard is released so the
-    // subscription is active again for any store updates from persistence.
-    if (failed) {
-      try {
-        await invoke("toggle_device_include_in_stats", {
-          alias: device,
-          includeInStats: !includeInStats,
-        });
-      } catch (rollbackErr) {
-        console.error("Failed to rollback device stats toggle:", rollbackErr);
-      }
-      try {
-        await updateSetting("sshHosts", previousHosts);
-      } catch (settingsRollbackErr) {
-        console.error("Failed to rollback sshHosts setting:", settingsRollbackErr);
-      }
-    }
   }
 
   // ── Window resize (delegated to resizeOrchestrator.ts) ──
@@ -1049,7 +982,6 @@
             deviceBreakdown={data.device_breakdown}
             onDeviceSelect={handleDeviceSelect}
             onShowAllDevices={() => { showDevices = true; }}
-            onToggleDeviceStats={handleToggleDeviceStats}
           />
         {/if}
       </div>

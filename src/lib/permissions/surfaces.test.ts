@@ -35,6 +35,7 @@ function settings(overrides: Partial<Settings> = {}): Settings {
     floatBall: false,
     taskbarPanel: false,
     sshHosts: [],
+    remoteDeviceIncludes: [],
     debugLogging: false,
     cursorApiKey: "",
     keychainAccessRequested: false,
