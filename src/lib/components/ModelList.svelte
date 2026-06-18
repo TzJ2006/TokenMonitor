@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { modelColor, formatCost, formatTokens } from "../utils/format.js";
+  import { modelColor, formatModelCost, formatTokens } from "../utils/format.js";
   import { settings } from "../stores/settings.js";
   import type { ModelSummary } from "../types/index.js";
 
@@ -42,7 +42,7 @@
             <span class="mcs-minus">−{row.change_stats.removed_lines.toLocaleString()}</span>
           </span>
         {/if}
-        <span class="mc">{formatCost(row.cost)}</span>
+        <span class="mc">{formatModelCost(row.cost, row.pricing_available)}</span>
         <span class="mt">{formatTokens(row.tokens)}</span>
       </div>
     {/each}

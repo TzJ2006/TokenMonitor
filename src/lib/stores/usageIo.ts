@@ -1,0 +1,91 @@
+import { invoke } from "@tauri-apps/api/core";
+
+// Mirrors src-tauri/src/commands/usage_io.rs (camelCase wire format).
+export type ExportResult = {
+  path: string;
+  sourceCount: number;
+  recordCount: number;
+};
+
+export type ImportSourceStats = {
+  sourceKey: string;
+  seen: number;
+  newBuckets: number;
+  deduped: number;
+};
+
+export type ImportResult = {
+  sources: ImportSourceStats[];
+  totalSeen: number;
+  totalNew: number;
+  totalDeduped: number;
+  /** Malformed/oversized lines skipped while parsing a JSONL file (e.g. a torn
+   * final append). 0 for a clean import or a single-document JSON snapshot. */
+  skipped: number;
+};
+
+/**
+ * Write the usage archive to a JSON file at the caller-chosen `path`.
+ * `hiddenModels` (the UI's hidden-models setting) is forwarded so the export
+ * excludes models hidden in the dashboard — export visibility == UI visibility.
+ */
+export async function exportUsageData(
+  path: string,
+  hiddenModels: string[] = [],
+): Promise<ExportResult> {
+  return invoke<ExportResult>("export_usage_data", { path, hiddenModels });
+}
+
+/**
+ * Push the background auto-export config to the backend. `hiddenModels` is
+ * included so the rolling mirror filters the same models the dashboard hides;
+ * changing it forces a full rewrite backend-side.
+ */
+export async function setAutoExportConfig(
+  enabled: boolean,
+  folder: string | null,
+  hiddenModels: string[] = [],
+): Promise<void> {
+  await invoke("set_auto_export_config", { enabled, folder, hiddenModels });
+}
+
+/**
+ * Merge a previously exported JSON document into the archive (dedup on import).
+ * `fileName` (the picked file's name) lets the backend attribute a
+ * `TokenMonitor-Usage-<slug>.jsonl` peer file to the SAME device alias that
+ * auto-sync would, so a manual import doesn't create a duplicate device.
+ */
+export async function importUsageData(
+  json: string,
+  fileName?: string,
+): Promise<ImportResult> {
+  return invoke<ImportResult>("import_usage_data", { json, fileName: fileName ?? null });
+}
+
+/** File name (without directory) of an export path, for compact UI display. */
+export function exportFileName(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
+export function formatExportSummary(r: ExportResult): string {
+  if (r.recordCount === 0) {
+    return "Nothing to export yet";
+  }
+  const records = r.recordCount.toLocaleString();
+  const sources = r.sourceCount === 1 ? "1 source" : `${r.sourceCount} sources`;
+  return `Saved ${records} records from ${sources} → ${exportFileName(r.path)}`;
+}
+
+export function formatImportSummary(r: ImportResult): string {
+  if (r.totalSeen === 0) {
+    return r.skipped > 0
+      ? `No usable records found · ${r.skipped.toLocaleString()} line${r.skipped === 1 ? "" : "s"} skipped`
+      : "No usage records found in that file";
+  }
+  const seen = r.totalSeen.toLocaleString();
+  const base = `Imported ${seen} records · ${r.totalNew.toLocaleString()} new · ${r.totalDeduped.toLocaleString()} deduplicated`;
+  return r.skipped > 0
+    ? `${base} · ${r.skipped.toLocaleString()} line${r.skipped === 1 ? "" : "s"} skipped`
+    : base;
+}

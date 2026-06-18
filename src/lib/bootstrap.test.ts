@@ -43,6 +43,7 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
       barDisplay: 'both',
       barProvider: 'claude',
       barProviders: ["claude", "codex"],
+      floatBallBarProviders: ["claude", "codex"],
       showPercentages: false,
       percentageFormat: 'compact',
       showCost: true,
@@ -53,6 +54,7 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     floatBall: false,
     taskbarPanel: false,
     sshHosts: [],
+    remoteDeviceIncludes: [],
     debugLogging: false,
     cursorApiKey: "",
     keychainAccessRequested: false,
@@ -64,6 +66,8 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     claudePlanCustomFiveHourTokens: null,
     claudePlanCustomWeeklyTokens: null,
     usageAccessEnabled: true,
+    autoExportEnabled: false,
+    autoExportFolder: null,
     ...overrides,
   };
 }
