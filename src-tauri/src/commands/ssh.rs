@@ -15,6 +15,18 @@ use crate::usage::ssh_config::{discover_ssh_hosts, SshHostInfo};
 use crate::usage::ssh_remote::{
     CompactUsageRecord, SshHostConfig, SshHostStatus, SshSyncResult, SshTestResult,
 };
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RemoteDeviceIncludeFlag {
+    pub alias: String,
+    #[serde(default = "default_true")]
+    pub include_in_stats: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
 
 fn validate_ssh_alias(alias: &str) -> Result<(), String> {
     if alias.is_empty() {
@@ -138,12 +150,40 @@ pub async fn toggle_device_include_in_stats(
     include_in_stats: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut configs = state.ssh_hosts.write().await;
+    validate_ssh_alias(&alias)?;
+    let updated_config = {
+        let mut configs = state.ssh_hosts.write().await;
+        if let Some(cfg) = configs.iter_mut().find(|c| c.alias == alias) {
+            cfg.include_in_stats = include_in_stats;
+            true
+        } else {
+            false
+        }
+    };
 
-    if let Some(cfg) = configs.iter_mut().find(|c| c.alias == alias) {
-        cfg.include_in_stats = include_in_stats;
+    if !updated_config {
+        let mut flags = state.remote_device_include_flags.write().await;
+        flags.insert(alias, include_in_stats);
     }
 
+    invalidate_usage_view_cache(&state).await;
+    Ok(())
+}
+
+/// Initialize archive-only remote device include flags from persisted settings.
+#[tauri::command]
+pub async fn init_remote_device_include_flags(
+    flags: Vec<RemoteDeviceIncludeFlag>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut normalized = HashMap::new();
+    for flag in flags {
+        validate_ssh_alias(&flag.alias)?;
+        normalized.insert(flag.alias, flag.include_in_stats);
+    }
+
+    let mut current = state.remote_device_include_flags.write().await;
+    *current = normalized;
     Ok(())
 }
 
@@ -290,7 +330,10 @@ pub async fn get_device_usage(
         // connection (imported from another machine's export) never appeared on
         // this page even though it shows in the breakdown.
         let mgr = cache_mgr.as_ref();
-        let agg_devices = enumerate_agg_devices(&configs, archive.as_ref());
+        let agg_devices = {
+            let remote_include_flags = state.remote_device_include_flags.read().await;
+            enumerate_agg_devices(&configs, archive.as_ref(), &remote_include_flags)
+        };
         let statuses = mgr.map(|m| m.host_statuses(&configs)).unwrap_or_default();
         for dev in &agg_devices {
             let source_key = format!("device:{}", dev.alias);
@@ -303,9 +346,7 @@ pub async fn get_device_usage(
                 .map(|a| a.load_archived(&source_key, Some(since)))
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|e| {
-                    crate::usage::integrations::provider_matches_model(&provider, &e.model)
-                })
+                .filter(|e| crate::usage::integrations::provider_matches_model(&provider, &e.model))
                 .collect();
 
             // Live compact rows only for configured SSH hosts; file-imported
@@ -349,8 +390,13 @@ pub async fn get_device_usage(
             }
 
             // Build summary: archived entries + live compact records.
-            let mut summary =
-                build_device_summary_merged(&dev.alias, &archived_entries, &live_records, since, end);
+            let mut summary = build_device_summary_merged(
+                &dev.alias,
+                &archived_entries,
+                &live_records,
+                since,
+                end,
+            );
 
             if dev.configured {
                 // Enrich with live status from the SSH cache manager.

@@ -11,5 +11,6 @@ pub mod openrouter;
 pub mod parser;
 pub mod payload_disk_cache;
 pub mod pricing;
+pub mod pricing_fallback;
 pub mod ssh_config;
 pub mod ssh_remote;

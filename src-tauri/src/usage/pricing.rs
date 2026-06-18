@@ -1,5 +1,5 @@
 #[cfg_attr(not(test), allow(dead_code))]
-pub const PRICING_VERSION: &str = "2026-06-09";
+pub const PRICING_VERSION: &str = "2026-06-17";
 
 use crate::models::{detect_model_family, ModelFamily};
 use crate::usage::litellm::DynamicModelRates;
@@ -174,11 +174,23 @@ fn get_rates(model: &str) -> Option<ModelRates> {
 
 /// Look up pricing for an already-lowercase model key.
 ///
-/// Checks dynamic LiteLLM pricing first, then falls back to hardcoded rates.
+/// Checks dynamic LiteLLM/OpenRouter pricing first, then `pricing_fallback.json`,
+/// then inline hardcoded rates.
 fn get_rates_for_key(model: &str) -> Option<ModelRates> {
-    // Dynamic pricing from LiteLLM (refreshed on startup, cached 24h).
+    // Dynamic pricing from LiteLLM + OpenRouter (refreshed on startup, cached 7d).
     if let Some(rates) = lookup_dynamic(model) {
         return Some(rates);
+    }
+
+    // Static table in pricing_fallback.json (offline, easy to edit).
+    if let Some(r) = crate::usage::pricing_fallback::lookup(model) {
+        return Some(ModelRates {
+            input: r.input,
+            output: r.output,
+            cache_write_5m: r.cache_write_5m,
+            cache_write_1h: r.cache_write_1h,
+            cache_read: r.cache_read,
+        });
     }
 
     // ── Hardcoded fallback (always available) ───────────────────────────────
@@ -514,10 +526,16 @@ mod tests {
     }
 
     #[test]
+    fn pricing_fallback_covers_gemini_and_composer() {
+        assert!(pricing_available_for_key("gemini-2.5-pro"));
+        assert!(pricing_available_for_key("composer-2.5"));
+        assert!(approx_eq(cost("gemini-2.5-pro", M, M), 14.0));
+        assert!(approx_eq(cost("composer-2.5", M, M), 3.0));
+    }
+
+    #[test]
     fn unsupported_family_defaults_to_zero_until_priced() {
-        assert!(approx_eq(cost("gemini-2.5-pro", M, M), 0.00));
         assert!(approx_eq(cost("totally-unknown-model", M, M), 0.00));
-        assert!(!pricing_available_for_key("gemini-2.5-pro"));
         assert!(!pricing_available_for_key("totally-unknown-model"));
     }
 
@@ -531,7 +549,7 @@ mod tests {
 
     #[test]
     fn pricing_version_is_set() {
-        assert_eq!(PRICING_VERSION, "2026-06-09");
+        assert_eq!(PRICING_VERSION, "2026-06-17");
     }
 
     #[test]
