@@ -46,6 +46,12 @@ export function formatCost(value: number): string {
   return `${symbol}${converted.toFixed(2)}`;
 }
 
+export function formatModelCost(value: number, pricingAvailable: boolean | undefined): string {
+  if (pricingAvailable === false) return "N/A";
+  if (value === 0) return "Free";
+  return formatCost(value);
+}
+
 export function formatTokens(count: number): string {
   if (count >= 1_000_000_000) return `${(count / 1_000_000_000).toFixed(1)}B`;
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
@@ -245,6 +251,103 @@ const DEVICE_COLOR_PALETTE = [
 export function deviceColor(alias: string): string {
   const idx = hashString(alias) % DEVICE_COLOR_PALETTE.length;
   return DEVICE_COLOR_PALETTE[idx];
+}
+
+// ── Device display names ──
+// A device's raw name (`DeviceSummary.device` / a chart segment's device key)
+// doubles as its identity — used for color, selection, sync, and IPC — so it is
+// never mutated. These helpers derive a friendlier *display* string only:
+//   • drop a trailing OS-style parenthetical, e.g. "My Mac (macOS)" → "My Mac"
+//   • turn "-" into spaces, e.g. "AWS-RustDesk" → "AWS RustDesk"
+// When two distinct devices would collapse to the same display string, the
+// parenthetical is kept on both so they stay distinguishable.
+
+const DEVICE_TRAILING_PARENS = /\s*\(([^()]*)\)\s*$/;
+const DEVICE_HASH_SUFFIX = /(?:[-\s]+)[0-9a-fA-F]{8}$/;
+const DEVICE_OS_SUFFIX = /(?:[-\s]+)(macOS|Windows|Linux)$/i;
+
+type DeviceNameInfo = {
+  base: string;
+  paren: string | null;
+  slugLike: boolean;
+};
+
+function normalizeDeviceIdentity(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+}
+
+function capitalizeFirstWord(value: string): string {
+  return value.replace(/[A-Za-z]/, (letter) => letter.toLocaleUpperCase());
+}
+
+function deviceNameInfo(raw: string): DeviceNameInfo {
+  const trimmed = raw.trim();
+  const paren = deviceNameParen(trimmed);
+  let stem = trimmed.replace(DEVICE_TRAILING_PARENS, "");
+  const hadHash = DEVICE_HASH_SUFFIX.test(stem);
+  stem = stem.replace(DEVICE_HASH_SUFFIX, "");
+  const hadOsSuffix = !paren && DEVICE_OS_SUFFIX.test(stem);
+  stem = stem.replace(DEVICE_OS_SUFFIX, "");
+
+  const spaced = stem.replace(/-/g, " ").replace(/\s+/g, " ").trim();
+  const slugLike = hadHash || hadOsSuffix;
+  const base = spaced || trimmed;
+  return {
+    base: slugLike ? capitalizeFirstWord(base) : base,
+    paren,
+    slugLike,
+  };
+}
+
+function deviceNameBase(raw: string): string {
+  return deviceNameInfo(raw).base;
+}
+
+function deviceNameParen(raw: string): string | null {
+  const inner = raw.match(DEVICE_TRAILING_PARENS)?.[1]?.trim();
+  return inner ? inner : null;
+}
+
+/** Friendly display form of a single device name (no collision awareness). */
+export function formatDeviceName(raw: string): string {
+  return deviceNameBase(raw);
+}
+
+/** Stable key for deciding whether two raw device aliases represent one device. */
+export function deviceIdentityKey(raw: string): string {
+  const info = deviceNameInfo(raw);
+  if (info.paren) return normalizeDeviceIdentity(raw.replace(/-/g, " "));
+  return normalizeDeviceIdentity(info.base);
+}
+
+/**
+ * Map each raw device name to its display name. When several distinct raw names
+ * share the same base form, the parenthetical (e.g. the OS) is kept so the
+ * collided devices stay distinguishable; a collided name with no parenthetical
+ * falls back to its raw form.
+ */
+export function deviceDisplayNames(rawNames: Iterable<string>): Map<string, string> {
+  const names = Array.from(new Set(rawNames));
+  const baseCounts = new Map<string, number>();
+  for (const raw of names) {
+    const base = deviceNameBase(raw);
+    baseCounts.set(base, (baseCounts.get(base) ?? 0) + 1);
+  }
+  const out = new Map<string, string>();
+  for (const raw of names) {
+    const info = deviceNameInfo(raw);
+    const base = info.base;
+    if ((baseCounts.get(base) ?? 0) > 1) {
+      if (info.slugLike) {
+        out.set(raw, base);
+      } else {
+        out.set(raw, info.paren ? `${base} (${info.paren})` : raw);
+      }
+    } else {
+      out.set(raw, base);
+    }
+  }
+  return out;
 }
 
 // ── Model colors ──

@@ -58,6 +58,36 @@ pub fn position_top_right(window: &WebviewWindow) {
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
+/// Re-snap the window to the top-right anchor, but ONLY if the window manager
+/// has drifted it away from there (beyond a small tolerance).
+///
+/// X11/Wayland window managers freely reposition top-level windows on their own
+/// — e.g. when another window (a file manager) opens, the WM can shift/re-stack
+/// the popover. The frontend resize/focus loop calls `set_window_size_and_align`
+/// very frequently; routing it through here re-anchors the popover top-right on
+/// the next tick instead of preserving the WM-drifted position (which made the
+/// window appear to "follow" the file manager). Gating on actual drift avoids a
+/// `set_position` on every tick — some WMs render redundant moves as jitter — so
+/// this is a no-op in the common (already-anchored) case.
+pub fn reanchor_top_right_if_drifted(window: &WebviewWindow) {
+    let Some((tx, ty)) = target_top_right(window) else {
+        return;
+    };
+    // Tolerance in physical px. The work-area clamp keeps the window an 8px*scale
+    // margin off the edge, so anything past ~24px is a genuine WM-driven move.
+    const DRIFT_TOLERANCE: i32 = 24;
+    if let Ok(pos) = window.outer_position() {
+        let anchored =
+            (pos.x - tx).abs() <= DRIFT_TOLERANCE && (pos.y - ty).abs() <= DRIFT_TOLERANCE;
+        if anchored {
+            // Already anchored — leave it alone (no extra X11 round-trip).
+            return;
+        }
+    }
+    let _ = window.set_position(tauri::PhysicalPosition::new(tx, ty));
+    super::clamp_window_to_work_area(window);
+}
+
 /// Spawn a deferred re-position loop that retries with increasing delays.
 ///
 /// Linux window managers process `show()` asynchronously — on the very first
