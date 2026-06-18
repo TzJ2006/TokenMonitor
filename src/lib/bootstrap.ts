@@ -133,6 +133,9 @@ export async function initializeRuntimeFromSettings(
       folder: saved.autoExportFolder,
       hiddenModels: saved.hiddenModels,
     }),
+    invokeFn("init_remote_device_include_flags", {
+      flags: saved.remoteDeviceIncludes,
+    }),
     invokeFn("set_cursor_auth_config", {
       apiKey: saved.cursorApiKey,
     }),
