@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tauri::State;
 
+const USAGE_PAYLOAD_CACHE_VERSION: &str = "model-pricing-2026-06-13";
+
 /// Ensure every day in [start, end) has a chart bucket, inserting empty buckets
 /// for days with no data.  This prevents the chart from appearing "cut off" when
 /// the current month hasn't ended yet.
@@ -76,26 +78,30 @@ fn filter_buckets_to_range(payload: &mut UsagePayload, start: NaiveDate, end: Na
         .count() as u32;
 
     // Rebuild model_breakdown from retained buckets
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
     for bucket in &payload.chart_buckets {
         for seg in &bucket.segments {
             let entry =
                 model_map
                     .entry(seg.model_key.clone())
-                    .or_insert((seg.model.clone(), 0.0, 0));
+                    .or_insert((seg.model.clone(), 0.0, 0, true));
             entry.1 += seg.cost;
             entry.2 += seg.tokens;
+            entry.3 &= seg.pricing_available;
         }
     }
     payload.model_breakdown = model_map
         .into_iter()
-        .map(|(key, (name, cost, tokens))| ModelSummary {
-            display_name: name,
-            model_key: key,
-            cost,
-            tokens,
-            change_stats: None,
-        })
+        .map(
+            |(key, (name, cost, tokens, pricing_available))| ModelSummary {
+                display_name: name,
+                model_key: key,
+                cost,
+                tokens,
+                pricing_available,
+                change_stats: None,
+            },
+        )
         .collect();
 
     // Recalculate input/output/cache tokens (populated later from raw entries)
@@ -192,7 +198,7 @@ fn final_usage_cache_key(provider: &str, period: &str, offset: i32) -> String {
     let date_tag = resolve_period_bounds(period, offset)
         .map(|b| b.start.format("%Y%m%d").to_string())
         .unwrap_or_default();
-    format!("usage-view:{provider}:{period}:{offset}:{date_tag}")
+    format!("usage-view:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{date_tag}")
 }
 
 async fn finalize_usage_payload(
@@ -277,7 +283,7 @@ pub(crate) fn get_provider_data(
     offset: i32,
 ) -> Result<UsagePayload, String> {
     // Single cache layer: stores the complete payload including stats.
-    let cache_key = format!("full:{}:{}:{}", provider, period, offset);
+    let cache_key = format!("full:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}");
     if let Some(cached) = parser.check_cache(&cache_key) {
         return Ok(cached);
     }
@@ -335,10 +341,12 @@ fn merge_payloads(mut c: UsagePayload, x: UsagePayload) -> UsagePayload {
                 model_key: model.model_key,
                 cost: 0.0,
                 tokens: 0,
+                pricing_available: true,
                 change_stats: None,
             });
         entry.cost += model.cost;
         entry.tokens += model.tokens;
+        entry.pricing_available &= model.pricing_available;
     }
 
     c.total_cost += x.total_cost;
@@ -674,8 +682,7 @@ pub(crate) async fn get_usage_data_inner(
                         // recomputes with the freshly-fetched remote data
                         // instead of re-serving a stale or empty disk entry.
                         if let Some(ref disk_cache) = *disk_cache_arc.read().await {
-                            disk_cache.clear_prefix("usage-view:cursor");
-                            disk_cache.clear_prefix("usage-view:all");
+                            disk_cache.clear_prefix("usage-view:");
                         }
                         let _ = app_handle.emit("data-updated", 0u64);
                     }
@@ -727,6 +734,7 @@ mod tests {
             model_key: model_key.to_string(),
             cost,
             tokens,
+            pricing_available: true,
             change_stats: None,
         }
     }
@@ -830,6 +838,87 @@ mod tests {
         );
 
         (state, claude_dir, codex_dir, app_data_dir)
+    }
+
+    #[tokio::test]
+    async fn source_change_must_invalidate_disk_cache_so_per_provider_view_refreshes() {
+        // Regression for DBG-010: the no-TTL payload disk cache re-served a
+        // stale per-provider payload after the in-memory cache was cleared,
+        // freezing the Claude/Codex tabs for the day while the `all` view kept
+        // refreshing (its disk entries are cleared by the cursor/SSH paths).
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let app_data_dir = TempDir::new().unwrap();
+        let now = Local::now();
+
+        write_file(
+            &claude_dir.path().join("session.jsonl"),
+            &claude_assistant_entry(&now.to_rfc3339(), "claude-sonnet-4-6-20260301", 1_000, 500),
+        );
+
+        let mut state = AppState::new();
+        state
+            .usage_access_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.parser = Arc::new(UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        ));
+        *state.payload_disk_cache.write().await = Some(
+            crate::usage::payload_disk_cache::PayloadDiskCache::new(app_data_dir.path()),
+        );
+
+        // Real computation: establishes the true cost and persists it to disk.
+        let real = get_usage_data_inner(None, &state, "claude", "day", 0)
+            .await
+            .unwrap();
+        assert!(
+            real.total_cost > 0.0,
+            "fixture should produce nonzero claude usage"
+        );
+
+        // Plant a stale payload on disk under the same key — as if it had been
+        // written earlier in the day, before more usage was logged — then clear
+        // ONLY the in-memory cache, exactly what the refresh loops used to do.
+        let key = final_usage_cache_key("claude", "day", 0);
+        let stale = UsagePayload {
+            total_cost: 999_999.0,
+            ..UsagePayload::default()
+        };
+        state
+            .payload_disk_cache
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .save(&key, &stale);
+        state.parser.clear_payload_cache();
+
+        // Bug reproduction: a memory-only invalidation re-serves the stale disk
+        // entry instead of recomputing.
+        let stale_served = get_usage_data_inner(None, &state, "claude", "day", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_served.total_cost, 999_999.0,
+            "guard: the disk cache short-circuits recompute on a memory miss"
+        );
+
+        // The fix: clearing the disk cache (what the refresh loops now do on a
+        // source change) forces a recompute that reflects the real logs again.
+        state.parser.clear_payload_cache();
+        state.clear_payload_disk_cache().await;
+        let fresh = get_usage_data_inner(None, &state, "claude", "day", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.total_cost, real.total_cost,
+            "after disk invalidation the per-provider view recomputes fresh"
+        );
+        assert!(
+            (fresh.total_cost - 999_999.0).abs() > 1.0,
+            "the stale payload must not survive disk invalidation"
+        );
     }
 
     #[tokio::test]

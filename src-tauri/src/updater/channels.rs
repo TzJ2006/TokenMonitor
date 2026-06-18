@@ -69,8 +69,12 @@ pub async fn discover_channels() -> Vec<ChannelInfo> {
 }
 
 async fn fetch_forks() -> Result<Vec<GithubFork>, String> {
+    // NOTE: the GitHub "List forks" endpoint only accepts sort values
+    // `newest` | `oldest` | `stargazers`. Passing `pushed` returns HTTP 400,
+    // which previously collapsed the fork list to empty (so no fork channels
+    // ever appeared in the updater channel selector).
     let url = format!(
-        "https://api.github.com/repos/{}/forks?per_page=100&sort=pushed",
+        "https://api.github.com/repos/{}/forks?per_page=100&sort=newest",
         UPSTREAM_REPO
     );
     let client = reqwest::Client::new();
