@@ -10,7 +10,7 @@ use crate::usage::integrations::{
 use chrono::{DateTime, Local, NaiveDate, Timelike};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -107,6 +107,36 @@ struct CachedRootFileList {
     directories: Arc<[DirectoryStamp]>,
     file_stamps: Arc<[FileListStamp]>,
     last_accessed_at: Instant,
+}
+
+/// Per-root result of a content-only change scan: the fully re-stat'd stamp
+/// list (so the listing can be refreshed without a second stat sweep) plus the
+/// subset of files whose stamp differs from the cached one (so only those need
+/// re-parsing).
+struct RootContentChange {
+    cache_key: String,
+    fresh_stamps: Vec<FileListStamp>,
+    changed_keys: Vec<String>,
+}
+
+/// Outcome of one source-change scan. Distinguishes a file-SET change
+/// (add/remove/rename, detected via directory mtime) from in-place CONTENT
+/// changes (append, detected via file stamp). A set change forces a full
+/// invalidation; content changes are applied surgically.
+#[derive(Default)]
+struct SourceChangeScan {
+    listing_changed: bool,
+    content_changes: Vec<RootContentChange>,
+}
+
+impl SourceChangeScan {
+    fn any(&self) -> bool {
+        self.listing_changed
+            || self
+                .content_changes
+                .iter()
+                .any(|c| !c.changed_keys.is_empty())
+    }
 }
 
 #[derive(Clone)]
@@ -389,11 +419,21 @@ pub(crate) fn format_hour(h: u32) -> String {
 // Shared aggregation utility — build segments map for a bucket
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Aggregate (display_name, cost, tokens) keyed by model_key for a slice of entries.
-fn build_segment_map(entries: &[&ParsedEntry]) -> HashMap<String, (String, f64, u64)> {
-    let mut map: HashMap<String, (String, f64, u64)> = HashMap::new();
+#[derive(Clone)]
+struct SegmentAgg {
+    display_name: String,
+    cost: f64,
+    tokens: u64,
+    pricing_available: bool,
+}
+
+/// Aggregate (display_name, cost, tokens, pricing_available) keyed by model_key
+/// for a slice of entries.
+fn build_segment_map(entries: &[&ParsedEntry]) -> HashMap<String, SegmentAgg> {
+    let mut map: HashMap<String, SegmentAgg> = HashMap::new();
     for e in entries {
         let (name, key) = normalize_model(&e.model);
+        let pricing_available = crate::usage::pricing::pricing_available_for_key(&key);
         let cost = crate::usage::pricing::calculate_cost_for_key(
             &key,
             e.input_tokens,
@@ -403,9 +443,15 @@ fn build_segment_map(entries: &[&ParsedEntry]) -> HashMap<String, (String, f64, 
             e.cache_read_tokens,
             e.web_search_requests,
         ) * crate::usage::pricing::provider_multiplier(&e.model);
-        let entry = map.entry(key).or_insert((name, 0.0, 0));
-        entry.1 += cost;
-        entry.2 += entry_total_tokens(e);
+        let entry = map.entry(key).or_insert(SegmentAgg {
+            display_name: name,
+            cost: 0.0,
+            tokens: 0,
+            pricing_available: true,
+        });
+        entry.cost += cost;
+        entry.tokens += entry_total_tokens(e);
+        entry.pricing_available &= pricing_available;
     }
     map
 }
@@ -418,24 +464,77 @@ fn entry_total_tokens(entry: &ParsedEntry) -> u64 {
         + entry.cache_read_tokens
 }
 
-fn segment_map_to_vec(map: HashMap<String, (String, f64, u64)>) -> Vec<ChartSegment> {
+fn entry_archive_hour(entry: &ParsedEntry) -> (NaiveDate, u8) {
+    (entry.timestamp.date_naive(), entry.timestamp.hour() as u8)
+}
+
+fn merge_archived_and_live_entries(
+    out: &mut Vec<ParsedEntry>,
+    archived: Vec<ParsedEntry>,
+    live: Vec<ParsedEntry>,
+    frontier: Option<super::archive::ArchiveFrontier>,
+) {
+    let Some(frontier) = frontier else {
+        out.extend(live);
+        return;
+    };
+
+    let mut archived_keys_by_hour: HashMap<(NaiveDate, u8), HashSet<String>> = HashMap::new();
+    for entry in &archived {
+        archived_keys_by_hour
+            .entry(entry_archive_hour(entry))
+            .or_default()
+            .insert(crate::models::normalized_model_key(&entry.model));
+    }
+
+    let mut replacement_hours: HashSet<(NaiveDate, u8)> = HashSet::new();
+    let mut live_to_add = Vec::new();
+    for entry in live {
+        let hour = entry_archive_hour(&entry);
+        if frontier.covers(hour.0, hour.1) {
+            let model_key = crate::models::normalized_model_key(&entry.model);
+            if let Some(archived_keys) = archived_keys_by_hour.get(&hour) {
+                if archived_keys.contains("unknown")
+                    && model_key != "unknown"
+                    && !archived_keys.contains(&model_key)
+                {
+                    replacement_hours.insert(hour);
+                    live_to_add.push(entry);
+                }
+            }
+        } else {
+            live_to_add.push(entry);
+        }
+    }
+
+    out.extend(archived.into_iter().filter(|entry| {
+        let hour = entry_archive_hour(entry);
+        !(replacement_hours.contains(&hour)
+            && crate::models::normalized_model_key(&entry.model) == "unknown")
+    }));
+    out.extend(live_to_add);
+}
+
+fn segment_map_to_vec(map: HashMap<String, SegmentAgg>) -> Vec<ChartSegment> {
     map.into_iter()
-        .map(|(key, (name, cost, tokens))| ChartSegment {
-            model: name,
+        .map(|(key, agg)| ChartSegment {
+            model: agg.display_name,
             model_key: key,
-            cost,
-            tokens,
+            cost: agg.cost,
+            tokens: agg.tokens,
+            pricing_available: agg.pricing_available,
         })
         .collect()
 }
 
-fn segment_map_to_model_summaries(map: &HashMap<String, (String, f64, u64)>) -> Vec<ModelSummary> {
+fn segment_map_to_model_summaries(map: &HashMap<String, SegmentAgg>) -> Vec<ModelSummary> {
     map.iter()
-        .map(|(key, (name, cost, tokens))| ModelSummary {
-            display_name: name.clone(),
+        .map(|(key, agg)| ModelSummary {
+            display_name: agg.display_name.clone(),
             model_key: key.clone(),
-            cost: *cost,
-            tokens: *tokens,
+            cost: agg.cost,
+            tokens: agg.tokens,
+            pricing_available: agg.pricing_available,
             change_stats: None,
         })
         .collect()
@@ -812,50 +911,147 @@ impl UsageParser {
         }
     }
 
-    /// Returns true if any integration root directory has changed since last scan.
-    /// When false, the payload cache is still valid and callers can skip a full refresh.
-    pub fn have_sources_changed(&self) -> bool {
+    /// Single stat sweep over the cached listings that classifies what changed.
+    ///
+    /// For every cached root it compares directory mtimes (cheap, detects
+    /// add/remove/rename) and, when the listing is unchanged, re-stats each file
+    /// to detect in-place appends. The fresh stamps are kept so a content-only
+    /// change can refresh the listing without a second stat pass — the same
+    /// sweep that detects the change also supplies the data to apply it.
+    fn scan_source_changes(&self) -> SourceChangeScan {
         let cache = match self.root_file_lists.lock() {
             Ok(c) => c,
-            Err(_) => return true,
+            // Poisoned lock: be conservative and force a full rescan.
+            Err(_) => {
+                return SourceChangeScan {
+                    listing_changed: true,
+                    content_changes: Vec::new(),
+                }
+            }
         };
 
         if cache.is_empty() {
-            return true;
+            return SourceChangeScan {
+                listing_changed: true,
+                content_changes: Vec::new(),
+            };
         }
 
-        for entry in cache.values() {
+        let mut scan = SourceChangeScan::default();
+        for (cache_key, entry) in cache.iter() {
             if !Self::root_listing_is_fresh(entry) {
-                return true;
+                // Directory mtime moved → files were added/removed/renamed. The
+                // next query rebuilds this root from scratch, so don't bother
+                // collecting per-file stamps for it.
+                scan.listing_changed = true;
+                continue;
             }
-            // Also check a sample of file stamps for content changes
-            // (directory mtime only detects add/remove, not in-place edits).
-            if Self::any_file_stamp_changed(entry) {
-                return true;
+
+            // Listing membership unchanged → look for in-place content edits
+            // (directory mtime is blind to appends into an existing file). The
+            // idle path (nothing changed) must stay allocation-free, so only
+            // the changed files are collected here; the full refreshed stamp
+            // list is materialized lazily (one slice clone) and only when
+            // something actually changed.
+            let mut changed: Vec<(usize, FileStamp)> = Vec::new();
+            let mut listing_changed = false;
+            for (i, file) in entry.file_stamps.iter().enumerate() {
+                match file_stamp(&file.path) {
+                    Some(stamp) => {
+                        if stamp != file.stamp {
+                            changed.push((i, stamp));
+                        }
+                    }
+                    None => {
+                        // A listed file vanished without the directory mtime
+                        // moving (rare fs race). Force a full rescan to stay
+                        // correct rather than trusting a phantom entry.
+                        listing_changed = true;
+                        break;
+                    }
+                }
+            }
+            if listing_changed {
+                scan.listing_changed = true;
+                continue;
+            }
+            if !changed.is_empty() {
+                let mut fresh_stamps = entry.file_stamps.to_vec();
+                let mut changed_keys = Vec::with_capacity(changed.len());
+                for (i, stamp) in changed {
+                    changed_keys.push(path_to_string(&fresh_stamps[i].path));
+                    fresh_stamps[i].stamp = stamp;
+                }
+                scan.content_changes.push(RootContentChange {
+                    cache_key: cache_key.clone(),
+                    fresh_stamps,
+                    changed_keys,
+                });
             }
         }
-
-        false
+        scan
     }
 
     /// Invalidate the payload cache only if source files have changed.
     /// Returns true if the cache was cleared.
+    ///
+    /// Splits the response by change kind: a file-SET change (add/remove/rename)
+    /// drops the listing and the earliest-entry-date cache for a full rescan,
+    /// while in-place CONTENT changes (appends — the common active-use case)
+    /// keep both. An append can never lower a provider's global earliest entry
+    /// date, so re-deriving it (a multi-hundred-ms re-parse of every session
+    /// file) is pure waste; and the file listing's membership is unchanged, so
+    /// the tree walk is skipped too. Only the appended files re-parse.
     pub fn invalidate_if_changed(&self) -> bool {
-        if self.have_sources_changed() {
-            self.clear_payload_cache();
-            self.clear_entries_cache();
-            // Clear root_file_lists so next query does a fresh scan
-            // (listing_cache_hit will be false, forcing fresh stat).
+        let scan = self.scan_source_changes();
+        if !scan.any() {
+            return false;
+        }
+
+        // Any change invalidates the derived payload + entries aggregates.
+        self.clear_payload_cache();
+
+        if scan.listing_changed {
+            // Clear the listing so the next query does a fresh scan
+            // (listing_cache_hit will be false, forcing a fresh stat).
             if let Ok(mut c) = self.root_file_lists.lock() {
                 c.clear();
             }
-            // Source files changed → the cached earliest date may be stale.
+            // The file set changed → the cached earliest date may be stale.
             if let Ok(mut c) = self.earliest_date_cache.lock() {
                 c.clear();
             }
-            true
         } else {
-            false
+            // Content-only change: keep the listing and earliest_date_cache; just
+            // refresh the changed files' stamps and drop their parsed entries.
+            self.apply_content_changes(scan.content_changes);
+        }
+        true
+    }
+
+    /// Apply in-place content changes surgically: drop the changed files'
+    /// `file_cache` entries (so the next query re-parses exactly them) and
+    /// refresh their stamps in the cached listing (reusing the stamps the scan
+    /// already collected, so the mtime filter sees the new mtimes without a
+    /// second stat sweep). Directory stamps are untouched — set membership held.
+    fn apply_content_changes(&self, changes: Vec<RootContentChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        if let Ok(mut fc) = self.file_cache.lock() {
+            for change in &changes {
+                for key in &change.changed_keys {
+                    fc.remove(key);
+                }
+            }
+        }
+        if let Ok(mut lists) = self.root_file_lists.lock() {
+            for change in changes {
+                if let Some(entry) = lists.get_mut(&change.cache_key) {
+                    entry.file_stamps = change.fresh_stamps.into();
+                    entry.last_accessed_at = Instant::now();
+                }
+            }
         }
     }
 
@@ -917,13 +1113,6 @@ impl UsageParser {
         // If all directory mtimes match, the file listing is still valid — no need
         // to re-stat every individual file (which costs ~0.4ms × 14K files on Windows).
         true
-    }
-
-    fn any_file_stamp_changed(entry: &CachedRootFileList) -> bool {
-        entry
-            .file_stamps
-            .iter()
-            .any(|file| file_stamp(&file.path).is_some_and(|stamp| stamp != file.stamp))
     }
 
     #[allow(clippy::type_complexity)]
@@ -1390,10 +1579,11 @@ impl UsageParser {
             let frontier = archive.and_then(|a| a.frontier(&source_key));
 
             // Load archived entries for completed hours (up to frontier).
-            if let (Some(a), Some(_frontier)) = (archive, frontier) {
-                let archived = a.load_archived(&source_key, since);
-                entries.extend(archived);
-            }
+            let archived = if let (Some(a), Some(_frontier)) = (archive, frontier) {
+                a.load_archived(&source_key, since)
+            } else {
+                Vec::new()
+            };
 
             // Load live entries from source JSONL files.
             match integration_id {
@@ -1401,15 +1591,7 @@ impl UsageParser {
                     let (next_entries, next_change_events, next_reports) =
                         self.load_claude_entries_with_debug(since);
 
-                    // If archive covers some hours, filter live entries to
-                    // only include those AFTER the archive frontier.
-                    if let Some(ref f) = frontier {
-                        entries.extend(next_entries.into_iter().filter(|e| {
-                            !f.covers(e.timestamp.date_naive(), e.timestamp.hour() as u8)
-                        }));
-                    } else {
-                        entries.extend(next_entries);
-                    }
+                    merge_archived_and_live_entries(&mut entries, archived, next_entries, frontier);
                     change_events.extend(next_change_events);
                     reports.extend(next_reports);
                 }
@@ -1417,13 +1599,7 @@ impl UsageParser {
                     let (next_entries, next_change_events, next_report) =
                         self.load_codex_entries_with_debug(since);
 
-                    if let Some(ref f) = frontier {
-                        entries.extend(next_entries.into_iter().filter(|e| {
-                            !f.covers(e.timestamp.date_naive(), e.timestamp.hour() as u8)
-                        }));
-                    } else {
-                        entries.extend(next_entries);
-                    }
+                    merge_archived_and_live_entries(&mut entries, archived, next_entries, frontier);
                     change_events.extend(next_change_events);
                     reports.push(next_report);
                 }
@@ -1431,13 +1607,7 @@ impl UsageParser {
                     let (next_entries, next_change_events, next_report) =
                         self.load_cursor_entries_with_debug(since);
 
-                    if let Some(ref f) = frontier {
-                        entries.extend(next_entries.into_iter().filter(|e| {
-                            !f.covers(e.timestamp.date_naive(), e.timestamp.hour() as u8)
-                        }));
-                    } else {
-                        entries.extend(next_entries);
-                    }
+                    merge_archived_and_live_entries(&mut entries, archived, next_entries, frontier);
                     change_events.extend(next_change_events);
                     reports.push(next_report);
                 }
@@ -1609,13 +1779,13 @@ impl UsageParser {
         let mut total_tokens = 0u64;
         let mut total_input = 0u64;
         let mut total_output = 0u64;
-        let mut global_model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+        let mut global_model_map: HashMap<String, SegmentAgg> = HashMap::new();
 
         for (date, day_entries) in &day_map {
             let label = date.format("%b %-d").to_string();
             let seg_map = build_segment_map(day_entries);
-            let bucket_cost: f64 = seg_map.values().map(|(_, c, _)| c).sum();
-            let bucket_tokens: u64 = seg_map.values().map(|(_, _, t)| t).sum();
+            let bucket_cost: f64 = seg_map.values().map(|agg| agg.cost).sum();
+            let bucket_tokens: u64 = seg_map.values().map(|agg| agg.tokens).sum();
 
             total_cost += bucket_cost;
             total_tokens += bucket_tokens;
@@ -1626,12 +1796,16 @@ impl UsageParser {
             }
 
             // Merge into global model map
-            for (key, (name, cost, tokens)) in &seg_map {
-                let gm = global_model_map
-                    .entry(key.clone())
-                    .or_insert((name.clone(), 0.0, 0));
-                gm.1 += cost;
-                gm.2 += tokens;
+            for (key, agg) in &seg_map {
+                let gm = global_model_map.entry(key.clone()).or_insert(SegmentAgg {
+                    display_name: agg.display_name.clone(),
+                    cost: 0.0,
+                    tokens: 0,
+                    pricing_available: true,
+                });
+                gm.cost += agg.cost;
+                gm.tokens += agg.tokens;
+                gm.pricing_available &= agg.pricing_available;
             }
 
             chart_buckets.push(ChartBucket {
@@ -1704,7 +1878,7 @@ impl UsageParser {
         let mut total_tokens = 0u64;
         let mut total_input = 0u64;
         let mut total_output = 0u64;
-        let mut global_model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+        let mut global_model_map: HashMap<String, SegmentAgg> = HashMap::new();
 
         for (ym, month_entries) in &month_map {
             // Label: parse "YYYY-MM" -> "Jan", "Feb", etc.
@@ -1713,8 +1887,8 @@ impl UsageParser {
                 .unwrap_or_else(|_| ym.clone());
 
             let seg_map = build_segment_map(month_entries);
-            let bucket_cost: f64 = seg_map.values().map(|(_, c, _)| c).sum();
-            let bucket_tokens: u64 = seg_map.values().map(|(_, _, t)| t).sum();
+            let bucket_cost: f64 = seg_map.values().map(|agg| agg.cost).sum();
+            let bucket_tokens: u64 = seg_map.values().map(|agg| agg.tokens).sum();
 
             total_cost += bucket_cost;
             total_tokens += bucket_tokens;
@@ -1724,12 +1898,16 @@ impl UsageParser {
                 total_output += e.output_tokens;
             }
 
-            for (key, (name, cost, tokens)) in &seg_map {
-                let gm = global_model_map
-                    .entry(key.clone())
-                    .or_insert((name.clone(), 0.0, 0));
-                gm.1 += cost;
-                gm.2 += tokens;
+            for (key, agg) in &seg_map {
+                let gm = global_model_map.entry(key.clone()).or_insert(SegmentAgg {
+                    display_name: agg.display_name.clone(),
+                    cost: 0.0,
+                    tokens: 0,
+                    pricing_available: true,
+                });
+                gm.cost += agg.cost;
+                gm.tokens += agg.tokens;
+                gm.pricing_available &= agg.pricing_available;
             }
 
             chart_buckets.push(ChartBucket {
@@ -1817,15 +1995,15 @@ impl UsageParser {
         let mut total_tokens = 0u64;
         let mut total_input = 0u64;
         let mut total_output = 0u64;
-        let mut global_model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+        let mut global_model_map: HashMap<String, SegmentAgg> = HashMap::new();
 
         for h in start_hour..=end_hour {
             let label = format_hour(h);
             let hour_entries = hour_map.get(&h).map(|v| v.as_slice()).unwrap_or(&[]);
 
             let seg_map = build_segment_map(hour_entries);
-            let bucket_cost: f64 = seg_map.values().map(|(_, c, _)| c).sum();
-            let bucket_tokens: u64 = seg_map.values().map(|(_, _, t)| t).sum();
+            let bucket_cost: f64 = seg_map.values().map(|agg| agg.cost).sum();
+            let bucket_tokens: u64 = seg_map.values().map(|agg| agg.tokens).sum();
 
             total_cost += bucket_cost;
             total_tokens += bucket_tokens;
@@ -1835,12 +2013,16 @@ impl UsageParser {
                 total_output += e.output_tokens;
             }
 
-            for (key, (name, cost, tokens)) in &seg_map {
-                let gm = global_model_map
-                    .entry(key.clone())
-                    .or_insert((name.clone(), 0.0, 0));
-                gm.1 += cost;
-                gm.2 += tokens;
+            for (key, agg) in &seg_map {
+                let gm = global_model_map.entry(key.clone()).or_insert(SegmentAgg {
+                    display_name: agg.display_name.clone(),
+                    cost: 0.0,
+                    tokens: 0,
+                    pricing_available: true,
+                });
+                gm.cost += agg.cost;
+                gm.tokens += agg.tokens;
+                gm.pricing_available &= agg.pricing_available;
             }
 
             chart_buckets.push(ChartBucket {
@@ -1930,24 +2112,28 @@ impl UsageParser {
         let mut chart_buckets: Vec<ChartBucket> = Vec::new();
         let mut total_cost = 0.0f64;
         let mut total_tokens = 0u64;
-        let mut global_model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+        let mut global_model_map: HashMap<String, SegmentAgg> = HashMap::new();
         let mut active_block: Option<ActiveBlock> = None;
         let mut five_hour_cost = 0.0f64;
 
         for (idx, block) in blocks.iter().enumerate() {
             let seg_map = build_segment_map(block);
-            let block_cost: f64 = seg_map.values().map(|(_, c, _)| c).sum();
-            let block_tokens: u64 = seg_map.values().map(|(_, _, t)| t).sum();
+            let block_cost: f64 = seg_map.values().map(|agg| agg.cost).sum();
+            let block_tokens: u64 = seg_map.values().map(|agg| agg.tokens).sum();
 
             total_cost += block_cost;
             total_tokens += block_tokens;
 
-            for (key, (name, cost, tokens)) in &seg_map {
-                let gm = global_model_map
-                    .entry(key.clone())
-                    .or_insert((name.clone(), 0.0, 0));
-                gm.1 += cost;
-                gm.2 += tokens;
+            for (key, agg) in &seg_map {
+                let gm = global_model_map.entry(key.clone()).or_insert(SegmentAgg {
+                    display_name: agg.display_name.clone(),
+                    cost: 0.0,
+                    tokens: 0,
+                    pricing_available: true,
+                });
+                gm.cost += agg.cost;
+                gm.tokens += agg.tokens;
+                gm.pricing_available &= agg.pricing_available;
             }
 
             // Label: start time of block formatted as "9am", "10am", etc.
@@ -2044,6 +2230,43 @@ mod tests {
 
     fn write_file(path: &Path, content: &str) {
         fs::write(path, content).unwrap();
+    }
+
+    fn test_entry(model: &str, hour: u32) -> ParsedEntry {
+        use chrono::TimeZone;
+
+        ParsedEntry {
+            timestamp: Local
+                .with_ymd_and_hms(2026, 6, 12, hour, 5, 0)
+                .single()
+                .unwrap(),
+            model: model.to_string(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            cache_read_tokens: 0,
+            web_search_requests: 0,
+            unique_hash: None,
+            session_key: String::from("test"),
+            agent_scope: crate::stats::subagent::AgentScope::Main,
+        }
+    }
+
+    #[test]
+    fn archived_unknown_hour_is_replaced_by_live_named_model() {
+        let archived = vec![test_entry("unknown", 10)];
+        let live = vec![test_entry("claude-fable-5", 10)];
+        let frontier = crate::usage::archive::ArchiveFrontier {
+            date: archived[0].timestamp.date_naive(),
+            hour: 10,
+        };
+
+        let mut merged = Vec::new();
+        merge_archived_and_live_entries(&mut merged, archived, live, Some(frontier));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].model, "claude-fable-5");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3015,6 +3238,140 @@ mod tests {
             parser.check_cache("sentinel").is_none(),
             "payload cache should be cleared after source file content changes"
         );
+    }
+
+    #[test]
+    fn content_append_keeps_earliest_date_cache_warm() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        write_file(
+            &path,
+            r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+        );
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+
+        // Warm the listing + earliest-date caches.
+        parser.get_daily("claude", "20260101");
+        let _ = parser.has_entries_before("claude", NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
+        assert!(
+            parser
+                .earliest_date_cache
+                .lock()
+                .unwrap()
+                .contains_key("claude"),
+            "earliest-date cache should be warm after the first probe"
+        );
+
+        // Append a newer entry to the SAME file (in-place content change).
+        write_file(
+            &path,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-03-16T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":200,"output_tokens":75}}}"#,
+            ),
+        );
+
+        assert!(
+            parser.invalidate_if_changed(),
+            "append must invalidate the payload cache"
+        );
+
+        // An append can never lower the global earliest date, so its cache must
+        // be PRESERVED — no multi-hundred-ms re-parse-all on the next query.
+        assert!(
+            parser
+                .earliest_date_cache
+                .lock()
+                .unwrap()
+                .contains_key("claude"),
+            "earliest-date cache must survive a content-only append"
+        );
+        // And the answer is still correct.
+        assert!(parser.has_entries_before("claude", NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()));
+        assert!(!parser.has_entries_before("claude", NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()));
+    }
+
+    #[test]
+    fn adding_new_file_clears_earliest_date_cache() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir.path().join("session-a.jsonl"),
+            r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+        );
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+        parser.get_daily("claude", "20260101");
+        let _ = parser.has_entries_before("claude", NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
+        assert!(parser
+            .earliest_date_cache
+            .lock()
+            .unwrap()
+            .contains_key("claude"));
+
+        // A brand-new file could contain backdated data → the earliest date may
+        // change, so adding one must clear the cache for a fresh recompute.
+        write_file(
+            &dir.path().join("session-b.jsonl"),
+            r#"{"type":"assistant","timestamp":"2026-03-16T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":200,"output_tokens":75}}}"#,
+        );
+        filetime::set_file_mtime(
+            dir.path(),
+            filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+            ),
+        )
+        .unwrap();
+
+        assert!(parser.invalidate_if_changed());
+        assert!(
+            !parser
+                .earliest_date_cache
+                .lock()
+                .unwrap()
+                .contains_key("claude"),
+            "adding a file must clear the earliest-date cache (potential backdated data)"
+        );
+    }
+
+    #[test]
+    fn content_append_keeps_listing_and_reparses_only_changed_file() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        write_file(
+            &a,
+            r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+        );
+        write_file(
+            &b,
+            r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        );
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+        parser.get_monthly("claude", "20260101");
+
+        // Append only to a.jsonl (in-place content change, set unchanged).
+        write_file(
+            &a,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-03-16T12:00:00+00:00","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":300,"output_tokens":80}}}"#,
+            ),
+        );
+        assert!(parser.invalidate_if_changed());
+
+        parser.get_monthly("claude", "20260101");
+        let debug = parser.last_query_debug().unwrap();
+        // Membership unchanged → the listing cache is kept (no tree re-walk).
+        assert!(
+            debug.sources[0].listing_cache_hit,
+            "listing cache must survive a content-only append"
+        );
+        // Exactly the changed file re-parses; the untouched file is served from
+        // the per-file cache.
+        assert_eq!(debug.sources[0].opened_paths, 1);
+        assert_eq!(debug.sources[0].cache_misses, 1);
+        assert_eq!(debug.sources[0].cache_hits, 1);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
