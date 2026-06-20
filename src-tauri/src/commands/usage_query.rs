@@ -192,13 +192,28 @@ fn attach_local_stats(
     );
 }
 
-fn final_usage_cache_key(provider: &str, period: &str, offset: i32) -> String {
+fn final_usage_cache_key(provider: &str, period: &str, offset: i32, interval_secs: u64) -> String {
     // Include the resolved start date so date-relative keys (e.g. "day:0" = today)
     // don't serve stale disk-cached payloads after a date rollover.
     let date_tag = resolve_period_bounds(period, offset)
         .map(|b| b.start.format("%Y%m%d").to_string())
         .unwrap_or_default();
-    format!("usage-view:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{date_tag}")
+    // The 5h window rolls continuously with wall-clock time, so a key fixed to
+    // provider:period:offset:date would serve a frozen payload until the source
+    // logs change. Mix in a coarse time bucket sized to the user's refresh
+    // interval so the window recomputes once per interval. Other periods are
+    // day-granular and need no sub-day busting. interval_secs == 0 ("off")
+    // falls back to the date-only key — no periodic refresh is expected then.
+    let bucket_tag = if period == "5h" && interval_secs > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!(":b{}", now / interval_secs)
+    } else {
+        String::new()
+    };
+    format!("usage-view:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{date_tag}{bucket_tag}")
 }
 
 async fn finalize_usage_payload(
@@ -514,7 +529,13 @@ pub(crate) async fn get_usage_data_inner(
 
     let parser = &state.parser;
     let selection = parse_usage_selection(provider)?;
-    let final_cache_key = final_usage_cache_key(provider, period, offset);
+    let refresh_interval_secs = *state.refresh_interval.read().await;
+    let final_cache_key = final_usage_cache_key(provider, period, offset, refresh_interval_secs);
+    // The 5h key is time-bucketed (see final_usage_cache_key), so every refresh
+    // interval mints a fresh key. The disk cache has no TTL, so persisting one
+    // entry per bucket would bloat it without ever being re-read (cold starts
+    // land in a new bucket). Keep 5h in the TTL-bounded memory cache only.
+    let use_disk_cache = period != "5h";
     if let Some(cached) = parser.check_cache(&final_cache_key) {
         tracing::info!(
             "[DEVICE] get_usage_data HIT MEMORY CACHE: key={final_cache_key} total_cost={:.2}",
@@ -537,25 +558,27 @@ pub(crate) async fn get_usage_data_inner(
     }
 
     // Disk cache fallback: return stale data instantly, caller refreshes in background.
-    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
-        if let Some(mut cached) = disk_cache.load(&final_cache_key) {
-            // Ignore payloads persisted while async cursor data was still
-            // pending: the disk cache has no TTL, so serving a `cursor_loading`
-            // payload would show empty cursor usage forever (and the disk hit
-            // returns before the background-fetch spawn below, so it can never
-            // self-heal). Treat it as a miss to recompute + re-trigger fetch.
-            if cached.cursor_loading {
-                tracing::info!(
+    if use_disk_cache {
+        if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+            if let Some(mut cached) = disk_cache.load(&final_cache_key) {
+                // Ignore payloads persisted while async cursor data was still
+                // pending: the disk cache has no TTL, so serving a `cursor_loading`
+                // payload would show empty cursor usage forever (and the disk hit
+                // returns before the background-fetch spawn below, so it can never
+                // self-heal). Treat it as a miss to recompute + re-trigger fetch.
+                if cached.cursor_loading {
+                    tracing::info!(
                     "[DEVICE] get_usage_data DISK CACHE SKIP (incomplete/cursor_loading): key={final_cache_key}"
                 );
-            } else {
-                tracing::info!(
+                } else {
+                    tracing::info!(
                     "[DEVICE] get_usage_data HIT DISK CACHE: key={final_cache_key} total_cost={:.2}",
                     cached.total_cost,
                 );
-                cached.from_cache = true;
-                parser.store_cache(&final_cache_key, cached.clone());
-                return Ok(cached);
+                    cached.from_cache = true;
+                    parser.store_cache(&final_cache_key, cached.clone());
+                    return Ok(cached);
+                }
             }
         }
     }
@@ -651,7 +674,7 @@ pub(crate) async fn get_usage_data_inner(
     // Persist to disk for next cold start (fire-and-forget). Never persist an
     // incomplete payload: a `cursor_loading` payload is missing its async
     // remote data, and the TTL-less disk cache would serve it forever.
-    if !payload.cursor_loading {
+    if use_disk_cache && !payload.cursor_loading {
         if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
             disk_cache.save(&final_cache_key, &payload);
         }
@@ -880,7 +903,7 @@ mod tests {
         // Plant a stale payload on disk under the same key — as if it had been
         // written earlier in the day, before more usage was logged — then clear
         // ONLY the in-memory cache, exactly what the refresh loops used to do.
-        let key = final_usage_cache_key("claude", "day", 0);
+        let key = final_usage_cache_key("claude", "day", 0, 0);
         let stale = UsagePayload {
             total_cost: 999_999.0,
             ..UsagePayload::default()
@@ -1186,11 +1209,47 @@ mod tests {
     }
 
     #[test]
+    fn five_hour_cache_key_is_time_bucketed_by_refresh_interval() {
+        // The rolling 5h window must recompute once per refresh interval, so its
+        // key carries a wall-clock bucket sized to the interval. A 30s interval
+        // and a 300s interval land the same instant in different-width buckets,
+        // so their keys differ.
+        let k30 = final_usage_cache_key("claude", "5h", 0, 30);
+        let k300 = final_usage_cache_key("claude", "5h", 0, 300);
+        assert_ne!(
+            k30, k300,
+            "5h key must vary with the refresh interval bucket size"
+        );
+        assert!(k30.contains(":b"), "5h key should carry a time bucket tag");
+
+        // Non-5h periods are day-granular and must stay interval-independent so
+        // their disk-cache entries remain reusable across refreshes.
+        let day_30 = final_usage_cache_key("claude", "day", 0, 30);
+        let day_300 = final_usage_cache_key("claude", "day", 0, 300);
+        assert_eq!(
+            day_30, day_300,
+            "non-5h keys must not depend on the interval"
+        );
+        assert!(
+            !day_30.contains(":b"),
+            "non-5h key should carry no bucket tag"
+        );
+
+        // "Off" (interval 0) disables periodic refresh, so the 5h key falls back
+        // to the date-only form rather than bucketing by a zero-width slot.
+        let five_off = final_usage_cache_key("claude", "5h", 0, 0);
+        assert!(
+            !five_off.contains(":b"),
+            "5h key must not bucket when refresh is off"
+        );
+    }
+
+    #[test]
     fn clearing_usage_view_cache_keeps_provider_cache_entries() {
         let dir = TempDir::new().unwrap();
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
         let full_key = String::from("full:claude:day:0");
-        let final_key = final_usage_cache_key("claude", "day", 0);
+        let final_key = final_usage_cache_key("claude", "day", 0, 0);
 
         parser.store_cache(&full_key, UsagePayload::default());
         parser.store_cache(&final_key, UsagePayload::default());
