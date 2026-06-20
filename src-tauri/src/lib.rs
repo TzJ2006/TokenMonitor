@@ -633,6 +633,28 @@ async fn background_loop(app: tauri::AppHandle) {
         });
     }
 
+    // One-shot on launch: probe rate limits immediately instead of waiting for
+    // the first periodic refresh (~2.5 min in). cached_rate_limits starts empty,
+    // so this re-probes fresh for every provider — notably Codex, whose periodic
+    // refresh is throttled to 5 min and would otherwise sit on stale hydrated
+    // data showing "(stale)" right after the app opens. Spawned (not awaited):
+    // the Codex app-server probe can take up to 15s and must not delay the loop.
+    // Emits `data-updated` afterward so the 5h view re-pulls the fresh windows.
+    if state
+        .usage_access_enabled
+        .load(std::sync::atomic::Ordering::SeqCst)
+        && state
+            .rate_limits_enabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            let state = app_clone.state::<AppState>();
+            refresh_rate_limits(&app_clone, &state).await;
+            let _ = app_clone.emit("data-updated", 0u64);
+        });
+    }
+
     // One-shot on launch: purge duplicate device sources left by older builds
     // (the same machine counted under several drifted slugs, or a peer under both
     // its hash-less and canonical alias). The local archive persists across
@@ -643,6 +665,12 @@ async fn background_loop(app: tauri::AppHandle) {
     let mut ssh_sync_counter: u64 = 0;
     let mut rate_limit_counter: u64 = 0;
     let mut pricing_counter: u64 = 0;
+    // Tracks which refresh-interval-sized time bucket the rolling 5h window is
+    // in. The 5h payload cache key is bucketed by the same size, so when this
+    // advances the cached 5h numbers are stale-by-time even if no source log
+    // changed — we emit `data-updated` to nudge the UI to re-fetch. Starts at 0
+    // so the first cycle always emits once shortly after launch.
+    let mut last_five_hour_bucket: u64 = 0;
 
     loop {
         let interval_secs = {
@@ -757,6 +785,20 @@ async fn background_loop(app: tauri::AppHandle) {
         // no-op when disabled or no folder is configured.
         commands::usage_io::run_auto_export(&app, &state).await;
 
+        // The rolling 5h window advances with wall-clock time, not just log
+        // changes. Its cache key is bucketed by the refresh interval (see
+        // final_usage_cache_key), so once we cross into a new bucket the cached
+        // 5h payload is stale-by-time. Detect the roll and nudge the UI to
+        // re-fetch — the existing `data-updated` listener recomputes the fresh
+        // window (and re-pulls rate limits when the 5h view is open).
+        let current_five_hour_bucket = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            / interval_secs;
+        let five_hour_bucket_rolled = current_five_hour_bucket != last_five_hour_bucket;
+        last_five_hour_bucket = current_five_hour_bucket;
+
         if changed {
             // Local source logs changed. `invalidate_if_changed()` above already
             // dropped the in-memory payload cache, but the no-TTL disk cache
@@ -764,6 +806,8 @@ async fn background_loop(app: tauri::AppHandle) {
             // Claude/Codex tabs froze for the day while `all` stayed fresh). Drop
             // the disk entries too so the next fetch recomputes from fresh logs.
             state.clear_payload_disk_cache().await;
+            let _ = app.emit("data-updated", update_counter);
+        } else if five_hour_bucket_rolled && usage_access_enabled {
             let _ = app.emit("data-updated", update_counter);
         }
     }
