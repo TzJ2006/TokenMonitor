@@ -3,7 +3,7 @@ use chrono::{DateTime, Local, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
@@ -299,6 +299,52 @@ pub(super) async fn fetch_codex_rate_limits_via_cli(
     result
 }
 
+/// True when `line` is a JSON-RPC message carrying `"id": id`. Responses to our
+/// requests echo the request id; unsolicited notifications carry a `"method"`
+/// and no id, so they probe to `false`.
+fn response_has_id(line: &str, id: u64) -> bool {
+    #[derive(Deserialize)]
+    struct IdProbe {
+        id: Option<u64>,
+    }
+    serde_json::from_str::<IdProbe>(line)
+        .ok()
+        .and_then(|probe| probe.id)
+        == Some(id)
+}
+
+/// Read app-server lines until the response matching `id` arrives, skipping
+/// blanks and interleaved notifications. The app-server pushes unsolicited
+/// notifications (e.g. `remoteControl/status/changed`) between responses, so a
+/// single `read_line` after a request can land on a notification instead of the
+/// result — the bug that made every Codex probe fall back to the stale log file.
+async fn read_json_rpc_response<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    id: u64,
+) -> Result<String, RateLimitFetchError> {
+    // Bounded so a chatty server can never spin forever; the outer 15s timeout
+    // is the real ceiling. 64 lines is far more than the handshake ever emits.
+    const MAX_LINES: usize = 64;
+    for _ in 0..MAX_LINES {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).await.map_err(|e| {
+            RateLimitFetchError::message(format!("Failed to read app-server response: {e}"))
+        })?;
+        if bytes == 0 {
+            return Err(RateLimitFetchError::message(
+                "Codex app-server closed before responding",
+            ));
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && response_has_id(trimmed, id) {
+            return Ok(trimmed.to_string());
+        }
+    }
+    Err(RateLimitFetchError::message(
+        "Codex app-server sent no matching response",
+    ))
+}
+
 async fn app_server_exchange(
     child: &mut tokio::process::Child,
 ) -> Result<ProviderRateLimits, RateLimitFetchError> {
@@ -328,12 +374,8 @@ async fn app_server_exchange(
         .await
         .map_err(|e| RateLimitFetchError::message(format!("Failed to flush init: {e}")))?;
 
-    // 2. Read initialize response
-    let mut init_line = String::new();
-    reader
-        .read_line(&mut init_line)
-        .await
-        .map_err(|e| RateLimitFetchError::message(format!("Failed to read init response: {e}")))?;
+    // 2. Read initialize response (id:0), skipping any interleaved notifications.
+    let _init_line = read_json_rpc_response(&mut reader, 0).await?;
 
     // 3. Send rateLimits/read
     let rl_msg = r#"{"jsonrpc":"2.0","id":1,"method":"account/rateLimits/read","params":null}"#;
@@ -349,19 +391,10 @@ async fn app_server_exchange(
         .await
         .map_err(|e| RateLimitFetchError::message(format!("Failed to flush request: {e}")))?;
 
-    // 4. Read rate limits response
-    let mut rl_line = String::new();
-    reader.read_line(&mut rl_line).await.map_err(|e| {
-        RateLimitFetchError::message(format!("Failed to read rate limits response: {e}"))
-    })?;
-
-    if rl_line.trim().is_empty() {
-        return Err(RateLimitFetchError::message(
-            "Codex app-server returned empty response",
-        ));
-    }
-
-    parse_rate_limits_response(rl_line.trim())
+    // 4. Read the id:1 response, skipping notifications (e.g.
+    // `remoteControl/status/changed`) the server interleaves between replies.
+    let rl_line = read_json_rpc_response(&mut reader, 1).await?;
+    parse_rate_limits_response(&rl_line)
 }
 
 #[cfg(test)]
@@ -426,6 +459,38 @@ mod tests {
 
         assert!(result.cooldown_until.is_some());
         assert_eq!(result.windows[0].utilization, 100.0);
+    }
+
+    #[tokio::test]
+    async fn read_json_rpc_response_skips_interleaved_notifications() {
+        // Real capture: the app-server pushes a `remoteControl/status/changed`
+        // notification between the init response (id:0) and the rate-limits
+        // response (id:1). Reading a single line after the request grabbed the
+        // notification and the probe failed → fell back to the stale log file.
+        let stream = concat!(
+            r#"{"id":0,"result":{"userAgent":"x"}}"#,
+            "\n",
+            r#"{"method":"remoteControl/status/changed","params":{"status":"disabled"}}"#,
+            "\n",
+            r#"{"id":1,"result":{"rateLimits":{"primary":{"usedPercent":76,"windowDurationMins":300,"resetsAt":1781919685},"secondary":{"usedPercent":32,"windowDurationMins":10080,"resetsAt":1782346631},"credits":null,"planType":"plus","rateLimitReachedType":null}}}"#,
+            "\n",
+        );
+        let mut reader = BufReader::new(stream.as_bytes());
+
+        // Init handshake consumes id:0, skipping nothing yet.
+        let init = read_json_rpc_response(&mut reader, 0).await.unwrap();
+        assert!(init.contains("\"id\":0"));
+
+        // The rate-limits read must skip the notification and land on id:1.
+        let rl_line = read_json_rpc_response(&mut reader, 1).await.unwrap();
+        let result = parse_rate_limits_response(&rl_line).unwrap();
+        let primary = result
+            .windows
+            .iter()
+            .find(|w| w.window_id == "primary")
+            .unwrap();
+        assert_eq!(primary.utilization, 76.0);
+        assert!(!result.stale);
     }
 
     #[test]
