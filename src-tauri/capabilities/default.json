@@ -20,10 +20,13 @@
     "autostart:default",
     "updater:default",
     "notification:allow-is-permission-granted",
+    "dialog:allow-save",
+    "dialog:allow-open",
     {
       "identifier": "opener:allow-open-url",
       "allow": [
         { "url": "https://github.com/Michael-OvO/TokenMonitor/releases/**" },
+        { "url": "https://github.com/*/TokenMonitor/releases/**" },
         { "url": "https://cursor.com/dashboard" }
       ]
     }

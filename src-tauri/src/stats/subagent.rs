@@ -1,6 +1,6 @@
 // src-tauri/src/subagent_stats.rs
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -12,11 +12,13 @@ pub enum AgentScope {
 
 // ── Public types ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeModelUsage {
     pub display_name: String,
     pub model_key: String,
     pub cost: f64,
+    #[serde(default = "default_pricing_available")]
+    pub pricing_available: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -24,7 +26,11 @@ pub struct ScopeModelUsage {
     pub cache_write_1h_tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+fn default_pricing_available() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeUsageSummary {
     pub cost: f64,
     pub tokens: u64,
@@ -40,20 +46,34 @@ pub struct ScopeUsageSummary {
     pub removed_lines: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentStats {
     pub main: ScopeUsageSummary,
     pub subagents: ScopeUsageSummary,
 }
 
-#[derive(Default)]
 struct ModelAccum {
     cost: f64,
+    pricing_available: bool,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_5m_tokens: u64,
     cache_write_1h_tokens: u64,
+}
+
+impl Default for ModelAccum {
+    fn default() -> Self {
+        Self {
+            cost: 0.0,
+            pricing_available: true,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_5m_tokens: 0,
+            cache_write_1h_tokens: 0,
+        }
+    }
 }
 
 // ── Internal builder ────────────────────────────────────────────────────────
@@ -89,6 +109,7 @@ impl ScopeSummaryBuilder {
 
     fn add_entry(&mut self, entry: &crate::usage::parser::ParsedEntry) {
         let model_key = crate::models::normalized_model_key(&entry.model);
+        let pricing_available = crate::usage::pricing::pricing_available_for_key(&model_key);
         let entry_cost = crate::usage::pricing::calculate_cost_for_key(
             &model_key,
             entry.input_tokens,
@@ -97,7 +118,7 @@ impl ScopeSummaryBuilder {
             entry.cache_creation_1h_tokens,
             entry.cache_read_tokens,
             entry.web_search_requests,
-        );
+        ) * crate::usage::pricing::provider_multiplier(&entry.model);
         self.cost += entry_cost;
         self.input_tokens += entry.input_tokens;
         self.output_tokens += entry.output_tokens;
@@ -111,6 +132,7 @@ impl ScopeSummaryBuilder {
 
         let ma = self.model_stats.entry(entry.model.clone()).or_default();
         ma.cost += entry_cost;
+        ma.pricing_available &= pricing_available;
         ma.input_tokens += entry.input_tokens;
         ma.output_tokens += entry.output_tokens;
         ma.cache_read_tokens += entry.cache_read_tokens;
@@ -155,6 +177,7 @@ impl ScopeSummaryBuilder {
                     display_name,
                     model_key,
                     cost: accum.cost,
+                    pricing_available: accum.pricing_available,
                     input_tokens: accum.input_tokens,
                     output_tokens: accum.output_tokens,
                     cache_read_tokens: accum.cache_read_tokens,

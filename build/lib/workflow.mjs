@@ -101,7 +101,7 @@ async function runTauriBuild(context) {
   if (context.verbose) {
     args.push("--verbose");
   }
-  if (shouldDisableSigning(context.platform.id)) {
+  if (shouldDisableSigning()) {
     args.push("--no-sign");
   }
 
@@ -115,15 +115,14 @@ async function runTauriBuild(context) {
   }
 }
 
-function shouldDisableSigning(platformId) {
-  if (platformId === "macos") {
-    return !(
-      process.env.APPLE_SIGNING_IDENTITY
-      || process.env.APPLE_API_KEY
-      || process.env.APPLE_API_KEY_PATH
-    );
-  }
-
+function shouldDisableSigning() {
+  // `--no-sign` controls Tauri's UPDATER (minisign) signature only. It is
+  // unrelated to Apple Developer-ID code signing, which is driven by the
+  // APPLE_* env vars and the macOS tauri config. The updater key is the same
+  // minisign keypair on macOS, Windows and Linux, so sign updater artifacts on
+  // every platform whenever that key is present — including unsigned-Apple
+  // macOS builds, which otherwise ship a .app.tar.gz with no .sig and get
+  // dropped from latest.json.
   return !process.env.TAURI_SIGNING_PRIVATE_KEY;
 }
 

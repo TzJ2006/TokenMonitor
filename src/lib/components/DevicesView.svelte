@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { formatCost, formatTimeAgo, deviceColor } from "../utils/format.js";
+  import { formatCost, formatModelCost, formatTimeAgo, deviceColor, deviceDisplayNames } from "../utils/format.js";
   import { activePeriod, activeOffset, activeProvider } from "../stores/usage.js";
   import type { DeviceUsagePayload, DeviceSummary } from "../types/index.js";
 
@@ -85,12 +85,17 @@
     sortedDevices.filter((d) => !d.is_local),
   );
 
+  // Display names (raw `device` stays the identity used for color/selection/sync).
+  let deviceNames = $derived(deviceDisplayNames(sortedDevices.map((d) => d.device)));
+
   async function syncAll() {
     if (syncing || remoteDevices.length === 0) return;
     syncing = true;
     try {
       for (const d of remoteDevices) {
-        await invoke("sync_ssh_host", { alias: d.device });
+        try {
+          await invoke("sync_ssh_host", { alias: d.device });
+        } catch (_) {}
       }
       await fetchDeviceData();
     } finally {
@@ -159,7 +164,7 @@
                 style:background={STATUS_COLORS[device.status] ?? "#6b7280"}
                 title={device.status}
               ></span>
-              <span class="device-name">{device.device}</span>
+              <span class="device-name">{deviceNames.get(device.device) ?? device.device}</span>
               {#if device.is_local}
                 <span class="local-badge">This device</span>
               {/if}
@@ -191,7 +196,7 @@
               <div class="model-row">
                 <div class="model-dot" style:background={deviceColor(device.device)}></div>
                 <span class="model-name">{model.display_name}</span>
-                <span class="model-cost">{formatCost(model.cost)}</span>
+                <span class="model-cost">{formatModelCost(model.cost, model.pricing_available)}</span>
               </div>
             {/each}
           </div>

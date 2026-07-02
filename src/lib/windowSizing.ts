@@ -11,6 +11,10 @@ export const SCROLL_THRESHOLD_CAP = 500;
 export const RESIZE_SETTLE_DELAY_MS = 100;
 /** Ignore sub-pixel / 1px oscillation between ResizeObserver and setSize (feedback loop). */
 export const RESIZE_HYSTERESIS_PX = 3;
+/** Eased duration (ms) for the deferred shrink that fires once the cursor
+ * leaves the popover. Shrinks are held while the mouse is over the window so
+ * content doesn't collapse under the pointer; on leave we ease down gently. */
+export const SHRINK_ON_LEAVE_ANIM_MS = 280;
 
 export type ResizeDisposition = "grow" | "shrink" | "skip";
 
@@ -109,4 +113,26 @@ export function classifyResize(
   }
 
   return delta > 0 ? "grow" : "shrink";
+}
+
+
+// ── Fixed window height ──
+
+export const FIXED_HEIGHT_CAP = 500;
+export const FIXED_HEIGHT_SCREEN_RATIO = 0.392;
+
+export function resolveFixedWindowHeight(
+  monitorPhysicalWidth: number,
+  scaleFactor: number,
+  cap = FIXED_HEIGHT_CAP,
+  ratio = FIXED_HEIGHT_SCREEN_RATIO,
+): number {
+  if (!Number.isFinite(monitorPhysicalWidth) || monitorPhysicalWidth <= 0) {
+    return cap;
+  }
+  if (!Number.isFinite(scaleFactor) || scaleFactor <= 0) {
+    return cap;
+  }
+  const logicalWidth = monitorPhysicalWidth / scaleFactor;
+  return Math.min(cap, Math.floor(logicalWidth * ratio));
 }
