@@ -58,6 +58,9 @@ describe("loadSettings", () => {
         barDisplay: 'both',
         barProvider: 'claude',
         barProviders: ["claude", "codex"],
+        // Deliberately different from the tray bars to prove the two are
+        // independent fields after the split.
+        floatBallBarProviders: ["cursor"],
         showPercentages: false,
         percentageFormat: 'compact',
         showCost: false,
@@ -90,6 +93,7 @@ describe("loadSettings", () => {
         barDisplay: 'custom',
         barProvider: 'claude',
         barProviders: ["claude", "codex"],
+        floatBallBarProviders: ["cursor"],
         showPercentages: false,
         percentageFormat: 'compact',
         showCost: false,
@@ -100,6 +104,7 @@ describe("loadSettings", () => {
       floatBall: false,
       taskbarPanel: false,
       sshHosts: [],
+      remoteDeviceIncludes: [],
       debugLogging: false,
       cursorApiKey: "",
       // Existing installs (non-empty saved settings) migrate to rate-limits
@@ -114,6 +119,8 @@ describe("loadSettings", () => {
       claudePlanCustomFiveHourTokens: null,
       claudePlanCustomWeeklyTokens: null,
       usageAccessEnabled: true,
+      autoExportEnabled: false,
+      autoExportFolder: null,
     });
     expect(get(settings)).toEqual(loaded);
     expect(mockSetCurrency).toHaveBeenCalledWith("EUR");
@@ -151,6 +158,7 @@ describe("loadSettings", () => {
         barDisplay: 'custom',
         barProvider: 'claude',
         barProviders: ["claude", "codex", "cursor"],
+        floatBallBarProviders: ["claude", "codex", "cursor"],
         showPercentages: false,
         percentageFormat: 'compact',
         showCost: true,
@@ -161,6 +169,7 @@ describe("loadSettings", () => {
       floatBall: false,
       taskbarPanel: false,
       sshHosts: [],
+      remoteDeviceIncludes: [],
       debugLogging: false,
       cursorApiKey: "",
       // Failure path goes through pure defaults (no migration), so the
@@ -174,6 +183,8 @@ describe("loadSettings", () => {
       claudePlanCustomFiveHourTokens: null,
       claudePlanCustomWeeklyTokens: null,
       usageAccessEnabled: true,
+      autoExportEnabled: false,
+      autoExportFolder: null,
     });
     expect(get(settings)).toEqual(fallback);
     expect(mockSetCurrency).toHaveBeenCalledWith("USD");
@@ -208,7 +219,27 @@ describe("loadSettings", () => {
 
     expect(loaded.sshHosts).toEqual([
       { alias: "devbox", enabled: true, include_in_stats: true },
-      { alias: "lab", enabled: false, include_in_stats: false },
+      { alias: "lab", enabled: false, include_in_stats: true },
+    ]);
+  });
+
+  it("normalizes remote device include flags", async () => {
+    const store = makePersistedStore({
+      remoteDeviceIncludes: [
+        { alias: "peer-a", include_in_stats: false },
+        { alias: "peer-b" },
+        { alias: "peer-a", include_in_stats: true },
+        { alias: "  " },
+      ] as unknown as Settings["remoteDeviceIncludes"],
+    });
+    mockLoad.mockResolvedValueOnce(store);
+
+    const { loadSettings } = await loadSettingsModule();
+    const loaded = await loadSettings();
+
+    expect(loaded.remoteDeviceIncludes).toEqual([
+      { alias: "peer-a", include_in_stats: false },
+      { alias: "peer-b", include_in_stats: true },
     ]);
   });
 });
@@ -283,6 +314,7 @@ describe("loadSettings migration", () => {
         barDisplay: "triple" as Settings["trayConfig"]["barDisplay"],
         barProvider: "all" as Settings["trayConfig"]["barProvider"],
         barProviders: ["claude", "codex"],
+        floatBallBarProviders: ["claude", "codex"],
         showPercentages: "yes" as unknown as Settings["trayConfig"]["showPercentages"],
         percentageFormat: "long" as Settings["trayConfig"]["percentageFormat"],
         showCost: "no" as unknown as Settings["trayConfig"]["showCost"],

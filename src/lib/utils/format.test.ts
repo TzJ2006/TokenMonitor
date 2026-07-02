@@ -4,9 +4,13 @@ import {
   currencySymbol,
   convertCost,
   formatCost,
+  formatModelCost,
   formatTokens,
   formatTimeAgo,
   modelColor,
+  formatDeviceName,
+  deviceIdentityKey,
+  deviceDisplayNames,
 } from "./format.js";
 
 beforeEach(() => {
@@ -47,6 +51,21 @@ describe("formatCost", () => {
   it("falls back to USD for unknown currency", () => {
     setCurrency("XYZ");
     expect(formatCost(1.0)).toBe("$1.00");
+  });
+});
+
+describe("formatModelCost", () => {
+  it("returns N/A when model pricing is unavailable", () => {
+    expect(formatModelCost(0, false)).toBe("N/A");
+  });
+
+  it("returns Free when model pricing is known and the cost is zero", () => {
+    expect(formatModelCost(0, true)).toBe("Free");
+    expect(formatModelCost(0, undefined)).toBe("Free");
+  });
+
+  it("keeps normal cost formatting for non-zero costs when pricing is available or unspecified", () => {
+    expect(formatModelCost(1.5, undefined)).toBe("$1.50");
   });
 });
 
@@ -187,5 +206,71 @@ describe("modelColor", () => {
 
   it("returns a hashed fallback for unrecognized keys", () => {
     expect(modelColor("nonexistent")).toMatch(/^hsl\(/);
+  });
+});
+
+// ── device display names ───────────────────────────────────────────────
+
+describe("formatDeviceName", () => {
+  it("replaces dashes with spaces", () => {
+    expect(formatDeviceName("AWS-RustDesk")).toBe("AWS RustDesk");
+  });
+
+  it("strips a trailing OS parenthetical", () => {
+    expect(formatDeviceName("thomas-Linux-Desktop (Linux)")).toBe("thomas Linux Desktop");
+  });
+
+  it("leaves a plain name unchanged", () => {
+    expect(formatDeviceName("tianhe")).toBe("tianhe");
+    expect(formatDeviceName("Local")).toBe("Local");
+  });
+
+  it("strips auto-sync OS and hash suffixes", () => {
+    expect(formatDeviceName("thomas-Linux-Desktop-Linux-3033b0e0")).toBe("Thomas Linux Desktop");
+    expect(formatDeviceName("thomas-Linux-Desktop-Linux")).toBe("Thomas Linux Desktop");
+  });
+});
+
+describe("deviceIdentityKey", () => {
+  it("treats auto-sync slug variants and display names as the same device", () => {
+    const plain = deviceIdentityKey("Thomas Linux Desktop");
+    expect(deviceIdentityKey("thomas-Linux-Desktop-Linux-3033b0e0")).toBe(plain);
+    expect(deviceIdentityKey("thomas-Linux-Desktop-Linux")).toBe(plain);
+  });
+});
+
+describe("deviceDisplayNames", () => {
+  it("maps each name to its base form when there is no collision", () => {
+    const m = deviceDisplayNames(["AWS-RustDesk", "tianhe", "Local"]);
+    expect(m.get("AWS-RustDesk")).toBe("AWS RustDesk");
+    expect(m.get("tianhe")).toBe("tianhe");
+    expect(m.get("Local")).toBe("Local");
+  });
+
+  it("keeps the parenthetical when two names collide on the base", () => {
+    const m = deviceDisplayNames(["Desktop (Linux)", "Desktop (Windows)"]);
+    expect(m.get("Desktop (Linux)")).toBe("Desktop (Linux)");
+    expect(m.get("Desktop (Windows)")).toBe("Desktop (Windows)");
+  });
+
+  it("drops the parenthetical when names do not collide", () => {
+    const m = deviceDisplayNames(["Desktop (Linux)", "Laptop (Windows)"]);
+    expect(m.get("Desktop (Linux)")).toBe("Desktop");
+    expect(m.get("Laptop (Windows)")).toBe("Laptop");
+  });
+
+  it("falls back to the raw name for paren-less collisions", () => {
+    const m = deviceDisplayNames(["foo-bar", "foo bar"]);
+    expect(m.get("foo-bar")).toBe("foo-bar");
+    expect(m.get("foo bar")).toBe("foo bar");
+  });
+
+  it("collapses auto-sync slug variants to the friendly base", () => {
+    const m = deviceDisplayNames([
+      "thomas-Linux-Desktop-Linux",
+      "thomas-Linux-Desktop-Linux-3033b0e0",
+    ]);
+    expect(m.get("thomas-Linux-Desktop-Linux")).toBe("Thomas Linux Desktop");
+    expect(m.get("thomas-Linux-Desktop-Linux-3033b0e0")).toBe("Thomas Linux Desktop");
   });
 });

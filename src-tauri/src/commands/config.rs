@@ -540,9 +540,77 @@ pub async fn set_dock_icon_visible(app: tauri::AppHandle, visible: bool) -> Resu
     Ok(())
 }
 
+/// Suppress the next main-window auto-hide blur. Call this before opening a
+/// native OS dialog (Save/Open panel) that steals focus from the webview —
+/// without it the blur handler hides the window while the dialog is up,
+/// leaving the user unable to click the originating button afterwards.
+#[tauri::command]
+pub fn suppress_next_auto_hide(state: State<'_, AppState>) {
+    state
+        .suppress_auto_hide
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Update the background auto-export preferences. Mirrors the Settings toggle
+/// and the chosen destination folder; the refresh loop reads this each tick.
+/// The frontend is the source of truth and always passes the full state, so we
+/// overwrite both fields verbatim (a `None` folder simply clears it).
+///
+/// This command never touches the filesystem — it only flips prefs and, on a
+/// folder change, resets the auto-export runtime so the next tick writes a fresh
+/// full JSONL file to the new destination (the old cursors are meaningless for a
+/// different file). The runtime reset is the LAST mutation so the next tick
+/// observes the new folder and synced=false together.
+#[tauri::command]
+pub async fn set_auto_export_config(
+    app: tauri::AppHandle,
+    enabled: bool,
+    folder: Option<String>,
+    hidden_models: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let hidden =
+        crate::commands::usage_io::normalize_hidden_models(hidden_models.unwrap_or_default());
+    let has_folder = folder.is_some();
+    let needs_rewrite = {
+        let mut cfg = state.auto_export.write().await;
+        // A folder OR hidden-models change both invalidate the existing mirror:
+        // the folder points the writer at a fresh file, and a hidden-models change
+        // means previously-written rows must be re-filtered (a now-hidden model's
+        // rows dropped, a now-visible model's rows restored). Either way the next
+        // tick must do a full rewrite rather than an incremental append.
+        let changed = cfg.folder != folder || cfg.hidden_models != hidden;
+        cfg.enabled = enabled;
+        cfg.folder = folder;
+        cfg.hidden_models = hidden;
+        changed
+    };
+    if needs_rewrite {
+        let mut rt = state.auto_export_runtime.write().await;
+        rt.synced = false;
+        rt.cursors.clear();
+    }
+
+    // Kick an immediate sync so a freshly-configured folder pulls peers in right
+    // away — e.g. on launch when the frontend pushes this config — instead of
+    // waiting for the next refresh tick. Spawned so the IPC call returns promptly.
+    if has_folder {
+        use tauri::Manager;
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app2.state::<AppState>();
+            crate::commands::usage_io::run_auto_export(&app2, &state).await;
+        });
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.parser.clear_cache();
+    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+        disk_cache.clear_all();
+    }
     if let Some(ssh_cache) = state.ssh_cache.read().await.as_ref() {
         ssh_cache.reset_all_caches();
     }
@@ -554,12 +622,18 @@ pub async fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn clear_payload_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.parser.clear_payload_cache();
+    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+        disk_cache.clear_all();
+    }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn clear_usage_view_cache(state: State<'_, AppState>) -> Result<(), String> {
     state.parser.clear_payload_cache_prefix("usage-view:");
+    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+        disk_cache.clear_prefix("usage-view:");
+    }
     Ok(())
 }
 
@@ -573,9 +647,15 @@ pub async fn reposition_window(app: tauri::AppHandle) -> Result<(), String> {
         {
             crate::platform::windows::window::align_to_work_area(&window);
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         {
             crate::platform::clamp_window_to_work_area(&window);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Re-anchor top-right (drift-gated) rather than merely clamping, so a
+            // WM-driven reposition toward another window doesn't stick.
+            crate::platform::linux::reanchor_top_right_if_drifted(&window);
         }
     }
     Ok(())
@@ -587,26 +667,32 @@ pub async fn set_window_size_and_align(
     width: f64,
     height: f64,
 ) -> Result<(), String> {
-    use tauri::{LogicalSize, Manager, Size};
+    use tauri::Manager;
     if let Some(window) = app.get_webview_window("main") {
         #[cfg(target_os = "windows")]
         {
-            if let Some(monitor) = window.current_monitor().ok().flatten() {
-                let scale = monitor.scale_factor();
-                let physical_width = (width * scale).round() as u32;
-                let physical_height = (height * scale).round() as u32;
-                crate::platform::windows::window::set_size_and_align(
-                    &window,
-                    physical_width,
-                    physical_height,
-                );
-            } else {
-                let _ = window.set_size(Size::Logical(LogicalSize::new(width, height)));
-                crate::platform::windows::window::align_to_work_area(&window);
-            }
+            // `set_size_and_align` derives the work area from the window's
+            // monitor via MonitorFromWindow (Win32), which still succeeds when
+            // Tauri's `current_monitor()` returns None — it intermittently does
+            // around DPI changes, monitor sleep/wake, and RDP reconnects. The
+            // old `else` fallback used a non-atomic `set_size` that keeps the
+            // window's TOP-LEFT fixed, so a shrink moved the bottom edge UP and
+            // off the taskbar, and the follow-up `align_to_work_area` re-read a
+            // stale (pre-resize) rect and could not recover it. Always take the
+            // atomic move+resize path, using the window's own scale factor for
+            // the logical->physical conversion (no `current_monitor()` needed).
+            let scale = window.scale_factor().unwrap_or(1.0);
+            let physical_width = (width * scale).round() as u32;
+            let physical_height = (height * scale).round() as u32;
+            crate::platform::windows::window::set_size_and_align(
+                &window,
+                physical_width,
+                physical_height,
+            );
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         {
+            use tauri::{LogicalSize, Size};
             // Capture position before resize so we can keep the anchored edge fixed.
             let old_pos = window.outer_position().ok();
             let old_size = window.outer_size().ok();
@@ -614,7 +700,7 @@ pub async fn set_window_size_and_align(
             let _ = window.set_size(Size::Logical(LogicalSize::new(width, height)));
 
             // For bottom-anchored windows, move upward so the bottom edge stays put.
-            // macOS/Linux keep top-left fixed after set_size, so top-anchored is free.
+            // macOS keeps top-left fixed after set_size, so top-anchored is free.
             if let (Some(pos), Some(old_sz)) = (old_pos, old_size) {
                 let old_bottom = pos.y + old_sz.height as i32;
                 if let Some(monitor) = window.current_monitor().ok().flatten() {
@@ -632,6 +718,18 @@ pub async fn set_window_size_and_align(
                 }
             }
             crate::platform::clamp_window_to_work_area(&window);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use tauri::{LogicalSize, Size};
+            let _ = window.set_size(Size::Logical(LogicalSize::new(width, height)));
+            // The Linux popover is a top-right tray window that is never user-movable.
+            // Unlike macOS, we must NOT preserve the window's current position here:
+            // a WM can drift/re-stack the window toward another window (e.g. a file
+            // manager that just opened), and the old `clamp`-only path would keep it
+            // wherever the WM left it. Re-anchor top-right (drift-gated so it's a
+            // no-op when already in place and doesn't cause jitter).
+            crate::platform::linux::reanchor_top_right_if_drifted(&window);
         }
     }
     Ok(())
@@ -715,4 +813,34 @@ pub async fn get_exchange_rates() -> Result<std::collections::HashMap<String, f6
 pub async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     app.exit(0);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn start_cache_warmup(
+    app: AppHandle,
+    priority_provider: Option<String>,
+    priority_period: Option<String>,
+) -> Result<u32, String> {
+    if crate::usage::cache_warmup::is_warmup_running() {
+        return Err("Warmup already running".to_string());
+    }
+    let provider = priority_provider.unwrap_or_else(|| "all".to_string());
+    let period = priority_period.unwrap_or_else(|| "day".to_string());
+
+    tokio::spawn(async move {
+        crate::usage::cache_warmup::warmup_payloads(&app, &provider, &period, true).await;
+    });
+
+    Ok(0)
+}
+
+#[tauri::command]
+pub fn cancel_cache_warmup() -> Result<(), String> {
+    crate::usage::cache_warmup::cancel_warmup();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_warmup_status() -> bool {
+    crate::usage::cache_warmup::is_warmup_running()
 }

@@ -3,6 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { open, save } from "@tauri-apps/plugin-dialog";
   import {
     getVisibleHeaderProviders,
     settings,
@@ -10,8 +11,16 @@
     type Settings as SettingsType,
   } from "../stores/settings.js";
   import { clearUsageCache } from "../stores/usage.js";
-  import { updaterStore, checkNow, setAutoCheck } from "../stores/updater.js";
+  import {
+    exportUsageData,
+    importUsageData,
+    formatExportSummary,
+    formatImportSummary,
+  } from "../stores/usageIo.js";
+  import { updaterStore, checkNow, setAutoCheck, setChannel, discoverChannels, fetchChannelPubkey, installUpdate, dismissBanner } from "../stores/updater.js";
+  import type { ChannelInfo } from "../stores/updater.js";
   import { isMacOS } from "../utils/platform.js";
+  import type { PermissionSurfaceId } from "../permissions/surfaces.js";
   import { currencySymbol } from "../utils/format.js";
   import { logger } from "../utils/logger.js";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
@@ -23,7 +32,7 @@
   import TrayConfigSettings from "./TrayConfigSettings.svelte";
   import HiddenModelsSettings from "./HiddenModelsSettings.svelte";
   import SshHostsSettings from "./SshHostsSettings.svelte";
-  import UpdateBanner from "./UpdateBanner.svelte";
+  import CacheWarmupSettings from "./CacheWarmupSettings.svelte";
   import PermissionDisclosure from "./PermissionDisclosure.svelte";
 
   interface Props {
@@ -33,7 +42,33 @@
   let { onBack }: Props = $props();
   let current = $derived($settings as SettingsType);
   let appVersion = $state("");
+  let autostartError = $state<string | null>(null);
   let checking = $state(false);
+  let channels = $state<ChannelInfo[]>([]);
+  let channelsLoading = $state(false);
+
+  async function loadChannels() {
+    if (channels.length > 0 || channelsLoading) return;
+    channelsLoading = true;
+    try {
+      channels = await discoverChannels();
+    } catch {
+      channels = [{ id: "main", label: "Michael-OvO/TokenMonitor (official)", owner: "Michael-OvO", repo: "TokenMonitor", hasReleases: true }];
+    }
+    channelsLoading = false;
+  }
+
+  async function onChannelChange(channelId: string) {
+    if (channelId !== "main") {
+      try {
+        await fetchChannelPubkey(channelId);
+      } catch {
+        // pubkey fetch failed — user is warned by update check later
+      }
+    }
+    await setChannel(channelId);
+  }
+
   let cursorAuthStatus = $state<CursorAuthStatus | null>(null);
   let cursorAuthMessage = $state<string | null>(null);
   let cursorExpanded = $state(false);
@@ -195,16 +230,42 @@
 
   async function handleAutostart(checked: boolean) {
     logger.info("settings", `Autostart: ${checked}`);
+    // Optimistically reflect the user's intent so the controlled ToggleSwitch
+    // doesn't visually snap back while the plugin call is in flight. On
+    // failure (e.g. a blocked registry / LaunchAgent write) roll back AND show
+    // why, instead of silently reverting the switch with no feedback.
+    const previous = current.launchAtLogin;
+    autostartError = null;
+    updateSetting("launchAtLogin", checked);
     try {
       if (checked) {
         await enable();
       } else {
         await disable();
       }
-      updateSetting("launchAtLogin", checked);
+      // Reconcile against the real OS state in case the plugin coerced it.
+      const actual = await isEnabled().catch(() => checked);
+      if (actual !== checked) updateSetting("launchAtLogin", actual);
     } catch (e) {
-      console.error("Failed to toggle autostart:", e);
+      logger.error("settings", `Failed to toggle autostart: ${e}`);
+      autostartError = `Couldn't ${checked ? "enable" : "disable"} Launch at Login (${e}).`;
+      updateSetting("launchAtLogin", previous);
     }
+  }
+
+  /** "Manage →" from the read-only Permissions panel: scroll to the section
+   * that owns the real control. The panel never mutates these itself. */
+  function handleManagePermission(id: PermissionSurfaceId) {
+    const targetId =
+      id === "login_item"
+        ? "settings-system"
+        : id === "ssh_config"
+          ? "settings-visibility"
+          : null;
+    if (!targetId) return;
+    document
+      .getElementById(targetId)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
 
@@ -254,6 +315,172 @@
     }
     if (resetTimer) clearTimeout(resetTimer);
     resetTimer = setTimeout(() => { resetStatus = "idle"; }, 2000);
+  }
+
+  // ── Usage import / export ──
+  let ioBusy = $state(false);
+  let ioMessage = $state<string | null>(null);
+  let ioError = $state(false);
+  let importInput = $state<HTMLInputElement | null>(null);
+
+  function exportStamp(): string {
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  async function exportUsage() {
+    if (ioBusy) return;
+    let path: string | null;
+    try {
+      // The native Save panel steals focus from the webview; suppress the
+      // resulting blur so the main window doesn't auto-hide while it's open.
+      await invoke("suppress_next_auto_hide");
+      // Native Save dialog: user picks the destination + file name.
+      path = await save({
+        defaultPath: `TokenMonitor-Usage-${exportStamp()}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+    } catch (e) {
+      ioError = true;
+      ioMessage = e instanceof Error ? e.message : String(e);
+      return;
+    }
+    if (!path) return; // dialog cancelled
+    ioBusy = true;
+    ioError = false;
+    ioMessage = null;
+    try {
+      const result = await exportUsageData(path, current.hiddenModels);
+      ioMessage = formatExportSummary(result);
+    } catch (e) {
+      ioError = true;
+      ioMessage = e instanceof Error ? e.message : String(e);
+    } finally {
+      ioBusy = false;
+    }
+  }
+
+  async function triggerImport() {
+    if (ioBusy) return;
+    // The native Open panel steals focus from the webview; suppress the
+    // resulting blur so the main window doesn't auto-hide while it's open.
+    await invoke("suppress_next_auto_hide");
+    importInput?.click();
+  }
+
+  async function onImportFileSelected(event: Event) {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+    ioBusy = true;
+    ioError = false;
+    ioMessage = null;
+    try {
+      const text = await file.text();
+      const result = await importUsageData(text, file.name);
+      ioMessage = formatImportSummary(result);
+      // Drop the frontend payload cache so merged data shows immediately;
+      // the backend also emits data-updated after the merge.
+      clearUsageCache();
+    } catch (e) {
+      ioError = true;
+      ioMessage = e instanceof Error ? e.message : String(e);
+    } finally {
+      ioBusy = false;
+    }
+  }
+
+  // ── Auto export ──
+  /** Last path segment of the chosen folder, or a prompt when none is set. */
+  function autoExportFolderLabel(path: string | null): string {
+    if (!path) return "Choose Folder…";
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    return parts[parts.length - 1] || path;
+  }
+
+  async function pushAutoExportConfig(enabled: boolean, folder: string | null) {
+    try {
+      // Forward the current hidden-models set so the auto-export mirror filters
+      // the same models the dashboard hides.
+      await invoke("set_auto_export_config", {
+        enabled,
+        folder,
+        hiddenModels: current.hiddenModels,
+      });
+    } catch (e) {
+      logger.debug("settings", `set_auto_export_config failed: ${e}`);
+    }
+  }
+
+  /** Open the native folder picker, returning the chosen path or null. */
+  async function pickAutoExportFolder(): Promise<string | null> {
+    // The native picker steals focus from the webview; suppress the resulting
+    // blur so the main window doesn't auto-hide while it's open.
+    await invoke("suppress_next_auto_hide");
+    const selected = await open({ directory: true, multiple: false });
+    return typeof selected === "string" ? selected : null;
+  }
+
+  async function changeAutoExportFolder() {
+    const folder = await pickAutoExportFolder();
+    if (!folder) return; // picker cancelled
+    updateSetting("autoExportFolder", folder);
+    await pushAutoExportConfig(current.autoExportEnabled, folder);
+  }
+
+  async function handleAutoExportToggle(checked: boolean) {
+    // Enabling without a destination: prompt for one first. If the user
+    // cancels, leave the toggle off (it's controlled, so it snaps back).
+    if (checked && !current.autoExportFolder) {
+      const folder = await pickAutoExportFolder();
+      if (!folder) return;
+      updateSetting("autoExportFolder", folder);
+      updateSetting("autoExportEnabled", true);
+      await pushAutoExportConfig(true, folder);
+      return;
+    }
+    updateSetting("autoExportEnabled", checked);
+    await pushAutoExportConfig(checked, current.autoExportFolder);
+  }
+
+  // ── Update install prompt (inline row beneath "Last Checked") ──
+  let updateInstalling = $state(false);
+  let updateInstallError = $state<string | null>(null);
+  const updateAvailable = $derived.by(() => {
+    const s = $updaterStore;
+    if (!s.available || s.dismissedForSession) return false;
+    return !s.skippedVersions.includes(s.available.version);
+  });
+  const updateManualInstall = $derived($updaterStore.installMode === "manual");
+  const installingLabel = $derived.by(() => {
+    const percent = $updaterStore.progress?.percent;
+    return percent != null ? `Installing ${percent.toFixed(0)}%` : "Installing…";
+  });
+
+  async function onInstallUpdate() {
+    const s = $updaterStore;
+    if (!s.available) return;
+    if (updateManualInstall) {
+      await openUrl(
+        `https://github.com/Michael-OvO/TokenMonitor/releases/tag/v${s.available.version}`,
+      );
+      await dismissBanner();
+      return;
+    }
+    updateInstalling = true;
+    updateInstallError = null;
+    try {
+      await installUpdate();
+    } catch (e) {
+      updateInstallError = e instanceof Error ? e.message : String(e);
+      updateInstalling = false;
+    }
+  }
+
+  async function onCancelUpdate() {
+    await dismissBanner();
   }
 
   function stopCursorRetry() {
@@ -407,7 +634,7 @@
     </div>
 
     <!-- 3. Visibility -->
-    <div class="group">
+    <div class="group" id="settings-visibility">
       <div class="group-label">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
@@ -499,7 +726,7 @@
     </div>
 
     <!-- 6. System -->
-    <div class="group">
+    <div class="group" id="settings-system">
       <div class="group-label">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="3"></circle>
@@ -515,6 +742,11 @@
             onChange={handleAutostart}
           />
         </div>
+        {#if autostartError}
+          <div class="row border autostart-error-row">
+            <span class="autostart-error">{autostartError}</span>
+          </div>
+        {/if}
         {#if isMacOS()}
         <div class="row border">
           <span class="label">Show Dock Icon</span>
@@ -544,13 +776,44 @@
             onChange={handleDebugLogging}
           />
         </div>
-        <div class="row center">
-          <div class="actions">
-            <button class="reset-btn" class:done={resetStatus === "done"} class:error={resetStatus === "error"} onclick={resetCache}>
-              {#if resetStatus === "done"}Cache Reset ✓
-              {:else if resetStatus === "error"}Reset Failed
-              {:else}Reset Cache{/if}
+        <div class="row border cache-row">
+          <span class="label">Cache</span>
+          <div class="cache-row-actions">
+            <button class="cache-btn" onclick={triggerImport} disabled={ioBusy}>Import</button>
+            <button class="cache-btn" onclick={exportUsage} disabled={ioBusy}>Export</button>
+            <button class="cache-btn" class:done={resetStatus === "done"} class:error={resetStatus === "error"} onclick={resetCache}>
+              {#if resetStatus === "done"}Cleared ✓
+              {:else if resetStatus === "error"}Failed
+              {:else}Clear{/if}
             </button>
+            <CacheWarmupSettings />
+          </div>
+        </div>
+        {#if ioMessage}
+          <div class="row data-io-status">
+            <span class="data-io-msg" class:error={ioError}>{ioMessage}</span>
+          </div>
+        {/if}
+        <input
+          bind:this={importInput}
+          type="file"
+          accept="application/json,.json,.jsonl"
+          class="hidden-file-input"
+          onchange={onImportFileSelected}
+        />
+        <div class="row auto-export-row">
+          <span class="label">Auto Sync</span>
+          <div class="auto-export-right">
+            <button
+              class="cache-btn auto-export-folder"
+              type="button"
+              title={current.autoExportFolder ?? "Choose a destination folder"}
+              onclick={changeAutoExportFolder}
+            >{autoExportFolderLabel(current.autoExportFolder)}</button>
+            <ToggleSwitch
+              checked={current.autoExportEnabled}
+              onChange={handleAutoExportToggle}
+            />
           </div>
         </div>
       </div>
@@ -584,6 +847,28 @@
           </div>
         </div>
         <div class="row border">
+          <span class="label">Channel</span>
+          <select
+            class="channel-select"
+            value={$updaterStore.updateChannel}
+            onfocus={loadChannels}
+            onchange={(e) => onChannelChange((e.target as HTMLSelectElement).value)}
+          >
+            {#if channels.length === 0}
+              <option value={$updaterStore.updateChannel}>
+                {$updaterStore.updateChannel === "main" ? "Official" : $updaterStore.updateChannel}
+              </option>
+            {:else}
+              {#each channels as ch (ch.id)}
+                <option value={ch.id}>{ch.label}</option>
+              {/each}
+            {/if}
+          </select>
+          {#if channelsLoading}
+            <span class="channel-loading">...</span>
+          {/if}
+        </div>
+        <div class="row border">
           <span class="label">Last Checked</span>
           <div class="value-group">
             <span class="value">{formatRelativeTime($updaterStore.lastCheck)}</span>
@@ -604,11 +889,28 @@
             </button>
           </div>
         </div>
+        {#if updateAvailable}
+          <div class="row update-install-row">
+            <span class="label">
+              {updateManualInstall ? "Download" : "Install"} v{$updaterStore.available?.version}
+            </span>
+            <div class="value-group">
+              {#if updateInstallError}
+                <span class="status status-warn"><span class="status-dot"></span>Failed</span>
+                <button class="update-btn primary" onclick={onInstallUpdate}>Retry</button>
+                <button class="update-btn" onclick={onCancelUpdate}>Cancel</button>
+              {:else if updateInstalling}
+                <span class="value">{installingLabel}</span>
+              {:else}
+                <button class="update-btn primary" onclick={onInstallUpdate}>
+                  {updateManualInstall ? "Download" : "Install"}
+                </button>
+                <button class="update-btn" onclick={onCancelUpdate}>Cancel</button>
+              {/if}
+            </div>
+          </div>
+        {/if}
       </div>
-    </div>
-
-    <div class="update-bottom">
-      <UpdateBanner />
     </div>
 
     <!-- 8. Privacy & Permissions -->
@@ -631,7 +933,7 @@
         </button>
         <div class="privacy-collapse" class:open={privacyExpanded}>
           <div class="collapse-inner">
-            <PermissionDisclosure mode="settings" />
+            <PermissionDisclosure mode="settings" onManage={handleManagePermission} />
           </div>
         </div>
       </div>
@@ -721,6 +1023,14 @@
   }
   .row.center {
     justify-content: center;
+  }
+  .autostart-error-row {
+    justify-content: flex-start;
+    padding-top: 0;
+  }
+  .autostart-error {
+    font: 400 9px/1.35 'Inter', sans-serif;
+    color: var(--ch-minus);
   }
 
   .collapsible-toggle {
@@ -913,22 +1223,100 @@
     border-color: var(--t3);
   }
 
-  .reset-btn {
-    background: none;
-    border: none;
-    font: 400 9px/1 'Inter', sans-serif;
-    color: var(--t4);
+  .cache-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .auto-export-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .auto-export-folder {
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .channel-select {
+    max-width: 150px;
+    padding: 2px 6px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--t1);
+    font: 400 9px/1.4 'Inter', sans-serif;
+    outline: none;
     cursor: pointer;
+  }
+  .channel-select:focus {
+    border-color: var(--t3);
+  }
+  .channel-loading {
+    font: 400 8px/1 'Inter', sans-serif;
+    color: var(--t4);
+  }
+  .cache-btn {
+    background: var(--surface-hover);
+    border: 1px solid var(--border);
+    border-radius: 4px;
     padding: 2px 8px;
-  }
-  .reset-btn:hover {
+    font: 400 8px/1.2 'Inter', sans-serif;
     color: var(--t2);
+    cursor: pointer;
+    white-space: nowrap;
   }
-  .reset-btn.done {
+  .cache-btn:hover {
+    color: var(--t1);
+    border-color: var(--t3);
+  }
+  .cache-btn.done {
     color: var(--ch-plus);
   }
-  .reset-btn.error {
+  .cache-btn.error {
     color: var(--ch-minus);
+  }
+  .data-io-status {
+    padding-top: 0;
+  }
+  .data-io-msg {
+    font: 400 8px/1.4 'Inter', sans-serif;
+    color: var(--t3);
+    word-break: break-word;
+  }
+  .data-io-msg.error {
+    color: var(--ch-minus);
+  }
+  .hidden-file-input {
+    display: none;
+  }
+  .update-install-row .value-group {
+    gap: 8px;
+  }
+  .update-btn {
+    background: var(--surface-hover);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font: 400 8px/1.2 'Inter', sans-serif;
+    color: var(--t2);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .update-btn:hover {
+    color: var(--t1);
+    border-color: var(--t3);
+  }
+  .update-btn.primary {
+    color: var(--accent);
+    border-color: var(--accent-soft);
+    font-weight: 600;
+  }
+  .update-btn.primary:hover {
+    background: var(--accent-soft);
   }
   .secondary-btn {
     background: none;
@@ -946,12 +1334,6 @@
   .secondary-btn:disabled {
     opacity: .55;
     cursor: default;
-  }
-
-  .update-bottom :global(.banner) {
-    border-bottom: none;
-    border-top: 1px solid var(--border-subtle);
-    border-radius: 0 0 8px 8px;
   }
 
   .quit-section {

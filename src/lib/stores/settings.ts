@@ -14,6 +14,7 @@ import type {
   CostPrecision,
   DefaultPeriod,
   RateLimitProviderId,
+  RemoteDeviceIncludeConfig,
   HeaderTabs,
   PercentageFormat,
   SshHostConfig,
@@ -42,8 +43,12 @@ export interface Settings {
   glassEffect: boolean;
   showModelChangeStats: boolean;
   floatBall: boolean;
+  /** @deprecated Retired — the Windows taskbar panel froze the tray (it
+   * embedded a child window into explorer's Shell_TrayWnd). Kept only so
+   * persisted settings still parse; it has no effect and no UI toggle. */
   taskbarPanel: boolean;
   sshHosts: SshHostConfig[];
+  remoteDeviceIncludes: RemoteDeviceIncludeConfig[];
   debugLogging: boolean;
   /**
    * Whether to compute live rate-limit data. The fetch is fully local now
@@ -94,6 +99,14 @@ export interface Settings {
    * can disable tracking without resetting the welcome flow.
    */
   usageAccessEnabled: boolean;
+  /**
+   * When `true`, the backend refresh loop mirrors the usage archive to a
+   * rolling file inside `autoExportFolder` on every tick (same cadence as
+   * `refreshInterval`). Has no effect while a folder hasn't been chosen.
+   */
+  autoExportEnabled: boolean;
+  /** Destination folder for the auto-export file. `null` until the user picks one. */
+  autoExportFolder: string | null;
 }
 
 export const HEADER_TAB_ORDER: UsageProvider[] = [...USAGE_PROVIDER_ORDER];
@@ -133,6 +146,7 @@ const DEFAULTS: Settings = {
     barDisplay: 'both',
     barProvider: DEFAULT_RATE_LIMIT_PROVIDER,
     barProviders: [...RATE_LIMIT_PROVIDER_ORDER],
+    floatBallBarProviders: [...RATE_LIMIT_PROVIDER_ORDER],
     showPercentages: false,
     percentageFormat: 'compact',
     showCost: true,
@@ -143,6 +157,7 @@ const DEFAULTS: Settings = {
   floatBall: false,
   taskbarPanel: false,
   sshHosts: [],
+  remoteDeviceIncludes: [],
   debugLogging: false,
   rateLimitsEnabled: false,
   cursorApiKey: "",
@@ -154,6 +169,8 @@ const DEFAULTS: Settings = {
   claudePlanCustomFiveHourTokens: null,
   claudePlanCustomWeeklyTokens: null,
   usageAccessEnabled: true,
+  autoExportEnabled: false,
+  autoExportFolder: null,
 };
 
 function normalizeBoolean(value: unknown, fallback: boolean): boolean {
@@ -286,9 +303,32 @@ function normalizeSshHosts(value: unknown): SshHostConfig[] {
       alias: candidate.alias.trim(),
       enabled: candidate.enabled,
       include_in_stats:
-        typeof candidate.include_in_stats === "boolean" ? candidate.include_in_stats : false,
+        typeof candidate.include_in_stats === "boolean" ? candidate.include_in_stats : true,
     }];
   });
+}
+
+function normalizeRemoteDeviceIncludes(value: unknown): RemoteDeviceIncludeConfig[] {
+  if (!Array.isArray(value)) return [];
+
+  const seen = new Set<string>();
+  const normalized: RemoteDeviceIncludeConfig[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) continue;
+    const candidate = item as Record<string, unknown>;
+    if (typeof candidate.alias !== "string") continue;
+
+    const alias = candidate.alias.trim();
+    if (!alias || seen.has(alias)) continue;
+    seen.add(alias);
+    normalized.push({
+      alias,
+      include_in_stats:
+        typeof candidate.include_in_stats === "boolean" ? candidate.include_in_stats : true,
+    });
+  }
+
+  return normalized;
 }
 
 function normalizeTrayConfig(trayConfig?: Partial<TrayConfig> | null): TrayConfig {
@@ -313,6 +353,18 @@ function normalizeTrayConfig(trayConfig?: Partial<TrayConfig> | null): TrayConfi
     else barProviders = [...RATE_LIMIT_PROVIDER_ORDER];
   }
 
+  // Floating-ball bars are an independent field. For installs that predate
+  // the split (no `floatBallBarProviders` saved), inherit the tray selection
+  // so the float ball keeps showing the same providers it did when both
+  // surfaces shared one field — no surprise behavior change on upgrade.
+  let floatBallBarProviders: RateLimitProviderId[];
+  if (Array.isArray(trayConfig?.floatBallBarProviders)) {
+    floatBallBarProviders = (trayConfig!.floatBallBarProviders as string[])
+      .filter((p): p is RateLimitProviderId => SUPPORTED_BAR_PROVIDERS.includes(p as RateLimitProviderId));
+  } else {
+    floatBallBarProviders = [...barProviders];
+  }
+
   const derivedDisplay: BarDisplay =
     barProviders.length === 0 ? 'off'
     : barProviders.length === 1 ? 'single'
@@ -322,6 +374,7 @@ function normalizeTrayConfig(trayConfig?: Partial<TrayConfig> | null): TrayConfi
     barDisplay: derivedDisplay,
     barProvider: barProviders[0] ?? barProvider,
     barProviders,
+    floatBallBarProviders,
     showPercentages: normalizeBoolean(
       trayConfig?.showPercentages,
       DEFAULTS.trayConfig.showPercentages,
@@ -368,6 +421,7 @@ export function normalizeSettings(saved?: Partial<Settings> | null): Settings {
     floatBall: normalizeBoolean(saved?.floatBall, DEFAULTS.floatBall),
     taskbarPanel: normalizeBoolean(saved?.taskbarPanel, DEFAULTS.taskbarPanel),
     sshHosts: normalizeSshHosts(saved?.sshHosts),
+    remoteDeviceIncludes: normalizeRemoteDeviceIncludes(saved?.remoteDeviceIncludes),
     debugLogging: normalizeBoolean(saved?.debugLogging, DEFAULTS.debugLogging),
     rateLimitsEnabled: normalizeBoolean(saved?.rateLimitsEnabled, DEFAULTS.rateLimitsEnabled),
     cursorApiKey: normalizeSecretString(saved?.cursorApiKey),
@@ -387,7 +441,13 @@ export function normalizeSettings(saved?: Partial<Settings> | null): Settings {
       saved?.claudePlanCustomWeeklyTokens,
     ),
     usageAccessEnabled: normalizeBoolean(saved?.usageAccessEnabled, DEFAULTS.usageAccessEnabled),
+    autoExportEnabled: normalizeBoolean(saved?.autoExportEnabled, DEFAULTS.autoExportEnabled),
+    autoExportFolder: normalizeAutoExportFolder(saved?.autoExportFolder),
   };
+}
+
+function normalizeAutoExportFolder(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
 }
 
 function normalizePositiveNumberOrNull(value: unknown): number | null {

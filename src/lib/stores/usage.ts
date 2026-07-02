@@ -64,7 +64,8 @@ export function shallowPayloadEqual(a: UsagePayload, b: UsagePayload): boolean {
     a.model_breakdown.every((model, i) =>
       model.model_key === b.model_breakdown[i]?.model_key &&
       model.cost === b.model_breakdown[i]?.cost &&
-      model.tokens === b.model_breakdown[i]?.tokens,
+      model.tokens === b.model_breakdown[i]?.tokens &&
+      model.pricing_available === b.model_breakdown[i]?.pricing_available,
     ) &&
     a.period_label === b.period_label &&
     a.has_earlier_data === b.has_earlier_data &&
@@ -273,6 +274,7 @@ export async function fetchData(
   provider: UsageProvider,
   period: UsagePeriod,
   offset: number = 0,
+  opts: { silent?: boolean } = {},
 ) {
   const requestId = ++currentRequestId;
   const cacheEpoch = currentCacheEpoch;
@@ -280,6 +282,27 @@ export async function fetchData(
   const ctx: FetchCtx = { provider, period, offset, requestId, cacheKey: key };
   logger.debug("usage", `Fetch: ${provider}/${period} offset=${offset}`);
   logResizeDebug("usage:fetch-start", { ...ctx, hadFrontendCache: payloadCache.has(key) });
+  const _fetchT0 = performance.now();
+  console.log(`[PROFILE] fetchData:start provider=${provider} period=${period} offset=${offset}`);
+
+  // ── Silent refresh: never show a loading state ──
+  // Used by background `data-updated` and window-focus refreshes. Keeps the
+  // currently displayed payload on screen and swaps in fresh numbers when the
+  // IPC resolves. Without this, those callers cleared the cache and fell into
+  // the cold path below, re-showing the spinner over already-loaded data
+  // ("loading finishes, then loads again").
+  if (opts.silent) {
+    requestUsagePayload(provider, period, offset)
+      .then((fresh: UsagePayload) => {
+        logPayloadWarning(ctx, fresh, "silent-refresh");
+        cachePayload(key, fresh, cacheEpoch);
+        applyUsageDataIfCurrent(requestId, fresh);
+      })
+      .catch((error) => {
+        logResizeDebug("usage:silent-refresh-rejected", { ...ctx, error: formatDebugError(error) });
+      });
+    return;
+  }
 
   // ── Stale-while-revalidate: instant show + silent refresh ──
   const cached = payloadCache.get(key);
@@ -329,6 +352,7 @@ export async function fetchData(
     await logUsageReadDebug("usage:fetch-resolved", {
       ...ctx, appliedToUi, fromPayloadCache: data.from_cache,
     });
+    console.log(`[PROFILE] fetchData:IPC-resolved = ${(performance.now() - _fetchT0).toFixed(1)}ms provider=${provider}`);
   } catch (e) {
     logger.error("usage", `Fetch failed: provider=${provider} period=${period} offset=${offset} error=${formatDebugError(e)}`);
     logResizeDebug("usage:fetch-rejected", { ...ctx, error: formatDebugError(e) });
@@ -338,6 +362,7 @@ export async function fetchData(
       isPlaceholderLoading.set(false);
     }
   }
+  console.log(`[PROFILE] fetchData:TOTAL = ${(performance.now() - _fetchT0).toFixed(1)}ms provider=${provider}`);
 }
 
 /**
