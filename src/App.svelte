@@ -15,9 +15,6 @@
     fetchData,
     warmCache,
     warmAllPeriods,
-    clearUsageCache,
-    clearUsageCacheForProviders,
-    seedUsageCache,
   } from "./lib/stores/usage.js";
   import {
     ALL_USAGE_PROVIDER_ID,
@@ -38,7 +35,6 @@
   } from "./lib/stores/rateLimits.js";
   import { providerPayload } from "./lib/views/rateLimitMonitor.js";
   import { hasRateLimitWindows } from "./lib/views/rateLimits.js";
-  import { setDeviceIncludeFlag, setSshHostIncludeFlag } from "./lib/views/deviceStats.js";
   import {
     DEFAULT_HEADER_TABS,
     areHeaderTabsEqual,
@@ -88,7 +84,7 @@
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
   import PermissionDisclosure from "./lib/components/PermissionDisclosure.svelte";
   import PermissionsOnboarding from "./lib/components/PermissionsOnboarding.svelte";
-  import type { HeaderTabs, UsagePayload, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
+  import type { HeaderTabs, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
 
   let showSplash = $state(true);
   let appReady = $state(false);
@@ -145,9 +141,7 @@
   // @ts-expect-error Assigned via callback, read access planned
   let isScrollLocked = $state(false);
   let dismissedWarningText = $state<string | null>(null);
-  let deviceToggleGuard = 0;
   let initialDataLoad: Promise<void> | null = null;
-  const REMOTE_USAGE_CACHE_PROVIDERS: UsageProvider[] = [ALL_USAGE_PROVIDER_ID, "claude"];
 
   // ── View transition logic ──
   type ViewKey = 'splash' | 'welcome' | 'setup' | 'settings' | 'calendar' | 'single-device' | 'devices' | 'main' | 'loading';
@@ -216,9 +210,12 @@
   );
   // Subscribe to stores
   $effect(() => {
-    const unsub1 = usageData.subscribe((v) => { if (deviceToggleGuard === 0) data = v; });
+    const unsub1 = usageData.subscribe((v) => (data = v));
     const unsub2 = isLoading.subscribe((v) => (loading = v));
-    const unsubPL = isPlaceholderLoading.subscribe((v) => (placeholderLoading = v));
+    const unsubPL = isPlaceholderLoading.subscribe((v) => {
+      placeholderLoading = v;
+      tick().then(() => resizeOrch?.syncSizeAndVerify(v ? "content-loading" : "content-loaded"));
+    });
     const unsub3 = settings.subscribe((s) => {
       brandTheming = s.brandTheming;
       if (!areHeaderTabsEqual(headerTabs, s.headerTabs)) {
@@ -481,68 +478,6 @@
     syncSizeAndVerify("device-back");
   }
 
-  async function handleToggleDeviceStats(device: string, includeInStats: boolean) {
-    logger.info("device", `Stats toggle: ${device} include=${includeInStats}`);
-    const previousData = data;
-    const previousHosts = get(settings).sshHosts;
-
-    // Guard: prevent background fetchData refreshes from overwriting the
-    // optimistic update via the usageData subscription during the async flow.
-    // Without this, a pending stale-while-revalidate background refresh can
-    // resolve mid-toggle and revert the checkbox via usageData.set(oldData).
-    deviceToggleGuard++;
-    // Reject any in-flight background refreshes by bumping the request ID.
-    clearUsageCacheForProviders(REMOTE_USAGE_CACHE_PROVIDERS);
-
-    // Optimistic UI: immediately flip the checkbox so the user sees instant feedback.
-    data = setDeviceIncludeFlag(data, device, includeInStats);
-
-    let failed = false;
-    try {
-      // 1. Update Rust in-memory state + persist to settings.
-      await invoke("toggle_device_include_in_stats", { alias: device, includeInStats });
-      const updatedHosts = setSshHostIncludeFlag(previousHosts, device, includeInStats);
-      await updateSetting("sshHosts", updatedHosts);
-
-      // 2. Clear only the final usage-view cache so provider aggregates stay warm.
-      await invoke("clear_usage_view_cache");
-
-      // 3. Direct IPC fetch + store update (bypasses fetchData's stale-while-revalidate).
-      const freshData = await invoke<UsagePayload>("get_usage_data", { provider, period, offset });
-      seedUsageCache(provider, period, offset, freshData);
-      data = freshData;
-      usageData.set(freshData);
-    } catch (err) {
-      console.error("Failed to toggle device stats:", err);
-      failed = true;
-      data = previousData;
-      if (previousData) {
-        seedUsageCache(provider, period, offset, previousData);
-        usageData.set(previousData);
-      }
-    } finally {
-      deviceToggleGuard--;
-    }
-
-    // Rollback Rust state + settings after the guard is released so the
-    // subscription is active again for any store updates from persistence.
-    if (failed) {
-      try {
-        await invoke("toggle_device_include_in_stats", {
-          alias: device,
-          includeInStats: !includeInStats,
-        });
-      } catch (rollbackErr) {
-        console.error("Failed to rollback device stats toggle:", rollbackErr);
-      }
-      try {
-        await updateSetting("sshHosts", previousHosts);
-      } catch (settingsRollbackErr) {
-        console.error("Failed to rollback sshHosts setting:", settingsRollbackErr);
-      }
-    }
-  }
-
   // ── Window resize (delegated to resizeOrchestrator.ts) ──
   //
   // All resize state, measurement, throttling, and animation logic lives in
@@ -562,6 +497,9 @@
     let observer: ResizeObserver | undefined;
     let unlisten: (() => void) | undefined;
     let unlistenWindowResize: (() => void) | undefined;
+    let onViewportPointerEnter: (() => void) | undefined;
+    let onViewportPointerLeave: (() => void) | undefined;
+    let onViewportPointerMove: (() => void) | undefined;
 
     // Create the resize orchestrator (all resize state lives in its closure)
     let persistedWindowHeight = 0;
@@ -615,12 +553,15 @@
         logResizeDebug("window:focus", captureSnapshot("window-focus"));
         void syncNativeWindowSurface(undefined, get(settings).glassEffect).catch((e) => logger.debug("appearance", `syncNativeWindowSurface failed: ${e}`));
         syncSizeAndVerify("window-focus");
-        clearUsageCache();
-        fetchData(provider, period, offset);
+        // Refresh silently — never drop the live view back to the spinner.
+        fetchData(provider, period, offset, { silent: true });
         if (period === "5h") fetchRateLimits(provider);
       },
       onBlur: () => {
         logResizeDebug("window:blur", captureSnapshot("window-blur"));
+        // Safety net: if the popover is dismissed without a mouseleave firing,
+        // treat blur as "pointer gone" so a queued shrink still flushes.
+        resizeOrch?.setMouseOverWindow(false);
       },
       onError: (event) => {
         logResizeDebug("window:error", {
@@ -661,8 +602,13 @@
     logResizeDebug("app:mount", captureSnapshot("mount"));
 
     const init = async () => {
+      const _t0 = performance.now();
+      console.log('[PROFILE] init:start');
       await resizeOrch!.refreshWindowMetrics();
-      scrollThresholdH = resizeOrch!.getScrollThresholdH();
+      const fixedH0 = resizeOrch!.getFixedWindowH();
+      const rawThreshold = resizeOrch!.getScrollThresholdH();
+      scrollThresholdH = fixedH0 > 0 ? Math.min(rawThreshold, fixedH0) : rawThreshold;
+      console.log(`[PROFILE] init:window-metrics = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       // Load persisted settings and apply theme + defaults (non-blocking)
       try {
@@ -680,30 +626,36 @@
         // Settings load failed — continue with defaults
         logResizeDebug("app:settings-load-failed", {});
       }
+      console.log(`[PROFILE] init:settings+bootstrap = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       // Restore the window to its last-known height before the chart renders.
-      // Combined with the orchestrator's initial-content gate, this hides the
-      // "small → big" pop-out users were seeing on cold launch.
-      const restoredHeight = await getLastWindowHeight();
-      if (!cancelled && restoredHeight) {
-        try {
-          await invoke("set_window_size_and_align", {
-            width: 340,
-            height: restoredHeight,
-          });
-          persistedWindowHeight = restoredHeight;
-          logResizeDebug("app:window-height-restored", { height: restoredHeight });
-        } catch (e) {
-          logResizeDebug("app:window-height-restore-failed", {
-            error: formatDebugError(e),
-          });
+      // In fixed-height mode, don't restore persisted height — content will
+      // drive the height until data arrives, then fixedH locks in.
+      const fixedH = resizeOrch!.getFixedWindowH?.() ?? 0;
+      if (fixedH <= 0) {
+        const restoredHeight = await getLastWindowHeight();
+        if (!cancelled && restoredHeight) {
+          try {
+            await invoke("set_window_size_and_align", {
+              width: 340,
+              height: restoredHeight,
+            });
+            persistedWindowHeight = restoredHeight;
+            logResizeDebug("app:window-height-restored", { height: restoredHeight });
+          } catch (e) {
+            logResizeDebug("app:window-height-restore-failed", {
+              error: formatDebugError(e),
+            });
+          }
         }
       }
+      console.log(`[PROFILE] init:window-restore = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       if (get(settings).hasSeenWelcome) {
         await loadInitialData();
         if (cancelled) return;
       }
+      console.log(`[PROFILE] init:loadInitialData = ${(performance.now() - _t0).toFixed(1)}ms`);
       if (isWindows()) {
         try {
           const edge = await invoke<string>("get_window_anchor_edge");
@@ -713,6 +665,7 @@
 
       void refreshStatuslineProbe();
       appReady = true;
+      console.log(`[PROFILE] init:appReady = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       if (popEl) {
         observer = new ResizeObserver((entries) => {
@@ -726,6 +679,26 @@
           resizeOrch?.resizeToContent("resize-observer");
         });
         observer.observe(popEl);
+        // Defer shrink-resizes while the cursor is anywhere over the popover
+        // window; collapse (eased) only once it leaves the window. Track at the
+        // viewport (documentElement), NOT popEl: while a shrink is deferred the
+        // window stays tall but the content is short, so popEl no longer fills
+        // the window. A pointer move into that bare strip — or any move that
+        // crosses popEl's shrunken box while the cursor is still inside the
+        // window — would fire popEl's mouseleave and flush the shrink early,
+        // collapsing the window out from under the user. documentElement is the
+        // root element and owns every viewport point a child doesn't cover, so
+        // its mouseleave fires only at the true window edge. The mousemove
+        // re-arm covers the case where the popover opens under a stationary
+        // cursor (no enter event fires); setMouseOverWindow early-returns when
+        // the state is unchanged, so these frequent calls are cheap no-ops.
+        const docEl = document.documentElement;
+        onViewportPointerEnter = () => resizeOrch?.setMouseOverWindow(true);
+        onViewportPointerLeave = () => resizeOrch?.setMouseOverWindow(false);
+        onViewportPointerMove = () => resizeOrch?.setMouseOverWindow(true);
+        docEl.addEventListener("mouseenter", onViewportPointerEnter);
+        docEl.addEventListener("mouseleave", onViewportPointerLeave);
+        window.addEventListener("mousemove", onViewportPointerMove);
         syncSizeAndVerify("initial-mount");
         // Wait one frame so the Chart finishes its first paint, then allow
         // shrink-direction resizes. Until now the orchestrator has buffered
@@ -734,6 +707,7 @@
         await tick();
         resizeOrch?.markInitialContentReady();
       }
+      console.log(`[PROFILE] init:TOTAL = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       unlisten = await listen("data-updated", () => {
         logResizeDebug("app:data-updated-event", {
@@ -741,8 +715,10 @@
           period,
           offset,
         });
-        clearUsageCache();
-        fetchData(provider, period, offset);
+        // Silent background refresh — the backend just recomputed. Clearing
+        // the cache + cold-fetching here re-showed the loading spinner over
+        // live data every ~120s; keep the view and swap in fresh numbers.
+        fetchData(provider, period, offset, { silent: true });
         if (period === "5h") fetchRateLimits(provider);
       });
 
@@ -774,6 +750,10 @@
       cancelled = true;
       unlisten?.();
       unlistenWindowResize?.();
+      const docEl = document.documentElement;
+      if (onViewportPointerEnter) docEl.removeEventListener("mouseenter", onViewportPointerEnter);
+      if (onViewportPointerLeave) docEl.removeEventListener("mouseleave", onViewportPointerLeave);
+      if (onViewportPointerMove) window.removeEventListener("mousemove", onViewportPointerMove);
       observer?.disconnect();
       window.removeEventListener("chart-hover", onChartHover);
       resizeOrch?.destroy();
@@ -1002,7 +982,6 @@
             deviceBreakdown={data.device_breakdown}
             onDeviceSelect={handleDeviceSelect}
             onShowAllDevices={() => { showDevices = true; }}
-            onToggleDeviceStats={handleToggleDeviceStats}
           />
         {/if}
       </div>
@@ -1022,7 +1001,6 @@
 <style>
   .pop {
     width: 340px;
-    min-height: 200px;
     box-shadow: none;
     animation: popIn var(--t-slow) var(--ease-out) both;
   }
@@ -1038,7 +1016,7 @@
   .hr { height: 1px; background: var(--border-subtle); margin: 0 12px; }
   .loading {
     display: flex; flex-direction: column; align-items: center;
-    justify-content: center; padding: 48px 24px;
+    justify-content: center; padding: 12px 24px;
   }
   .spinner {
     width: 18px; height: 18px;

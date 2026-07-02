@@ -2,8 +2,9 @@ use chrono::Timelike;
 
 use crate::commands::AppState;
 use crate::models::{ChartBucket, ChartSegment, DeviceModelSummary, DeviceSummary};
+use crate::usage::archive::ArchiveManager;
 use crate::usage::integrations::{provider_matches_model, ALL_USAGE_INTEGRATIONS_ID};
-use crate::usage::ssh_remote::CompactUsageRecord;
+use crate::usage::ssh_remote::{CompactUsageRecord, SshHostConfig};
 
 pub(crate) fn parse_remote_ts(ts: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(ts)
@@ -25,6 +26,54 @@ pub(crate) fn compact_record_matches_provider(record: &CompactUsageRecord, provi
     provider_matches_model(provider, &record.model)
 }
 
+/// A device to aggregate in the dashboard: either a configured+enabled SSH host
+/// (live SSH cache + status) or a device present only in the archive — e.g.
+/// imported from a peer machine's synced export file. Archive-only devices have
+/// no SSH connection; they default to included-in-stats unless a saved include
+/// flag says otherwise.
+pub(crate) struct AggDevice {
+    pub alias: String,
+    pub include_in_stats: bool,
+    /// True for SSH hosts (read live cache + status); false for file-imported peers.
+    pub configured: bool,
+}
+
+/// Devices to aggregate = active SSH hosts ∪ `device:*` sources present in the
+/// archive (deduped by alias; a configured host wins). A DISABLED configured
+/// host stays hidden — its alias is suppressed from the archive set too, so a
+/// disabled host can't reappear as an "archive-only" device.
+pub(crate) fn enumerate_agg_devices(
+    configs: &[SshHostConfig],
+    archive: Option<&ArchiveManager>,
+    remote_include_flags: &std::collections::HashMap<String, bool>,
+) -> Vec<AggDevice> {
+    use std::collections::HashSet;
+    let configured_aliases: HashSet<&str> = configs.iter().map(|c| c.alias.as_str()).collect();
+    let mut out: Vec<AggDevice> = configs
+        .iter()
+        .filter(|c| c.enabled && c.include_in_stats)
+        .map(|c| AggDevice {
+            alias: c.alias.clone(),
+            include_in_stats: c.include_in_stats,
+            configured: true,
+        })
+        .collect();
+    if let Some(a) = archive {
+        for src in a.list_sources() {
+            if let Some(alias) = src.strip_prefix("device:") {
+                if !configured_aliases.contains(alias) {
+                    out.push(AggDevice {
+                        alias: alias.to_string(),
+                        include_in_stats: remote_include_flags.get(alias).copied().unwrap_or(true),
+                        configured: false,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 // ── Summary builders ────────────────────────────────────────────────────────
 
 pub(crate) fn build_device_summary_from_parsed(
@@ -34,10 +83,12 @@ pub(crate) fn build_device_summary_from_parsed(
     end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{
+        calculate_cost_for_key, pricing_available_for_key, provider_multiplier,
+    };
     use std::collections::HashMap;
 
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
 
     for entry in entries {
         if entry.timestamp.date_naive() >= end {
@@ -45,6 +96,7 @@ pub(crate) fn build_device_summary_from_parsed(
         }
 
         let (display_name, model_key) = normalize_model(&entry.model);
+        let pricing_available = pricing_available_for_key(&model_key);
         let cost = calculate_cost_for_key(
             &model_key,
             entry.input_tokens,
@@ -53,14 +105,15 @@ pub(crate) fn build_device_summary_from_parsed(
             entry.cache_creation_1h_tokens,
             entry.cache_read_tokens,
             0,
-        );
+        ) * provider_multiplier(&entry.model);
         let tokens = entry.input_tokens + entry.output_tokens;
 
         let agg = model_map
             .entry(model_key)
-            .or_insert_with(|| (display_name, 0.0, 0));
+            .or_insert_with(|| (display_name, 0.0, 0, true));
         agg.1 += cost;
         agg.2 += tokens;
+        agg.3 &= pricing_available;
     }
 
     finish_device_summary(device_name, model_map)
@@ -74,10 +127,12 @@ pub(crate) fn build_device_summary_from_compact(
     end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{
+        calculate_cost_for_key, pricing_available_for_key, provider_multiplier,
+    };
     use std::collections::HashMap;
 
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
 
     for record in records {
         if record.model.starts_with('<') {
@@ -91,6 +146,7 @@ pub(crate) fn build_device_summary_from_compact(
         }
 
         let (display_name, model_key) = normalize_model(&record.model);
+        let pricing_available = pricing_available_for_key(&model_key);
         let cost = calculate_cost_for_key(
             &model_key,
             record.input_tokens,
@@ -99,14 +155,15 @@ pub(crate) fn build_device_summary_from_compact(
             record.cache_1h,
             record.cache_read,
             0,
-        );
+        ) * provider_multiplier(&record.model);
         let tokens = record.input_tokens + record.output_tokens;
 
         let agg = model_map
             .entry(model_key)
-            .or_insert_with(|| (display_name, 0.0, 0));
+            .or_insert_with(|| (display_name, 0.0, 0, true));
         agg.1 += cost;
         agg.2 += tokens;
+        agg.3 &= pricing_available;
     }
 
     finish_device_summary(device_name, model_map)
@@ -120,10 +177,12 @@ pub(crate) fn build_device_summary_merged(
     end: chrono::NaiveDate,
 ) -> DeviceSummary {
     use crate::models::normalize_model;
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{
+        calculate_cost_for_key, pricing_available_for_key, provider_multiplier,
+    };
     use std::collections::HashMap;
 
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
 
     for entry in archived_entries {
         let entry_date = entry.timestamp.date_naive();
@@ -131,6 +190,7 @@ pub(crate) fn build_device_summary_merged(
             continue;
         }
         let (display_name, model_key) = normalize_model(&entry.model);
+        let pricing_available = pricing_available_for_key(&model_key);
         let cost = calculate_cost_for_key(
             &model_key,
             entry.input_tokens,
@@ -139,13 +199,14 @@ pub(crate) fn build_device_summary_merged(
             entry.cache_creation_1h_tokens,
             entry.cache_read_tokens,
             0,
-        );
+        ) * provider_multiplier(&entry.model);
         let tokens = entry.input_tokens + entry.output_tokens;
         let agg = model_map
             .entry(model_key)
-            .or_insert_with(|| (display_name, 0.0, 0));
+            .or_insert_with(|| (display_name, 0.0, 0, true));
         agg.1 += cost;
         agg.2 += tokens;
+        agg.3 &= pricing_available;
     }
 
     for record in live_records {
@@ -157,6 +218,7 @@ pub(crate) fn build_device_summary_merged(
             continue;
         }
         let (display_name, model_key) = normalize_model(&record.model);
+        let pricing_available = pricing_available_for_key(&model_key);
         let cost = calculate_cost_for_key(
             &model_key,
             record.input_tokens,
@@ -165,13 +227,14 @@ pub(crate) fn build_device_summary_merged(
             record.cache_1h,
             record.cache_read,
             0,
-        );
+        ) * provider_multiplier(&record.model);
         let tokens = record.input_tokens + record.output_tokens;
         let agg = model_map
             .entry(model_key)
-            .or_insert_with(|| (display_name, 0.0, 0));
+            .or_insert_with(|| (display_name, 0.0, 0, true));
         agg.1 += cost;
         agg.2 += tokens;
+        agg.3 &= pricing_available;
     }
 
     finish_device_summary(device_name, model_map)
@@ -179,16 +242,20 @@ pub(crate) fn build_device_summary_merged(
 
 fn finish_device_summary(
     device_name: &str,
-    model_map: std::collections::HashMap<String, (String, f64, u64)>,
+    model_map: std::collections::HashMap<String, (String, f64, u64, bool)>,
 ) -> DeviceSummary {
     let mut model_breakdown: Vec<DeviceModelSummary> = model_map
         .into_iter()
         .map(
-            |(model_key, (display_name, cost, tokens))| DeviceModelSummary {
-                display_name: format!("{} -- {}", display_name, device_name),
+            // The device name is NOT appended here: these rows always render
+            // nested under their device (the device card header / per-device
+            // chart bucket), so a "Model -- Device" suffix is redundant noise.
+            |(model_key, (display_name, cost, tokens, pricing_available))| DeviceModelSummary {
+                display_name,
                 model_key,
                 cost,
                 tokens,
+                pricing_available,
             },
         )
         .collect();
@@ -235,15 +302,24 @@ pub(crate) async fn build_device_breakdown_for_payload(
     use crate::commands::period::compute_date_bounds;
 
     let configs = state.ssh_hosts.read().await;
-    if configs.iter().all(|c| !c.enabled) {
+    let (since, end) = compute_date_bounds(period, offset)?;
+    let parser = &state.parser;
+    let archive = parser.archive();
+
+    // Devices to show = enabled SSH hosts ∪ archive (file-imported peer) devices.
+    // None when there are no remote devices at all (preserves the prior behavior
+    // of suppressing the per-device breakdown when only Local exists).
+    let agg_devices = {
+        let remote_include_flags = state.remote_device_include_flags.read().await;
+        enumerate_agg_devices(&configs, archive.as_ref(), &remote_include_flags)
+    };
+    if agg_devices.is_empty() {
         return None;
     }
 
-    let (since, end) = compute_date_bounds(period, offset)?;
-    let parser = &state.parser;
-
-    let (local_entries, _, _) = parser.load_entries(provider, Some(since));
-    let mut local_summary = build_device_summary_from_parsed("Local", &local_entries, since, end);
+    let loaded = parser.load_entries_cached(provider, Some(since));
+    let local_entries = &loaded.entries;
+    let mut local_summary = build_device_summary_from_parsed("Local", local_entries, since, end);
     local_summary.is_local = true;
     local_summary.status = String::from("online");
 
@@ -256,57 +332,63 @@ pub(crate) async fn build_device_breakdown_for_payload(
     }
 
     let cache_mgr = state.ssh_cache.read().await;
-    let archive = parser.archive();
-    if let Some(mgr) = cache_mgr.as_ref() {
-        let statuses = mgr.host_statuses(&configs);
-        for cfg in configs.iter().filter(|c| c.enabled) {
-            let source_key = format!("device:{}", cfg.alias);
-            let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
+    let mgr = cache_mgr.as_ref();
+    let statuses = mgr.map(|m| m.host_statuses(&configs)).unwrap_or_default();
+    for dev in &agg_devices {
+        let source_key = format!("device:{}", dev.alias);
+        let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
 
-            // Filter archive rows by the selected provider's model family,
-            // matching the live-record filter below. Without this, archive
-            // rows in the Claude tab include OpenAI/GLM data (and vice versa
-            // for the Codex tab), which double-counts archive data across
-            // tabs — making Claude + Codex exceed ALL.
-            let archived_entries: Vec<_> = archive
-                .as_ref()
-                .map(|a| a.load_archived(&source_key, Some(since)))
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|e| provider_matches_model(provider, &e.model))
-                .collect();
+        // Filter archive rows by the selected provider's model family, matching
+        // the live-record filter below. Without this, archive rows in the Claude
+        // tab include OpenAI/GLM data (and vice versa), double-counting across
+        // tabs — making Claude + Codex exceed ALL.
+        let archived_entries: Vec<_> = archive
+            .as_ref()
+            .map(|a| a.load_archived(&source_key, Some(since)))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| provider_matches_model(provider, &e.model))
+            .collect();
 
-            let all_records = match mgr.load_cached_records(&cfg.alias) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Failed to load cached records for {}: {e}", cfg.alias);
+        // Live SSH-cache rows only for configured hosts; file-imported peers have
+        // no SSH cache and contribute from archived data alone.
+        let all_records: Vec<CompactUsageRecord> = if dev.configured {
+            match mgr {
+                Some(m) => m.load_cached_records(&dev.alias).unwrap_or_else(|e| {
+                    tracing::warn!("Failed to load cached records for {}: {e}", dev.alias);
                     Vec::new()
-                }
-            };
-            let filtered: Vec<_> = all_records
-                .iter()
-                .filter(|r| compact_record_matches_provider(r, provider))
-                .filter(|r| {
-                    if let Some(ref f) = frontier {
-                        let dt = parse_remote_ts(&r.ts).map(|d| d.with_timezone(&chrono::Local));
-                        match dt {
-                            Some(local) => !f.covers(local.date_naive(), local.hour() as u8),
-                            None => true,
-                        }
-                    } else {
-                        true
-                    }
-                })
-                .collect();
-
-            if archived_entries.is_empty() && filtered.is_empty() {
-                continue;
+                }),
+                None => Vec::new(),
             }
+        } else {
+            Vec::new()
+        };
+        let filtered: Vec<&CompactUsageRecord> = all_records
+            .iter()
+            .filter(|r| compact_record_matches_provider(r, provider))
+            .filter(|r| {
+                if let Some(ref f) = frontier {
+                    match parse_remote_ts(&r.ts).map(|d| d.with_timezone(&chrono::Local)) {
+                        Some(local) => !f.covers(local.date_naive(), local.hour() as u8),
+                        None => true,
+                    }
+                } else {
+                    true
+                }
+            })
+            .collect();
 
-            let mut summary =
-                build_device_summary_merged(&cfg.alias, &archived_entries, &filtered, since, end);
+        // Skip devices with no data matching the selected provider (provider
+        // scoping — a Claude-only device doesn't show as an empty Codex row).
+        if archived_entries.is_empty() && filtered.is_empty() {
+            continue;
+        }
 
-            if let Some(host_status) = statuses.iter().find(|s| s.alias == cfg.alias) {
+        let mut summary =
+            build_device_summary_merged(&dev.alias, &archived_entries, &filtered, since, end);
+
+        if dev.configured {
+            if let Some(host_status) = statuses.iter().find(|s| s.alias == dev.alias) {
                 summary.last_synced = host_status.last_sync.clone();
                 summary.error_message = host_status.last_error.clone();
                 summary.remote_tz = host_status.remote_tz.clone();
@@ -318,11 +400,14 @@ pub(crate) async fn build_device_breakdown_for_payload(
                     String::from("offline")
                 };
             }
-            summary.include_in_stats = cfg.include_in_stats;
-
-            total_cost += summary.total_cost;
-            devices.push(summary);
+        } else {
+            // File-synced peer — no live SSH connection.
+            summary.status = String::from("offline");
         }
+        summary.include_in_stats = dev.include_in_stats;
+
+        total_cost += summary.total_cost;
+        devices.push(summary);
     }
 
     enrich_cost_percentages(&mut devices, total_cost);
@@ -337,7 +422,9 @@ pub(crate) async fn build_included_devices_payload(
 ) -> Option<crate::models::UsagePayload> {
     use crate::commands::period::compute_date_bounds;
     use crate::models::{ModelSummary, UsagePayload, UsageSource};
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{
+        calculate_cost_for_key, pricing_available_for_key, provider_multiplier,
+    };
     use std::collections::HashMap;
 
     if !provider_includes_remote_ssh_usage(provider) {
@@ -345,27 +432,40 @@ pub(crate) async fn build_included_devices_payload(
     }
 
     let configs = state.ssh_hosts.read().await;
-    let included: Vec<_> = configs
-        .iter()
-        .filter(|c| c.enabled && c.include_in_stats)
-        .collect();
-    if included.is_empty() {
+    let archive = state.parser.archive();
+    // Devices = enabled SSH hosts ∪ archive (file-imported peer) devices.
+    let agg_devices = {
+        let remote_include_flags = state.remote_device_include_flags.read().await;
+        enumerate_agg_devices(&configs, archive.as_ref(), &remote_include_flags)
+    };
+    if agg_devices.is_empty() {
         return None;
     }
 
     let (since, end) = compute_date_bounds(period, offset)?;
     let cache_mgr = state.ssh_cache.read().await;
-    let mgr = cache_mgr.as_ref()?;
-    let archive = state.parser.archive();
+    let mgr = cache_mgr.as_ref();
 
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
-    let mut chart_entries: Vec<(chrono::DateTime<chrono::FixedOffset>, String, f64, u64)> =
-        Vec::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
+    let mut chart_entries: Vec<(
+        chrono::DateTime<chrono::FixedOffset>,
+        String,
+        f64,
+        u64,
+        bool,
+    )> = Vec::new();
     let mut input_tokens = 0_u64;
     let mut output_tokens = 0_u64;
 
-    for cfg in &included {
-        let source_key = format!("device:{}", cfg.alias);
+    for dev in &agg_devices {
+        // Only devices flagged "include in stats" contribute to the MAIN total.
+        // This is the payload merged into the dashboard total; a device the user
+        // excluded (or that is double-counted elsewhere) must not inflate it.
+        // The per-device breakdown still lists excluded devices separately.
+        if !dev.include_in_stats {
+            continue;
+        }
+        let source_key = format!("device:{}", dev.alias);
         let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
 
         // ── Archived hourly rows for completed hours ──
@@ -379,6 +479,7 @@ pub(crate) async fn build_included_devices_payload(
                     continue;
                 }
                 let (display_name, model_key) = crate::models::normalize_model(&entry.model);
+                let pricing_available = pricing_available_for_key(&model_key);
                 let cost = calculate_cost_for_key(
                     &model_key,
                     entry.input_tokens,
@@ -387,26 +488,37 @@ pub(crate) async fn build_included_devices_payload(
                     entry.cache_creation_1h_tokens,
                     entry.cache_read_tokens,
                     0,
-                );
+                ) * provider_multiplier(&entry.model);
                 let tokens = entry.input_tokens + entry.output_tokens;
                 input_tokens += entry.input_tokens;
                 output_tokens += entry.output_tokens;
 
                 let agg = model_map
                     .entry(model_key.clone())
-                    .or_insert_with(|| (display_name, 0.0, 0));
+                    .or_insert_with(|| (display_name, 0.0, 0, true));
                 agg.1 += cost;
                 agg.2 += tokens;
+                agg.3 &= pricing_available;
 
-                chart_entries.push((entry.timestamp.fixed_offset(), model_key, cost, tokens));
+                chart_entries.push((
+                    entry.timestamp.fixed_offset(),
+                    model_key,
+                    cost,
+                    tokens,
+                    pricing_available,
+                ));
             }
         }
 
-        // ── Live compact rows (exclude hours already covered by archive) ──
-        let records = match mgr.load_cached_records(&cfg.alias) {
+        // ── Live compact rows for configured hosts (peers have no SSH cache) ──
+        if !dev.configured {
+            continue;
+        }
+        let Some(m) = mgr else { continue };
+        let records = match m.load_cached_records(&dev.alias) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Failed to load cached records for {}: {e}", cfg.alias);
+                tracing::warn!("Failed to load cached records for {}: {e}", dev.alias);
                 continue;
             }
         };
@@ -434,6 +546,7 @@ pub(crate) async fn build_included_devices_payload(
             }
 
             let (display_name, model_key) = crate::models::normalize_model(&record.model);
+            let pricing_available = pricing_available_for_key(&model_key);
             let cost = calculate_cost_for_key(
                 &model_key,
                 record.input_tokens,
@@ -442,18 +555,19 @@ pub(crate) async fn build_included_devices_payload(
                 record.cache_1h,
                 record.cache_read,
                 0,
-            );
+            ) * provider_multiplier(&record.model);
             let tokens = record.input_tokens + record.output_tokens;
             input_tokens += record.input_tokens;
             output_tokens += record.output_tokens;
 
             let agg = model_map
                 .entry(model_key.clone())
-                .or_insert_with(|| (display_name, 0.0, 0));
+                .or_insert_with(|| (display_name, 0.0, 0, true));
             agg.1 += cost;
             agg.2 += tokens;
+            agg.3 &= pricing_available;
 
-            chart_entries.push((parsed_ts, model_key, cost, tokens));
+            chart_entries.push((parsed_ts, model_key, cost, tokens, pricing_available));
         }
     }
 
@@ -463,13 +577,16 @@ pub(crate) async fn build_included_devices_payload(
 
     let mut model_breakdown: Vec<ModelSummary> = model_map
         .into_iter()
-        .map(|(model_key, (display_name, cost, tokens))| ModelSummary {
-            display_name,
-            model_key,
-            cost,
-            tokens,
-            change_stats: None,
-        })
+        .map(
+            |(model_key, (display_name, cost, tokens, pricing_available))| ModelSummary {
+                display_name,
+                model_key,
+                cost,
+                tokens,
+                pricing_available,
+                change_stats: None,
+            },
+        )
         .collect();
     model_breakdown.sort_by(|a, b| {
         b.cost
@@ -479,17 +596,19 @@ pub(crate) async fn build_included_devices_payload(
 
     use std::collections::BTreeMap;
 
-    let mut bucket_map: BTreeMap<String, BTreeMap<String, (String, f64, u64)>> = BTreeMap::new();
-    for (ts, model_key, cost, tokens) in &chart_entries {
+    type ModelBucket = BTreeMap<String, (String, f64, u64, bool)>;
+    let mut bucket_map: BTreeMap<String, ModelBucket> = BTreeMap::new();
+    for (ts, model_key, cost, tokens, pricing_available) in &chart_entries {
         let bkey = bucket_key_for_timestamp(ts, period);
         let model_entry = bucket_map.entry(bkey).or_default();
-        let (_, model_cost, model_tokens) =
+        let (_, model_cost, model_tokens, model_pricing_available) =
             model_entry.entry(model_key.clone()).or_insert_with(|| {
                 let (display, _) = crate::models::normalize_model(model_key);
-                (display, 0.0, 0)
+                (display, 0.0, 0, true)
             });
         *model_cost += cost;
         *model_tokens += tokens;
+        *model_pricing_available &= *pricing_available;
     }
 
     let chart_buckets: Vec<ChartBucket> = bucket_map
@@ -497,12 +616,15 @@ pub(crate) async fn build_included_devices_payload(
         .map(|(key, models)| {
             let mut segments: Vec<ChartSegment> = models
                 .into_iter()
-                .map(|(model_key, (display, cost, tokens))| ChartSegment {
-                    model: display,
-                    model_key,
-                    cost,
-                    tokens,
-                })
+                .map(
+                    |(model_key, (display, cost, tokens, pricing_available))| ChartSegment {
+                        model: display,
+                        model_key,
+                        cost,
+                        tokens,
+                        pricing_available,
+                    },
+                )
                 .collect();
             segments.sort_by(|a, b| {
                 b.cost
@@ -543,21 +665,28 @@ pub(crate) async fn build_device_time_chart_buckets(
 ) -> Option<Vec<ChartBucket>> {
     use crate::commands::period::compute_date_bounds;
     use crate::models::normalize_model;
-    use crate::usage::pricing::calculate_cost_for_key;
+    use crate::usage::pricing::{calculate_cost_for_key, provider_multiplier};
     use std::collections::HashMap;
 
     let configs = state.ssh_hosts.read().await;
-    if configs.iter().all(|c| !c.enabled) {
+    let parser = &state.parser;
+    let archive = parser.archive();
+    // Devices = enabled SSH hosts ∪ archive (file-imported peer) devices.
+    let agg_devices = {
+        let remote_include_flags = state.remote_device_include_flags.read().await;
+        enumerate_agg_devices(&configs, archive.as_ref(), &remote_include_flags)
+    };
+    if agg_devices.is_empty() {
         return None;
     }
 
     let (since, end) = compute_date_bounds(period, offset)?;
-    let parser = &state.parser;
 
     let mut device_cost_by_bucket: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
-    let (local_entries, _, _) = parser.load_entries(provider, Some(since));
-    for entry in &local_entries {
+    let loaded = parser.load_entries_cached(provider, Some(since));
+    let local_entries = &loaded.entries;
+    for entry in local_entries {
         let date = entry.timestamp.date_naive();
         if date >= end {
             continue;
@@ -572,7 +701,7 @@ pub(crate) async fn build_device_time_chart_buckets(
             entry.cache_creation_1h_tokens,
             entry.cache_read_tokens,
             0,
-        );
+        ) * provider_multiplier(&entry.model);
         *device_cost_by_bucket
             .entry(bucket_key)
             .or_default()
@@ -582,88 +711,95 @@ pub(crate) async fn build_device_time_chart_buckets(
 
     if provider_includes_remote_ssh_usage(provider) {
         let cache_mgr = state.ssh_cache.read().await;
-        let archive = parser.archive();
-        if let Some(mgr) = cache_mgr.as_ref() {
-            for cfg in configs.iter().filter(|c| c.enabled) {
-                let source_key = format!("device:{}", cfg.alias);
-                let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
+        let mgr = cache_mgr.as_ref();
+        for dev in &agg_devices {
+            // Mirror the total: only devices included in stats contribute to the
+            // device cost chart, so the chart matches the headline total.
+            if !dev.include_in_stats {
+                continue;
+            }
+            let source_key = format!("device:{}", dev.alias);
+            let frontier = archive.as_ref().and_then(|a| a.frontier(&source_key));
 
-                // Archived entries for this device, filtered by the active
-                // provider's model family (keeps device time-series consistent
-                // with build_device_breakdown_for_payload's totals).
-                if let Some(ref a) = archive {
-                    for entry in a.load_archived(&source_key, Some(since)) {
-                        if !provider_matches_model(provider, &entry.model) {
-                            continue;
-                        }
-                        let date = entry.timestamp.date_naive();
-                        if date >= end {
-                            continue;
-                        }
-                        let bucket_key =
-                            bucket_key_for_timestamp(&entry.timestamp.fixed_offset(), period);
-                        let (_, model_key) = normalize_model(&entry.model);
-                        let cost = calculate_cost_for_key(
-                            &model_key,
-                            entry.input_tokens,
-                            entry.output_tokens,
-                            entry.cache_creation_5m_tokens,
-                            entry.cache_creation_1h_tokens,
-                            entry.cache_read_tokens,
-                            0,
-                        );
-                        *device_cost_by_bucket
-                            .entry(bucket_key)
-                            .or_default()
-                            .entry(cfg.alias.clone())
-                            .or_insert(0.0) += cost;
-                    }
-                }
-
-                // Live compact records (excluding archived hours).
-                let records = match mgr.load_cached_records(&cfg.alias) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("Failed to load cached records for {}: {e}", cfg.alias);
+            // Archived entries for this device, filtered by the active provider's
+            // model family. Read for EVERY device (configured or file-imported)
+            // regardless of the SSH cache manager, so peers still chart.
+            if let Some(ref a) = archive {
+                for entry in a.load_archived(&source_key, Some(since)) {
+                    if !provider_matches_model(provider, &entry.model) {
                         continue;
                     }
-                };
-                for record in records
-                    .iter()
-                    .filter(|r| compact_record_matches_provider(r, provider))
-                {
-                    let parsed_ts = match parse_remote_ts(&record.ts) {
-                        Some(ts) => ts,
-                        None => continue,
-                    };
-                    let local = parsed_ts.with_timezone(&chrono::Local);
-                    if let Some(ref f) = frontier {
-                        if f.covers(local.date_naive(), local.hour() as u8) {
-                            continue;
-                        }
-                    }
-                    let record_date = local.date_naive();
-                    if record_date < since || record_date >= end {
+                    let date = entry.timestamp.date_naive();
+                    if date >= end {
                         continue;
                     }
-
-                    let bucket_key = bucket_key_for_timestamp(&parsed_ts, period);
-                    let (_, model_key) = normalize_model(&record.model);
+                    let bucket_key =
+                        bucket_key_for_timestamp(&entry.timestamp.fixed_offset(), period);
+                    let (_, model_key) = normalize_model(&entry.model);
                     let cost = calculate_cost_for_key(
                         &model_key,
-                        record.input_tokens,
-                        record.output_tokens,
-                        record.cache_5m,
-                        record.cache_1h,
-                        record.cache_read,
+                        entry.input_tokens,
+                        entry.output_tokens,
+                        entry.cache_creation_5m_tokens,
+                        entry.cache_creation_1h_tokens,
+                        entry.cache_read_tokens,
                         0,
-                    );
+                    ) * provider_multiplier(&entry.model);
                     *device_cost_by_bucket
                         .entry(bucket_key)
                         .or_default()
-                        .entry(cfg.alias.clone())
+                        .entry(dev.alias.clone())
                         .or_insert(0.0) += cost;
                 }
+            }
+
+            // Live compact records for configured hosts (peers have none).
+            if !dev.configured {
+                continue;
+            }
+            let Some(mgr) = mgr else { continue };
+            let records = match mgr.load_cached_records(&dev.alias) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Failed to load cached records for {}: {e}", dev.alias);
+                    continue;
+                }
+            };
+            for record in records
+                .iter()
+                .filter(|r| compact_record_matches_provider(r, provider))
+            {
+                let parsed_ts = match parse_remote_ts(&record.ts) {
+                    Some(ts) => ts,
+                    None => continue,
+                };
+                let local = parsed_ts.with_timezone(&chrono::Local);
+                if let Some(ref f) = frontier {
+                    if f.covers(local.date_naive(), local.hour() as u8) {
+                        continue;
+                    }
+                }
+                let record_date = local.date_naive();
+                if record_date < since || record_date >= end {
+                    continue;
+                }
+
+                let bucket_key = bucket_key_for_timestamp(&parsed_ts, period);
+                let (_, model_key) = normalize_model(&record.model);
+                let cost = calculate_cost_for_key(
+                    &model_key,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cache_5m,
+                    record.cache_1h,
+                    record.cache_read,
+                    0,
+                ) * provider_multiplier(&record.model);
+                *device_cost_by_bucket
+                    .entry(bucket_key)
+                    .or_default()
+                    .entry(dev.alias.clone())
+                    .or_insert(0.0) += cost;
             }
         }
     }
@@ -679,6 +815,7 @@ pub(crate) async fn build_device_time_chart_buckets(
                     model_key: device,
                     cost,
                     tokens: 0,
+                    pricing_available: true,
                 })
                 .collect();
             segments.sort_by(|a, b| {
@@ -756,6 +893,7 @@ pub(crate) fn build_device_chart_buckets(devices: &[DeviceSummary]) -> Vec<Chart
                     model_key: m.model_key.clone(),
                     cost: m.cost,
                     tokens: m.tokens,
+                    pricing_available: m.pricing_available,
                 })
                 .collect(),
         })
@@ -808,6 +946,82 @@ mod tests {
         format!(
             r#"{{"ts":"{ts}","m":"{model}","in":{input_tokens},"out":{output_tokens},"c5":0,"cr":0}}"#
         )
+    }
+
+    #[test]
+    fn enumerate_agg_devices_unions_configs_and_archive() {
+        let configs = vec![
+            SshHostConfig {
+                alias: "A".into(),
+                enabled: true,
+                include_in_stats: true,
+            },
+            SshHostConfig {
+                alias: "B".into(),
+                enabled: false,
+                include_in_stats: true,
+            },
+            SshHostConfig {
+                alias: "C".into(),
+                enabled: true,
+                include_in_stats: false,
+            },
+        ];
+
+        // Config-only (archive=None): active shown, disabled/hidden hosts omitted.
+        let flags = std::collections::HashMap::new();
+        let only_cfg = enumerate_agg_devices(&configs, None, &flags);
+        let aliases: Vec<&str> = only_cfg.iter().map(|d| d.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["A"]);
+        assert!(only_cfg.iter().all(|d| d.configured));
+
+        // With archive holding device:Peer (new) and device:B (a DISABLED config):
+        let tmp = TempDir::new().unwrap();
+        let archive = crate::usage::archive::ArchiveManager::new(tmp.path());
+        let rec = crate::usage::archive::ArchivedHourly {
+            d: "2020-01-01".into(),
+            h: 12,
+            mk: "opus-4-6".into(),
+            mn: "Opus 4.6".into(),
+            input_tokens: 1,
+            out: 2,
+            c5: 0,
+            c1: 0,
+            cr: 0,
+            ws: 0,
+            p: "all".into(),
+        };
+        let now = Local::now();
+        archive.import_source(
+            "device:Peer",
+            std::slice::from_ref(&rec),
+            now.date_naive(),
+            now.hour() as u8,
+        );
+        archive.import_source(
+            "device:B",
+            std::slice::from_ref(&rec),
+            now.date_naive(),
+            now.hour() as u8,
+        );
+
+        let mut flags = std::collections::HashMap::new();
+        flags.insert(String::from("Peer"), false);
+        let merged = enumerate_agg_devices(&configs, Some(&archive), &flags);
+        let names: Vec<&str> = merged.iter().map(|d| d.alias.as_str()).collect();
+        assert!(names.contains(&"A"));
+        assert!(
+            !names.contains(&"C"),
+            "an include-disabled config must stay hidden"
+        );
+        assert!(names.contains(&"Peer"), "file-imported peer should surface");
+        assert!(
+            !names.contains(&"B"),
+            "a disabled config must not reappear via the archive"
+        );
+        let peer = merged.iter().find(|d| d.alias == "Peer").unwrap();
+        assert!(!peer.configured);
+        assert!(!peer.include_in_stats);
     }
 
     async fn build_state_with_remote_claude_data() -> (AppState, TempDir, TempDir, TempDir) {
@@ -1118,7 +1332,7 @@ mod tests {
         *state.ssh_hosts.write().await = vec![SshHostConfig {
             alias: String::from("remote-mixed"),
             enabled: true,
-            include_in_stats: false,
+            include_in_stats: true,
         }];
         *state.ssh_cache.write().await = Some(SshCacheManager::new(app_data_dir.path()));
 

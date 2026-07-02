@@ -1,18 +1,18 @@
 use chrono::Local;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::stats::change::{ChangeStats, ModelChangeSummary};
 
 // ── Frontend payload (sent to Svelte via IPC) ──
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum UsageSource {
     Parser,
     Mixed,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsagePayload {
     pub total_cost: f64,
     pub total_tokens: u64,
@@ -41,6 +41,9 @@ pub struct UsagePayload {
     pub device_breakdown: Option<Vec<DeviceSummary>>,
     pub device_chart_buckets: Option<Vec<ChartBucket>>,
     pub provider_detected: Option<bool>,
+    /// True when Cursor remote data is still being fetched asynchronously.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cursor_loading: bool,
 }
 
 impl Default for UsagePayload {
@@ -70,11 +73,12 @@ impl Default for UsagePayload {
             device_breakdown: None,
             device_chart_buckets: None,
             provider_detected: None,
+            cursor_loading: false,
         }
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChartBucket {
     pub label: String,
     pub sort_key: String,
@@ -82,24 +86,32 @@ pub struct ChartBucket {
     pub segments: Vec<ChartSegment>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChartSegment {
     pub model: String,
     pub model_key: String,
     pub cost: f64,
     pub tokens: u64,
+    #[serde(default = "default_pricing_available")]
+    pub pricing_available: bool,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelSummary {
     pub display_name: String,
     pub model_key: String,
     pub cost: f64,
     pub tokens: u64,
+    #[serde(default = "default_pricing_available")]
+    pub pricing_available: bool,
     pub change_stats: Option<ModelChangeSummary>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+fn default_pricing_available() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ActiveBlock {
     pub cost: f64,
     pub burn_rate_per_hour: f64,
@@ -219,6 +231,8 @@ pub fn detect_model_family(raw: &str) -> ModelFamily {
     }
 
     if normalized.contains("claude")
+        || normalized.contains("fable")
+        || normalized.contains("mythos")
         || normalized.contains("opus")
         || normalized.contains("sonnet")
         || normalized.contains("haiku")
@@ -261,13 +275,54 @@ pub fn detect_model_family(raw: &str) -> ModelFamily {
     ModelFamily::Unknown
 }
 
-/// Family names for Claude model detection.
-const CLAUDE_FAMILIES: &[(&str, &str)] =
-    &[("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")];
+struct ClaudeFamily {
+    lower: &'static str,
+    display: &'static str,
+    allow_major_only: bool,
+    allow_preview: bool,
+}
 
-/// Extract (major, minor) version from text immediately after a family name.
-/// Expects "-{major}-{minor}..." where both are 1–2 digit numbers.
-fn extract_claude_version(after_family: &str) -> Option<(&str, &str)> {
+/// Family names for Claude model detection.
+const CLAUDE_FAMILIES: &[ClaudeFamily] = &[
+    ClaudeFamily {
+        lower: "fable",
+        display: "Fable",
+        allow_major_only: true,
+        allow_preview: false,
+    },
+    ClaudeFamily {
+        lower: "mythos",
+        display: "Mythos",
+        allow_major_only: true,
+        allow_preview: true,
+    },
+    ClaudeFamily {
+        lower: "opus",
+        display: "Opus",
+        allow_major_only: false,
+        allow_preview: false,
+    },
+    ClaudeFamily {
+        lower: "sonnet",
+        display: "Sonnet",
+        allow_major_only: false,
+        allow_preview: false,
+    },
+    ClaudeFamily {
+        lower: "haiku",
+        display: "Haiku",
+        allow_major_only: false,
+        allow_preview: false,
+    },
+];
+
+/// Extract (major, optional minor) version from text immediately after a family
+/// name. Most Claude 4.x model IDs use "-{major}-{minor}"; Fable/Mythos use
+/// "-{major}".
+fn extract_claude_version(
+    after_family: &str,
+    allow_major_only: bool,
+) -> Option<(&str, Option<&str>)> {
     let rest = after_family.strip_prefix('-')?;
     let major_end = rest
         .find(|c: char| !c.is_ascii_digit())
@@ -277,14 +332,89 @@ fn extract_claude_version(after_family: &str) -> Option<(&str, &str)> {
     }
     let major = &rest[..major_end];
     let after_major = &rest[major_end..];
-    let after_dash = after_major.strip_prefix('-')?;
+    let Some(after_dash) = after_major.strip_prefix('-') else {
+        return allow_major_only.then_some((major, None));
+    };
     let minor_end = after_dash
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(after_dash.len());
     if minor_end == 0 || minor_end > 2 {
-        return None;
+        return allow_major_only.then_some((major, None));
     }
-    Some((major, &after_dash[..minor_end]))
+    Some((major, Some(&after_dash[..minor_end])))
+}
+
+fn is_claude_preview_alias(after_family: &str) -> bool {
+    after_family == "-preview"
+        || after_family.starts_with("-preview-")
+        || after_family.starts_with("-preview[")
+}
+
+fn looks_like_model_date(token: &str) -> bool {
+    token.len() == 8 && token.starts_with("20") && token.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn looks_like_provider_revision(token: &str) -> bool {
+    token.len() >= 2 && token.starts_with('v') && token[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+fn title_case_token(token: &str) -> String {
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() => {
+            format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+        }
+        Some(first) => format!("{first}{}", chars.as_str()),
+        None => String::new(),
+    }
+}
+
+fn normalize_raw_model_identity(raw: &str) -> (String, String) {
+    let display_name = raw.trim();
+    if display_name.is_empty() {
+        return ("Unknown".into(), "unknown".into());
+    }
+
+    (display_name.to_string(), display_name.to_ascii_lowercase())
+}
+
+fn normalize_unknown_claude_model(
+    base: &str,
+    suffix_display: &str,
+    suffix_key: &str,
+) -> (String, String) {
+    let Some(pos) = base.find("claude-") else {
+        return normalize_raw_model_identity(base);
+    };
+    let after_claude = &base[pos + "claude-".len()..];
+    let mut key_tokens = Vec::new();
+    for token in after_claude
+        .split(['-', '_', '.', ':'])
+        .filter(|token| !token.is_empty())
+    {
+        if looks_like_model_date(token) || looks_like_provider_revision(token) {
+            break;
+        }
+        if token == "latest" && !key_tokens.is_empty() {
+            break;
+        }
+        key_tokens.push(token);
+    }
+
+    if key_tokens.is_empty() {
+        return normalize_raw_model_identity(base);
+    }
+
+    let display = key_tokens
+        .iter()
+        .map(|token| title_case_token(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let key = key_tokens.join("-");
+    (
+        format!("{display}{suffix_display}"),
+        format!("{key}{suffix_key}"),
+    )
 }
 
 pub fn normalize_claude_model(raw: &str) -> (String, String) {
@@ -297,13 +427,27 @@ pub fn normalize_claude_model(raw: &str) -> (String, String) {
     };
     let suffix_display = if is_fast { " Fast" } else { "" };
     let suffix_key = if is_fast { "-fast" } else { "" };
-    for &(family_lower, family_display) in CLAUDE_FAMILIES {
+    for family in CLAUDE_FAMILIES {
+        let family_lower = family.lower;
+        let family_display = family.display;
         if let Some(pos) = base.find(family_lower) {
             let after = &base[pos + family_lower.len()..];
-            if let Some((major, minor)) = extract_claude_version(after) {
+            if family.allow_preview && is_claude_preview_alias(after) {
                 return (
-                    format!("{family_display} {major}.{minor}{suffix_display}"),
-                    format!("{family_lower}-{major}-{minor}{suffix_key}"),
+                    format!("{family_display} Preview{suffix_display}"),
+                    format!("{family_lower}-preview{suffix_key}"),
+                );
+            }
+            if let Some((major, minor)) = extract_claude_version(after, family.allow_major_only) {
+                if let Some(minor) = minor {
+                    return (
+                        format!("{family_display} {major}.{minor}{suffix_display}"),
+                        format!("{family_lower}-{major}-{minor}{suffix_key}"),
+                    );
+                }
+                return (
+                    format!("{family_display} {major}{suffix_display}"),
+                    format!("{family_lower}-{major}{suffix_key}"),
                 );
             }
             return (
@@ -312,7 +456,7 @@ pub fn normalize_claude_model(raw: &str) -> (String, String) {
             );
         }
     }
-    ("Unknown".into(), "unknown".into())
+    normalize_unknown_claude_model(base, suffix_display, suffix_key)
 }
 
 /// Ordered prefix table for Codex/OpenAI models. Each entry:
@@ -405,15 +549,17 @@ pub(crate) fn is_codex_model_name(raw: &str) -> bool {
 
 // ── Device usage (per-SSH-host breakdown) ──
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeviceModelSummary {
     pub display_name: String,
     pub model_key: String,
     pub cost: f64,
     pub tokens: u64,
+    #[serde(default = "default_pricing_available")]
+    pub pricing_available: bool,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeviceSummary {
     pub device: String,
     pub total_cost: f64,
@@ -497,6 +643,39 @@ mod tests {
     }
 
     #[test]
+    fn claude_fable_5() {
+        let (d, k) = normalize_claude_model("claude-fable-5");
+        assert_eq!((d.as_str(), k.as_str()), ("Fable 5", "fable-5"));
+    }
+
+    #[test]
+    fn claude_mythos_5() {
+        let (d, k) = normalize_claude_model("claude-mythos-5");
+        assert_eq!((d.as_str(), k.as_str()), ("Mythos 5", "mythos-5"));
+    }
+
+    #[test]
+    fn claude_mythos_preview() {
+        let (d, k) = normalize_claude_model("claude-mythos-preview");
+        assert_eq!(
+            (d.as_str(), k.as_str()),
+            ("Mythos Preview", "mythos-preview")
+        );
+    }
+
+    #[test]
+    fn claude_unknown_future_family_keeps_identity() {
+        let (d, k) = normalize_claude_model("claude-cipher-5-20270101");
+        assert_eq!((d.as_str(), k.as_str()), ("Cipher 5", "cipher-5"));
+    }
+
+    #[test]
+    fn claude_unknown_future_family_bedrock_id_keeps_identity() {
+        let (d, k) = normalize_claude_model("us.anthropic.claude-cipher-5-20270101-v1:0");
+        assert_eq!((d.as_str(), k.as_str()), ("Cipher 5", "cipher-5"));
+    }
+
+    #[test]
     fn claude_haiku_generic() {
         let (d, k) = normalize_claude_model("claude-3-haiku-20240307");
         assert_eq!((d.as_str(), k.as_str()), ("Haiku", "haiku"));
@@ -518,7 +697,10 @@ mod tests {
     #[test]
     fn claude_unknown_model() {
         let (d, k) = normalize_claude_model("some-unknown-model");
-        assert_eq!((d.as_str(), k.as_str()), ("Unknown", "unknown"));
+        assert_eq!(
+            (d.as_str(), k.as_str()),
+            ("some-unknown-model", "some-unknown-model")
+        );
     }
 
     // ── substring specificity: longer pattern wins over shorter ──
@@ -569,6 +751,12 @@ mod tests {
     fn claude_opus_4_7_bare() {
         let (d, k) = normalize_claude_model("opus-4-7");
         assert_eq!((d.as_str(), k.as_str()), ("Opus 4.7", "opus-4-7"));
+    }
+
+    #[test]
+    fn claude_fable_5_bare() {
+        let (d, k) = normalize_claude_model("fable-5");
+        assert_eq!((d.as_str(), k.as_str()), ("Fable 5", "fable-5"));
     }
 
     // ── fast mode ──
@@ -869,6 +1057,18 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_routes_new_anthropic_family_to_claude() {
+        let (d, k) = normalize_model("claude-fable-5");
+        assert_eq!((d.as_str(), k.as_str()), ("Fable 5", "fable-5"));
+    }
+
+    #[test]
+    fn dispatch_routes_future_anthropic_family_without_unknown_key() {
+        let (d, k) = normalize_model("claude-cipher-5-20270101");
+        assert_eq!((d.as_str(), k.as_str()), ("Cipher 5", "cipher-5"));
+    }
+
+    #[test]
     fn dispatch_routes_openai_to_codex() {
         let (d, k) = normalize_model("gpt-5.3-codex");
         assert_eq!((d.as_str(), k.as_str()), ("GPT 5.3 codex", "gpt-5.3-codex"));
@@ -934,6 +1134,8 @@ mod tests {
             detect_model_family("claude-sonnet-4-5"),
             ModelFamily::Anthropic
         );
+        assert_eq!(detect_model_family("fable-5"), ModelFamily::Anthropic);
+        assert_eq!(detect_model_family("mythos-5"), ModelFamily::Anthropic);
         assert_eq!(detect_model_family("haiku-latest"), ModelFamily::Anthropic);
     }
 

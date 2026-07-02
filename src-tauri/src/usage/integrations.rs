@@ -77,6 +77,10 @@ impl UsageIntegrationSelection {
             Self::All => &ALL_USAGE_INTEGRATIONS,
         }
     }
+
+    pub fn includes_cursor(self) -> bool {
+        matches!(self, Self::All | Self::Single(UsageIntegrationId::Cursor))
+    }
 }
 
 pub fn all_usage_integrations() -> &'static [UsageIntegrationId] {

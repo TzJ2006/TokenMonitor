@@ -7,6 +7,7 @@ pub mod ssh;
 pub mod statusline;
 pub mod tray;
 pub mod updater;
+pub mod usage_io;
 pub mod usage_query;
 
 pub use tray::sync_tray_title;
@@ -15,8 +16,10 @@ use crate::models::*;
 use crate::statusline::windows::ClaudePlanTier;
 use crate::usage::integrations::UsageIntegrationSelection;
 use crate::usage::parser::{UsageParser, UsageQueryDebugReport};
+use crate::usage::payload_disk_cache::PayloadDiskCache;
 use crate::usage::ssh_remote::{SshCacheManager, SshHostConfig};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -32,6 +35,7 @@ pub struct AppState {
     pub glass_enabled: Arc<RwLock<bool>>,
     pub float_ball_state: Arc<RwLock<float_ball::FloatBallState>>,
     pub ssh_hosts: Arc<RwLock<Vec<SshHostConfig>>>,
+    pub remote_device_include_flags: Arc<RwLock<HashMap<String, bool>>>,
     pub ssh_cache: Arc<RwLock<Option<SshCacheManager>>>,
     pub updater: Arc<RwLock<crate::updater::UpdaterState>>,
     /// When true, the main window blur handler skips hiding once.
@@ -50,6 +54,14 @@ pub struct AppState {
     /// Plan tier used to compute the rolling-window utilization percentages.
     /// Updated by `set_claude_plan_tier`; defaults to `Pro` for new installs.
     pub claude_plan_tier: Arc<RwLock<ClaudePlanTier>>,
+    pub payload_disk_cache: Arc<RwLock<Option<PayloadDiskCache>>>,
+    /// Background auto-export preferences (enabled + destination folder),
+    /// mirrored from the frontend via `set_auto_export_config`. The refresh
+    /// loop appends new usage-archive records to the folder's JSONL file.
+    pub auto_export: Arc<RwLock<usage_io::AutoExportConfig>>,
+    /// Runtime state for the JSONL auto-export (once-per-session full-sync flag
+    /// + per-source append cursors). Not persisted; resets on launch.
+    pub auto_export_runtime: Arc<RwLock<usage_io::AutoExportRuntime>>,
 }
 
 impl AppState {
@@ -64,12 +76,34 @@ impl AppState {
             glass_enabled: Arc::new(RwLock::new(true)),
             float_ball_state: Arc::new(RwLock::new(float_ball::FloatBallState::default())),
             ssh_hosts: Arc::new(RwLock::new(Vec::new())),
+            remote_device_include_flags: Arc::new(RwLock::new(HashMap::new())),
             ssh_cache: Arc::new(RwLock::new(None)),
             updater: Arc::new(RwLock::new(crate::updater::UpdaterState::new())),
             suppress_auto_hide: Arc::new(AtomicBool::new(false)),
             rate_limits_enabled: Arc::new(AtomicBool::new(false)),
             usage_access_enabled: Arc::new(AtomicBool::new(false)),
             claude_plan_tier: Arc::new(RwLock::new(ClaudePlanTier::default())),
+            payload_disk_cache: Arc::new(RwLock::new(None)),
+            auto_export: Arc::new(RwLock::new(usage_io::AutoExportConfig::default())),
+            auto_export_runtime: Arc::new(RwLock::new(usage_io::AutoExportRuntime::default())),
+        }
+    }
+
+    /// Drop the persistent payload disk cache for every usage view.
+    ///
+    /// The disk cache has no TTL: once a per-view payload is written it is
+    /// re-served on every in-memory cache miss until the file is deleted. The
+    /// background refresh loops clear the in-memory payload cache as soon as
+    /// local source logs change, but unless the disk entries are dropped too a
+    /// stale per-provider payload (e.g. `usage-view:claude:day:0:<date>`) keeps
+    /// being served all day — freezing that tab while the `all` view (whose disk
+    /// entries are cleared by the cursor/SSH paths, or never persisted while
+    /// `cursor_loading`) keeps refreshing. Mirrors the SSH-sync path: clearing
+    /// the `usage-view:` prefix forces the next fetch to recompute from fresh
+    /// logs. The cold-start fallback is unaffected — the recompute re-persists.
+    pub(crate) async fn clear_payload_disk_cache(&self) {
+        if let Some(ref disk_cache) = *self.payload_disk_cache.read().await {
+            disk_cache.clear_prefix("usage-view:");
         }
     }
 }

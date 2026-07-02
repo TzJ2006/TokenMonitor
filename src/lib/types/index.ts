@@ -38,6 +38,7 @@ export interface UsagePayload {
   device_breakdown: DeviceSummary[] | null;
   device_chart_buckets: ChartBucket[] | null;
   provider_detected: boolean | null;
+  cursor_loading?: boolean;
 }
 
 export interface ChartBucket {
@@ -52,6 +53,7 @@ export interface ChartSegment {
   model_key: string;
   cost: number;
   tokens: number;
+  pricing_available?: boolean;
 }
 
 export interface ModelSummary {
@@ -59,6 +61,7 @@ export interface ModelSummary {
   model_key: string;
   cost: number;
   tokens: number;
+  pricing_available?: boolean;
   change_stats: ModelChangeSummary | null;
 }
 
@@ -105,6 +108,7 @@ export interface ScopeModelUsage {
   display_name: string;
   model_key: string;
   cost: number;
+  pricing_available?: boolean;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
@@ -202,7 +206,12 @@ export type CostPrecision = 'whole' | 'full';
 export interface TrayConfig {
   barDisplay: BarDisplay;
   barProvider: RateLimitProviderId;
+  /** Providers shown as bars on the menu-bar / tray icon. */
   barProviders: RateLimitProviderId[];
+  /** Providers shown as bars on the floating ball. Kept separate from
+   * `barProviders` so the tray and the floating ball can be configured
+   * independently. */
+  floatBallBarProviders: RateLimitProviderId[];
   showPercentages: boolean;
   percentageFormat: PercentageFormat;
   showCost: boolean;
@@ -233,6 +242,11 @@ export interface SshHostConfig {
   include_in_stats?: boolean;
 }
 
+export interface RemoteDeviceIncludeConfig {
+  alias: string;
+  include_in_stats: boolean;
+}
+
 export interface SshHostStatus {
   alias: string;
   enabled: boolean;
@@ -261,6 +275,7 @@ export interface DeviceModelSummary {
   model_key: string;
   cost: number;
   tokens: number;
+  pricing_available?: boolean;
 }
 
 export interface DeviceSummary {

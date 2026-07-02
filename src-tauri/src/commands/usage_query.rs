@@ -16,7 +16,11 @@ use chrono::Datelike;
 use chrono::NaiveDate;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tauri::Emitter;
 use tauri::State;
+
+const USAGE_PAYLOAD_CACHE_VERSION: &str = "model-pricing-2026-06-13";
 
 /// Ensure every day in [start, end) has a chart bucket, inserting empty buckets
 /// for days with no data.  This prevents the chart from appearing "cut off" when
@@ -74,26 +78,30 @@ fn filter_buckets_to_range(payload: &mut UsagePayload, start: NaiveDate, end: Na
         .count() as u32;
 
     // Rebuild model_breakdown from retained buckets
-    let mut model_map: HashMap<String, (String, f64, u64)> = HashMap::new();
+    let mut model_map: HashMap<String, (String, f64, u64, bool)> = HashMap::new();
     for bucket in &payload.chart_buckets {
         for seg in &bucket.segments {
             let entry =
                 model_map
                     .entry(seg.model_key.clone())
-                    .or_insert((seg.model.clone(), 0.0, 0));
+                    .or_insert((seg.model.clone(), 0.0, 0, true));
             entry.1 += seg.cost;
             entry.2 += seg.tokens;
+            entry.3 &= seg.pricing_available;
         }
     }
     payload.model_breakdown = model_map
         .into_iter()
-        .map(|(key, (name, cost, tokens))| ModelSummary {
-            display_name: name,
-            model_key: key,
-            cost,
-            tokens,
-            change_stats: None,
-        })
+        .map(
+            |(key, (name, cost, tokens, pricing_available))| ModelSummary {
+                display_name: name,
+                model_key: key,
+                cost,
+                tokens,
+                pricing_available,
+                change_stats: None,
+            },
+        )
         .collect();
 
     // Recalculate input/output/cache tokens (populated later from raw entries)
@@ -150,9 +158,9 @@ fn attach_local_stats(
     provider: &str,
     bounds: &PeriodBounds,
 ) {
-    let (mut entries, mut change_events, _reports) =
-        parser.load_entries(provider, Some(bounds.start));
-
+    let loaded = parser.load_entries_cached(provider, Some(bounds.start));
+    let mut entries: Vec<_> = loaded.entries.clone();
+    let mut change_events: Vec<_> = loaded.change_events.clone();
     change_events.retain(|event| {
         let date = event.timestamp.date_naive();
         date >= bounds.start && date < bounds.end
@@ -184,8 +192,28 @@ fn attach_local_stats(
     );
 }
 
-fn final_usage_cache_key(provider: &str, period: &str, offset: i32) -> String {
-    format!("usage-view:{provider}:{period}:{offset}")
+fn final_usage_cache_key(provider: &str, period: &str, offset: i32, interval_secs: u64) -> String {
+    // Include the resolved start date so date-relative keys (e.g. "day:0" = today)
+    // don't serve stale disk-cached payloads after a date rollover.
+    let date_tag = resolve_period_bounds(period, offset)
+        .map(|b| b.start.format("%Y%m%d").to_string())
+        .unwrap_or_default();
+    // The 5h window rolls continuously with wall-clock time, so a key fixed to
+    // provider:period:offset:date would serve a frozen payload until the source
+    // logs change. Mix in a coarse time bucket sized to the user's refresh
+    // interval so the window recomputes once per interval. Other periods are
+    // day-granular and need no sub-day busting. interval_secs == 0 ("off")
+    // falls back to the date-only key — no periodic refresh is expected then.
+    let bucket_tag = if period == "5h" && interval_secs > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!(":b{}", now / interval_secs)
+    } else {
+        String::new()
+    };
+    format!("usage-view:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{date_tag}{bucket_tag}")
 }
 
 async fn finalize_usage_payload(
@@ -195,24 +223,60 @@ async fn finalize_usage_payload(
     offset: i32,
     mut payload: UsagePayload,
 ) -> UsagePayload {
-    payload.device_breakdown =
+    let (device_breakdown, device_chart_buckets, included) = tokio::join!(
         crate::usage::device_aggregation::build_device_breakdown_for_payload(
             state, provider, period, offset,
-        )
-        .await;
-    payload.device_chart_buckets =
+        ),
         crate::usage::device_aggregation::build_device_time_chart_buckets(
             state, provider, period, offset,
-        )
-        .await;
+        ),
+        crate::usage::device_aggregation::build_included_devices_payload(
+            state, provider, period, offset,
+        ),
+    );
 
-    if let Some(included) = crate::usage::device_aggregation::build_included_devices_payload(
-        state, provider, period, offset,
-    )
-    .await
-    {
+    tracing::info!(
+        "[DEVICE] finalize_usage_payload: provider={provider} period={period} offset={offset}"
+    );
+    tracing::info!(
+        "[DEVICE] local payload before merge: total_cost={:.2}, total_tokens={}",
+        payload.total_cost,
+        payload.total_tokens,
+    );
+    if let Some(ref bd) = device_breakdown {
+        for d in bd {
+            tracing::info!(
+                "[DEVICE] breakdown: device={} cost={:.2} is_local={} include_in_stats={}",
+                d.device,
+                d.total_cost,
+                d.is_local,
+                d.include_in_stats,
+            );
+        }
+    } else {
+        tracing::info!("[DEVICE] device_breakdown = None");
+    }
+    tracing::info!(
+        "[DEVICE] build_included_devices_payload returned: {:?}",
+        included.as_ref().map(|p| format!(
+            "total_cost={:.2} models={}",
+            p.total_cost,
+            p.model_breakdown.len()
+        )),
+    );
+
+    payload.device_breakdown = device_breakdown;
+    payload.device_chart_buckets = device_chart_buckets;
+
+    if let Some(included) = included {
         payload = merge_payloads(payload, included);
     }
+
+    tracing::info!(
+        "[DEVICE] final merged payload: total_cost={:.2}, total_tokens={}",
+        payload.total_cost,
+        payload.total_tokens,
+    );
 
     payload
 }
@@ -234,7 +298,7 @@ pub(crate) fn get_provider_data(
     offset: i32,
 ) -> Result<UsagePayload, String> {
     // Single cache layer: stores the complete payload including stats.
-    let cache_key = format!("full:{}:{}:{}", provider, period, offset);
+    let cache_key = format!("full:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}");
     if let Some(cached) = parser.check_cache(&cache_key) {
         return Ok(cached);
     }
@@ -292,10 +356,12 @@ fn merge_payloads(mut c: UsagePayload, x: UsagePayload) -> UsagePayload {
                 model_key: model.model_key,
                 cost: 0.0,
                 tokens: 0,
+                pricing_available: true,
                 change_stats: None,
             });
         entry.cost += model.cost;
         entry.tokens += model.tokens;
+        entry.pricing_available &= model.pricing_available;
     }
 
     c.total_cost += x.total_cost;
@@ -432,31 +498,49 @@ pub async fn get_known_models(
 
 #[tauri::command]
 pub async fn get_usage_data(
+    app: tauri::AppHandle,
     provider: String,
     period: String,
     offset: i32,
     state: State<'_, AppState>,
 ) -> Result<UsagePayload, String> {
-    get_usage_data_inner(&state, &provider, &period, offset).await
+    get_usage_data_inner(Some(&app), &state, &provider, &period, offset).await
 }
 
 pub(crate) async fn get_usage_data_inner(
+    app: Option<&tauri::AppHandle>,
     state: &AppState,
     provider: &str,
     period: &str,
     offset: i32,
 ) -> Result<UsagePayload, String> {
+    let _ipc_t0 = std::time::Instant::now();
+    tracing::info!("[PROFILE] get_usage_data: provider={provider} period={period} offset={offset}");
     if !usage_access_enabled(state) {
         return Ok(UsagePayload {
             usage_warning: Some(String::from("Usage access has not been enabled yet.")),
             ..UsagePayload::default()
         });
     }
+    tracing::info!(
+        "[PROFILE] get_usage_data: access-check = {:?}",
+        _ipc_t0.elapsed()
+    );
 
     let parser = &state.parser;
     let selection = parse_usage_selection(provider)?;
-    let final_cache_key = final_usage_cache_key(provider, period, offset);
+    let refresh_interval_secs = *state.refresh_interval.read().await;
+    let final_cache_key = final_usage_cache_key(provider, period, offset, refresh_interval_secs);
+    // The 5h key is time-bucketed (see final_usage_cache_key), so every refresh
+    // interval mints a fresh key. The disk cache has no TTL, so persisting one
+    // entry per bucket would bloat it without ever being re-read (cold starts
+    // land in a new bucket). Keep 5h in the TTL-bounded memory cache only.
+    let use_disk_cache = period != "5h";
     if let Some(cached) = parser.check_cache(&final_cache_key) {
+        tracing::info!(
+            "[DEVICE] get_usage_data HIT MEMORY CACHE: key={final_cache_key} total_cost={:.2}",
+            cached.total_cost,
+        );
         set_last_usage_debug(
             state,
             UsageDebugReport {
@@ -473,7 +557,38 @@ pub(crate) async fn get_usage_data_inner(
         return Ok(cached);
     }
 
-    let payload = match selection {
+    // Disk cache fallback: return stale data instantly, caller refreshes in background.
+    if use_disk_cache {
+        if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+            if let Some(mut cached) = disk_cache.load(&final_cache_key) {
+                // Ignore payloads persisted while async cursor data was still
+                // pending: the disk cache has no TTL, so serving a `cursor_loading`
+                // payload would show empty cursor usage forever (and the disk hit
+                // returns before the background-fetch spawn below, so it can never
+                // self-heal). Treat it as a miss to recompute + re-trigger fetch.
+                if cached.cursor_loading {
+                    tracing::info!(
+                    "[DEVICE] get_usage_data DISK CACHE SKIP (incomplete/cursor_loading): key={final_cache_key}"
+                );
+                } else {
+                    tracing::info!(
+                    "[DEVICE] get_usage_data HIT DISK CACHE: key={final_cache_key} total_cost={:.2}",
+                    cached.total_cost,
+                );
+                    cached.from_cache = true;
+                    parser.store_cache(&final_cache_key, cached.clone());
+                    return Ok(cached);
+                }
+            }
+        }
+    }
+    tracing::info!("[DEVICE] get_usage_data CACHE MISS: key={final_cache_key}");
+    tracing::info!(
+        "[PROFILE] get_usage_data: cache-miss (memory+disk), starting full parse. elapsed={:?}",
+        _ipc_t0.elapsed()
+    );
+
+    let mut payload = match selection {
         UsageIntegrationSelection::Single(integration_id) => {
             let mut payload = get_provider_data(parser, provider, period, offset)?;
             payload.provider_detected =
@@ -539,8 +654,80 @@ pub(crate) async fn get_usage_data_inner(
             finalize_usage_payload(state, provider, period, offset, merged).await
         }
     };
+    tracing::info!(
+        "[PROFILE] get_usage_data: payload-built = {:?}",
+        _ipc_t0.elapsed()
+    );
+
+    // Check if cursor remote data needs async fetching. The cache is range-aware:
+    // a fetch is only needed when it doesn't already cover this period's `since`.
+    let cursor_included = selection.includes_cursor();
+    let cursor_since = resolve_period_bounds(period, offset).ok().map(|b| b.start);
+    let needs_cursor_remote = cursor_included && parser.needs_cursor_remote_fetch(cursor_since);
+    if needs_cursor_remote {
+        payload.cursor_loading = true;
+    }
 
     parser.store_cache(&final_cache_key, payload.clone());
+    parser.clear_entries_cache();
+
+    // Persist to disk for next cold start (fire-and-forget). Never persist an
+    // incomplete payload: a `cursor_loading` payload is missing its async
+    // remote data, and the TTL-less disk cache would serve it forever.
+    if use_disk_cache && !payload.cursor_loading {
+        if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
+            disk_cache.save(&final_cache_key, &payload);
+        }
+    }
+
+    // Spawn background Cursor remote fetch if needed.
+    if needs_cursor_remote {
+        if let Some(app_ref) = app {
+            let app_handle = app_ref.clone();
+            let parser_arc = Arc::clone(&state.parser);
+            let disk_cache_arc = Arc::clone(&state.payload_disk_cache);
+            let since = cursor_since;
+            tokio::spawn(async move {
+                tracing::info!("[cursor-async] Starting background Cursor remote fetch");
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::usage::cursor_parser::fetch_cursor_remote_entries(since)
+                })
+                .await;
+                match result {
+                    Ok(Ok(Some(entries))) => {
+                        tracing::info!(
+                            "[cursor-async] Background fetch complete: {} entries",
+                            entries.len()
+                        );
+                        parser_arc.store_cursor_remote(entries, since);
+                        parser_arc.clear_payload_cache();
+                        // Drop persisted cursor/all payloads so the refresh
+                        // recomputes with the freshly-fetched remote data
+                        // instead of re-serving a stale or empty disk entry.
+                        if let Some(ref disk_cache) = *disk_cache_arc.read().await {
+                            disk_cache.clear_prefix("usage-view:");
+                        }
+                        let _ = app_handle.emit("data-updated", 0u64);
+                    }
+                    Ok(Ok(None)) => {
+                        tracing::info!("[cursor-async] No cursor auth configured");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("[cursor-async] Cursor remote fetch failed: {e}");
+                        let _ = app_handle.emit("data-updated", 0u64);
+                    }
+                    Err(e) => {
+                        tracing::warn!("[cursor-async] Cursor remote task panicked: {e}");
+                    }
+                }
+            });
+        }
+    }
+
+    tracing::info!(
+        "[PROFILE] get_usage_data: TOTAL = {:?} (provider={provider})",
+        _ipc_t0.elapsed()
+    );
     Ok(payload)
 }
 
@@ -570,6 +757,7 @@ mod tests {
             model_key: model_key.to_string(),
             cost,
             tokens,
+            pricing_available: true,
             change_stats: None,
         }
     }
@@ -676,6 +864,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_change_must_invalidate_disk_cache_so_per_provider_view_refreshes() {
+        // Regression for DBG-010: the no-TTL payload disk cache re-served a
+        // stale per-provider payload after the in-memory cache was cleared,
+        // freezing the Claude/Codex tabs for the day while the `all` view kept
+        // refreshing (its disk entries are cleared by the cursor/SSH paths).
+        let claude_dir = TempDir::new().unwrap();
+        let codex_dir = TempDir::new().unwrap();
+        let app_data_dir = TempDir::new().unwrap();
+        let now = Local::now();
+
+        write_file(
+            &claude_dir.path().join("session.jsonl"),
+            &claude_assistant_entry(&now.to_rfc3339(), "claude-sonnet-4-6-20260301", 1_000, 500),
+        );
+
+        let mut state = AppState::new();
+        state
+            .usage_access_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.parser = Arc::new(UsageParser::with_dirs(
+            claude_dir.path().to_path_buf(),
+            codex_dir.path().to_path_buf(),
+        ));
+        *state.payload_disk_cache.write().await = Some(
+            crate::usage::payload_disk_cache::PayloadDiskCache::new(app_data_dir.path()),
+        );
+
+        // Real computation: establishes the true cost and persists it to disk.
+        let real = get_usage_data_inner(None, &state, "claude", "day", 0)
+            .await
+            .unwrap();
+        assert!(
+            real.total_cost > 0.0,
+            "fixture should produce nonzero claude usage"
+        );
+
+        // Plant a stale payload on disk under the same key — as if it had been
+        // written earlier in the day, before more usage was logged — then clear
+        // ONLY the in-memory cache, exactly what the refresh loops used to do.
+        let key = final_usage_cache_key("claude", "day", 0, 0);
+        let stale = UsagePayload {
+            total_cost: 999_999.0,
+            ..UsagePayload::default()
+        };
+        state
+            .payload_disk_cache
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .save(&key, &stale);
+        state.parser.clear_payload_cache();
+
+        // Bug reproduction: a memory-only invalidation re-serves the stale disk
+        // entry instead of recomputing.
+        let stale_served = get_usage_data_inner(None, &state, "claude", "day", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_served.total_cost, 999_999.0,
+            "guard: the disk cache short-circuits recompute on a memory miss"
+        );
+
+        // The fix: clearing the disk cache (what the refresh loops now do on a
+        // source change) forces a recompute that reflects the real logs again.
+        state.parser.clear_payload_cache();
+        state.clear_payload_disk_cache().await;
+        let fresh = get_usage_data_inner(None, &state, "claude", "day", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.total_cost, real.total_cost,
+            "after disk invalidation the per-provider view recomputes fresh"
+        );
+        assert!(
+            (fresh.total_cost - 999_999.0).abs() > 1.0,
+            "the stale payload must not survive disk invalidation"
+        );
+    }
+
+    #[tokio::test]
     async fn get_usage_data_inner_returns_empty_until_usage_access_is_enabled() {
         let claude_dir = TempDir::new().unwrap();
         let codex_dir = TempDir::new().unwrap();
@@ -693,7 +962,9 @@ mod tests {
             codex_dir.path().to_path_buf(),
         ));
 
-        let payload = get_usage_data_inner(&state, "all", "day", 0).await.unwrap();
+        let payload = get_usage_data_inner(None, &state, "all", "day", 0)
+            .await
+            .unwrap();
 
         assert_eq!(
             payload.usage_warning.as_deref(),
@@ -938,11 +1209,47 @@ mod tests {
     }
 
     #[test]
+    fn five_hour_cache_key_is_time_bucketed_by_refresh_interval() {
+        // The rolling 5h window must recompute once per refresh interval, so its
+        // key carries a wall-clock bucket sized to the interval. A 30s interval
+        // and a 300s interval land the same instant in different-width buckets,
+        // so their keys differ.
+        let k30 = final_usage_cache_key("claude", "5h", 0, 30);
+        let k300 = final_usage_cache_key("claude", "5h", 0, 300);
+        assert_ne!(
+            k30, k300,
+            "5h key must vary with the refresh interval bucket size"
+        );
+        assert!(k30.contains(":b"), "5h key should carry a time bucket tag");
+
+        // Non-5h periods are day-granular and must stay interval-independent so
+        // their disk-cache entries remain reusable across refreshes.
+        let day_30 = final_usage_cache_key("claude", "day", 0, 30);
+        let day_300 = final_usage_cache_key("claude", "day", 0, 300);
+        assert_eq!(
+            day_30, day_300,
+            "non-5h keys must not depend on the interval"
+        );
+        assert!(
+            !day_30.contains(":b"),
+            "non-5h key should carry no bucket tag"
+        );
+
+        // "Off" (interval 0) disables periodic refresh, so the 5h key falls back
+        // to the date-only form rather than bucketing by a zero-width slot.
+        let five_off = final_usage_cache_key("claude", "5h", 0, 0);
+        assert!(
+            !five_off.contains(":b"),
+            "5h key must not bucket when refresh is off"
+        );
+    }
+
+    #[test]
     fn clearing_usage_view_cache_keeps_provider_cache_entries() {
         let dir = TempDir::new().unwrap();
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
         let full_key = String::from("full:claude:day:0");
-        let final_key = final_usage_cache_key("claude", "day", 0);
+        let final_key = final_usage_cache_key("claude", "day", 0, 0);
 
         parser.store_cache(&full_key, UsagePayload::default());
         parser.store_cache(&final_key, UsagePayload::default());
@@ -956,6 +1263,33 @@ mod tests {
         assert!(
             parser.check_cache(&final_key).is_none(),
             "usage-view cache should be removed by prefix invalidation"
+        );
+    }
+
+    #[test]
+    fn load_entries_populates_entries_cache_for_subsequent_cached_calls() {
+        let dir = TempDir::new().unwrap();
+        let now = Local::now();
+        let ts = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let content = format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"model":"claude-sonnet-4-6-20260301","usage":{{"input_tokens":2000,"output_tokens":800}},"stop_reason":"end_turn"}}}}"#,
+        );
+        write_file(&dir.path().join("session.jsonl"), &content);
+
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+        let today = now.date_naive();
+
+        // First call via load_entries (as get_hourly does internally)
+        let (entries, _, _) = parser.load_entries("claude", Some(today));
+        assert!(!entries.is_empty(), "should parse at least one entry");
+
+        // Subsequent call via load_entries_cached should hit the cache
+        // without re-reading files (entries_cache was populated by write-through)
+        let cached = parser.load_entries_cached("claude", Some(today));
+        assert_eq!(
+            cached.entries.len(),
+            entries.len(),
+            "cached entries should match direct load_entries result"
         );
     }
 
@@ -1147,7 +1481,9 @@ mod tests {
             build_state_with_remote_claude_data().await;
 
         let baseline = get_provider_data(&state.parser, "all", "day", 0).unwrap();
-        let payload = get_usage_data_inner(&state, "all", "day", 0).await.unwrap();
+        let payload = get_usage_data_inner(None, &state, "all", "day", 0)
+            .await
+            .unwrap();
 
         assert!(payload.total_cost > baseline.total_cost);
         assert_eq!(payload.total_tokens, baseline.total_tokens + 3_000);
@@ -1174,7 +1510,7 @@ mod tests {
             build_state_with_remote_claude_data().await;
 
         let baseline = get_provider_data(&state.parser, "claude", "day", 0).unwrap();
-        let payload = get_usage_data_inner(&state, "claude", "day", 0)
+        let payload = get_usage_data_inner(None, &state, "claude", "day", 0)
             .await
             .unwrap();
 
@@ -1203,7 +1539,7 @@ mod tests {
             build_state_with_remote_claude_data().await;
 
         let baseline = get_provider_data(&state.parser, "codex", "day", 0).unwrap();
-        let payload = get_usage_data_inner(&state, "codex", "day", 0)
+        let payload = get_usage_data_inner(None, &state, "codex", "day", 0)
             .await
             .unwrap();
 
@@ -1422,5 +1758,45 @@ mod tests {
             week.total_tokens > 0,
             "expected local Claude weekly usage to be readable"
         );
+    }
+
+    #[test]
+    #[ignore = "profile all periods cold start with real local data"]
+    fn profile_all_periods_cold_start() {
+        fn elapsed_ms(started_at: std::time::Instant) -> f64 {
+            started_at.elapsed().as_secs_f64() * 1000.0
+        }
+
+        let providers = ["claude", "all"];
+        let periods = ["5h", "day", "week", "month", "year"];
+
+        for provider in &providers {
+            let state = AppState::new();
+            println!("\n--- Provider: {} ---", provider);
+
+            for period in &periods {
+                state.parser.clear_cache();
+                let started_at = std::time::Instant::now();
+                let result = get_provider_data(&state.parser, provider, period, 0);
+                let cold_ms = elapsed_ms(started_at);
+
+                match result {
+                    Ok(payload) => {
+                        let json_size = serde_json::to_vec(&payload).map(|v| v.len()).unwrap_or(0);
+                        println!(
+                            "  {}/{} cold={:.1}ms cost=${:.2} tokens={} buckets={} json_bytes={}",
+                            provider,
+                            period,
+                            cold_ms,
+                            payload.total_cost,
+                            payload.total_tokens,
+                            payload.chart_buckets.len(),
+                            json_size,
+                        );
+                    }
+                    Err(e) => println!("  {}/{} ERROR: {}", provider, period, e),
+                }
+            }
+        }
     }
 }

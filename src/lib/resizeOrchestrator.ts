@@ -4,6 +4,7 @@ import {
   MIN_WINDOW_HEIGHT,
   RESIZE_HYSTERESIS_PX,
   RESIZE_SETTLE_DELAY_MS,
+  SHRINK_ON_LEAVE_ANIM_MS,
   WINDOW_WIDTH,
   clampWindowHeight,
   classifyResize,
@@ -11,6 +12,7 @@ import {
   measureTargetWindowHeight,
   resolveEffectiveWindowMaxHeight,
   resolveMonitorMaxWindowHeight,
+  resolveFixedWindowHeight,
   resolveScrollThresholdHeight,
 } from "./windowSizing.js";
 
@@ -19,6 +21,7 @@ export interface ResizeOrchestratorDeps {
   invoke: (cmd: string, args: Record<string, unknown>) => Promise<void>;
   onScrollLockChange: (locked: boolean) => void;
   currentMonitor: () => Promise<{
+    size: { width: number; height: number };
     workArea: { size: { height: number } };
     scaleFactor: number;
   } | null>;
@@ -42,12 +45,17 @@ export interface ResizeOrchestrator {
   handleBreakdownAccordionToggle: (detail: AccordionToggleDetail) => void;
   refreshWindowMetrics: () => Promise<void>;
   setChartHoverActive: (active: boolean) => void;
+  /** Track whether the pointer is over the popover. While true, shrink
+   * requests are deferred and the latest desired height is flushed (eased)
+   * when the pointer leaves. */
+  setMouseOverWindow: (active: boolean) => void;
   /** Release the "no shrink before first data" gate; shrink requests were buffered until now. */
   markInitialContentReady: () => void;
   destroy: () => void;
   getMaxWindowH: () => number;
   getScrollThresholdH: () => number;
   getIsScrollLocked: () => boolean;
+  getFixedWindowH: () => number;
 }
 
 export function createResizeOrchestrator(
@@ -68,6 +76,12 @@ export function createResizeOrchestrator(
   let observerResizeRaf = 0;
   let pendingObserverSource = "observer";
   let chartHoverActive = false;
+  // While the pointer is over the popover, shrink requests are held back so
+  // the window doesn't collapse under the cursor mid-interaction. The latest
+  // desired (smaller) height is queued here and flushed with a slow ease once
+  // the pointer leaves. Grows always apply immediately.
+  let mouseOverWindow = false;
+  let deferredShrinkHeight: number | null = null;
 
   // Resize throttle: max 3 operations per 500ms window
   const ANIMATED_RESIZE_FRAME_INTERVAL_MS = 32;
@@ -81,7 +95,7 @@ export function createResizeOrchestrator(
   // once the bar chart renders. Suppress shrink requests during that window
   // to avoid a visible pop-out after content arrives.
   let initialContentReady = false;
-
+  let fixedWindowH = 0;
   // ── Internal helpers ──
 
   function captureDebugSnapshot(reason: string): Record<string, unknown> {
@@ -120,6 +134,12 @@ export function createResizeOrchestrator(
     try {
       const monitor = await deps.currentMonitor();
       if (!monitor) return;
+
+      fixedWindowH = resolveFixedWindowHeight(
+        monitor.size.width,
+        monitor.scaleFactor,
+      );
+
       maxWindowH = resolveMonitorMaxWindowHeight(
         monitor.workArea.size.height,
         monitor.scaleFactor,
@@ -133,6 +153,7 @@ export function createResizeOrchestrator(
         scaleFactor: monitor.scaleFactor,
         maxWindowH,
         scrollThresholdH,
+        fixedWindowH,
       });
     } catch {
       maxWindowH = DEFAULT_MAX_WINDOW_HEIGHT;
@@ -142,11 +163,13 @@ export function createResizeOrchestrator(
   }
 
   function getEffectiveWindowMaxHeight(): number {
-    return resolveEffectiveWindowMaxHeight(
+    const base = resolveEffectiveWindowMaxHeight(
       maxWindowH,
       scrollThresholdH,
       MIN_WINDOW_HEIGHT,
     );
+    if (fixedWindowH > 0 && fixedWindowH < base) return fixedWindowH;
+    return base;
   }
 
   function updateScrollLockState(
@@ -299,6 +322,23 @@ export function createResizeOrchestrator(
       });
       return;
     }
+    // Defer shrink while the pointer is over the popover; remember the latest
+    // target and collapse on mouse-leave. Only engage after the first paint so
+    // the cold-launch settle (handled by the initialContentReady gate above)
+    // is never deferred.
+    if (initialContentReady && mouseOverWindow && nextHeight < lastWindowH) {
+      deferredShrinkHeight = nextHeight;
+      deps.logDebug("resize:shrink-deferred-mouse-over", {
+        source,
+        nextHeight,
+        lastWindowH,
+      });
+      return;
+    }
+    // Any height we actually apply supersedes a queued shrink (e.g. a grow
+    // arrived while a shrink was pending) — keep the queue holding only the
+    // latest still-pending desired height.
+    deferredShrinkHeight = null;
     lastWindowH = nextHeight;
     pendingWindowHeightRequest = {
       height: nextHeight,
@@ -583,6 +623,23 @@ export function createResizeOrchestrator(
     }
   }
 
+  function setMouseOverWindow(active: boolean): void {
+    if (active === mouseOverWindow) return;
+    mouseOverWindow = active;
+    deps.logDebug("resize:mouse-over-window", {
+      active,
+      hasDeferredShrink: deferredShrinkHeight !== null,
+    });
+    if (!active && deferredShrinkHeight !== null) {
+      // Pointer left — collapse to the latest desired height with a slow ease
+      // rather than a hard snap. animateWindowHeight already eases + throttles
+      // its per-frame setSize calls and bypasses the (now-cleared) mouse gate.
+      const target = deferredShrinkHeight;
+      deferredShrinkHeight = null;
+      animateWindowHeight(target, SHRINK_ON_LEAVE_ANIM_MS, "mouse-leave-flush");
+    }
+  }
+
   function destroy(): void {
     if (resizeTimer) clearTimeout(resizeTimer);
     cancelAnimationFrame(resizeRaf);
@@ -601,9 +658,8 @@ export function createResizeOrchestrator(
     initialContentReady = true;
     deps.logDebug("resize:initial-content-ready", {
       lastWindowH,
+      fixedWindowH,
     });
-    // Now that shrinks are unblocked, run one sync pass in case the final
-    // content is shorter than the primed height we started with.
     syncSizeAndVerify("initial-content-ready");
   }
 
@@ -615,10 +671,12 @@ export function createResizeOrchestrator(
     handleBreakdownAccordionToggle,
     refreshWindowMetrics,
     setChartHoverActive,
+    setMouseOverWindow,
     markInitialContentReady,
     destroy,
     getMaxWindowH: () => maxWindowH,
     getScrollThresholdH: () => scrollThresholdH,
     getIsScrollLocked: () => isScrollLocked,
+    getFixedWindowH: () => fixedWindowH,
   };
 }

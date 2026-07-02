@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod cache_warmup;
 pub mod claude_parser;
 pub mod codex_parser;
 pub mod cursor_parser;
@@ -8,6 +9,8 @@ pub mod integrations;
 pub mod litellm;
 pub mod openrouter;
 pub mod parser;
+pub mod payload_disk_cache;
 pub mod pricing;
+pub mod pricing_fallback;
 pub mod ssh_config;
 pub mod ssh_remote;

@@ -1,5 +1,5 @@
 #[cfg_attr(not(test), allow(dead_code))]
-pub const PRICING_VERSION: &str = "2026-03-15";
+pub const PRICING_VERSION: &str = "2026-06-17";
 
 use crate::models::{detect_model_family, ModelFamily};
 use crate::usage::litellm::DynamicModelRates;
@@ -53,15 +53,19 @@ pub fn calculate_cost(
     cache_read_tokens: u64,
     web_search_requests: u64,
 ) -> f64 {
-    let rates = get_rates(model);
-    apply_rates(
-        &rates,
-        input_tokens,
-        output_tokens,
-        cache_creation_5m_tokens,
-        cache_creation_1h_tokens,
-        cache_read_tokens,
-    ) + web_search_requests as f64 * WEB_SEARCH_COST_PER_REQUEST
+    let token_cost = get_rates(model)
+        .map(|rates| {
+            apply_rates(
+                &rates,
+                input_tokens,
+                output_tokens,
+                cache_creation_5m_tokens,
+                cache_creation_1h_tokens,
+                cache_read_tokens,
+            )
+        })
+        .unwrap_or(0.0);
+    token_cost + web_search_requests as f64 * WEB_SEARCH_COST_PER_REQUEST
 }
 
 /// Like `calculate_cost`, but accepts a model key that is already lowercase.
@@ -76,15 +80,37 @@ pub fn calculate_cost_for_key(
     cache_read_tokens: u64,
     web_search_requests: u64,
 ) -> f64 {
-    let rates = get_rates_for_key(model_key);
-    apply_rates(
-        &rates,
-        input_tokens,
-        output_tokens,
-        cache_creation_5m_tokens,
-        cache_creation_1h_tokens,
-        cache_read_tokens,
-    ) + web_search_requests as f64 * WEB_SEARCH_COST_PER_REQUEST
+    let token_cost = get_rates_for_key(model_key)
+        .map(|rates| {
+            apply_rates(
+                &rates,
+                input_tokens,
+                output_tokens,
+                cache_creation_5m_tokens,
+                cache_creation_1h_tokens,
+                cache_read_tokens,
+            )
+        })
+        .unwrap_or(0.0);
+    token_cost + web_search_requests as f64 * WEB_SEARCH_COST_PER_REQUEST
+}
+
+pub fn pricing_available_for_key(model_key: &str) -> bool {
+    get_rates_for_key(model_key).is_some()
+}
+
+/// Returns a cost multiplier for cloud-provider endpoint surcharges.
+/// Bedrock geographic/regional endpoints (prefixed "us.", "eu.", "ap.")
+/// charge 10% over global endpoints per Anthropic's published pricing.
+pub fn provider_multiplier(raw_model: &str) -> f64 {
+    let b = raw_model.as_bytes();
+    if (b.starts_with(b"us.") || b.starts_with(b"eu.") || b.starts_with(b"ap."))
+        && raw_model.contains("anthropic")
+    {
+        1.1
+    } else {
+        1.0
+    }
 }
 
 fn apply_rates(
@@ -117,6 +143,18 @@ const fn claude_rates(input: f64, output: f64) -> ModelRates {
     }
 }
 
+/// Official Claude API cache pricing: 5m cache writes = 1.25x input,
+/// 1h cache writes = 2x input, cache read = 0.1x input.
+const fn claude_api_rates(input: f64, output: f64) -> ModelRates {
+    ModelRates {
+        input,
+        output,
+        cache_write_5m: input * 1.25,
+        cache_write_1h: input * 2.0,
+        cache_read: input * 0.1,
+    }
+}
+
 /// OpenAI/o-series don't have a 1h tier — set 1h = 5m (same rate).
 const fn openai_rates(input: f64, output: f64, cache_write: f64, cache_read: f64) -> ModelRates {
     ModelRates {
@@ -128,29 +166,31 @@ const fn openai_rates(input: f64, output: f64, cache_write: f64, cache_read: f64
     }
 }
 
-const fn zero_rates() -> ModelRates {
-    ModelRates {
-        input: 0.0,
-        output: 0.0,
-        cache_write_5m: 0.0,
-        cache_write_1h: 0.0,
-        cache_read: 0.0,
-    }
-}
-
 #[cfg_attr(not(test), allow(dead_code))]
-fn get_rates(model: &str) -> ModelRates {
+fn get_rates(model: &str) -> Option<ModelRates> {
     let normalized = model.trim().to_ascii_lowercase();
     get_rates_for_key(&normalized)
 }
 
 /// Look up pricing for an already-lowercase model key.
 ///
-/// Checks dynamic LiteLLM pricing first, then falls back to hardcoded rates.
-fn get_rates_for_key(model: &str) -> ModelRates {
-    // Dynamic pricing from LiteLLM (refreshed on startup, cached 24h).
+/// Checks dynamic LiteLLM/OpenRouter pricing first, then `pricing_fallback.json`,
+/// then inline hardcoded rates.
+fn get_rates_for_key(model: &str) -> Option<ModelRates> {
+    // Dynamic pricing from LiteLLM + OpenRouter (refreshed on startup, cached 7d).
     if let Some(rates) = lookup_dynamic(model) {
-        return rates;
+        return Some(rates);
+    }
+
+    // Static table in pricing_fallback.json (offline, easy to edit).
+    if let Some(r) = crate::usage::pricing_fallback::lookup(model) {
+        return Some(ModelRates {
+            input: r.input,
+            output: r.output,
+            cache_write_5m: r.cache_write_5m,
+            cache_write_1h: r.cache_write_1h,
+            cache_read: r.cache_read,
+        });
     }
 
     // ── Hardcoded fallback (always available) ───────────────────────────────
@@ -162,98 +202,100 @@ fn get_rates_for_key(model: &str) -> ModelRates {
     // ── OpenAI / Codex models ────────────────────────────────────────────────
 
     if model.contains("gpt-5.4") {
-        return openai_rates(2.50, 15.00, 2.50, 0.25);
+        return Some(openai_rates(2.50, 15.00, 2.50, 0.25));
     }
     if model.contains("gpt-5.3-codex") {
-        return openai_rates(1.75, 14.00, 1.75, 0.175);
+        return Some(openai_rates(1.75, 14.00, 1.75, 0.175));
     }
     if model.contains("gpt-5.2-codex") {
-        return openai_rates(1.75, 14.00, 1.75, 0.175);
+        return Some(openai_rates(1.75, 14.00, 1.75, 0.175));
     }
     if model.contains("gpt-5.2") {
-        return openai_rates(1.75, 14.00, 1.75, 0.175);
+        return Some(openai_rates(1.75, 14.00, 1.75, 0.175));
     }
     if model.contains("gpt-5.1-codex-max") {
-        return openai_rates(1.25, 10.00, 1.25, 0.125);
+        return Some(openai_rates(1.25, 10.00, 1.25, 0.125));
     }
     if model.contains("gpt-5.1-codex-mini") {
-        return openai_rates(0.25, 2.00, 0.25, 0.025);
+        return Some(openai_rates(0.25, 2.00, 0.25, 0.025));
     }
     if model.contains("gpt-5.1-codex") {
-        return openai_rates(1.25, 10.00, 1.25, 0.125);
+        return Some(openai_rates(1.25, 10.00, 1.25, 0.125));
     }
     if model.contains("codex-mini-latest") {
-        return openai_rates(1.50, 6.00, 1.50, 0.375);
+        return Some(openai_rates(1.50, 6.00, 1.50, 0.375));
     }
     if model.contains("gpt-5-codex") {
-        return openai_rates(1.25, 10.00, 1.25, 0.125);
+        return Some(openai_rates(1.25, 10.00, 1.25, 0.125));
     }
     if model.contains("gpt-5-mini") {
-        return openai_rates(0.25, 2.00, 0.25, 0.025);
+        return Some(openai_rates(0.25, 2.00, 0.25, 0.025));
     }
     if model.contains("gpt-5-nano") {
-        return openai_rates(0.05, 0.40, 0.05, 0.005);
+        return Some(openai_rates(0.05, 0.40, 0.05, 0.005));
     }
     if model.contains("gpt-5.1") {
-        return openai_rates(1.25, 10.00, 1.25, 0.125);
+        return Some(openai_rates(1.25, 10.00, 1.25, 0.125));
     }
     if model.contains("gpt-5") {
-        return openai_rates(1.25, 10.00, 1.25, 0.125);
+        return Some(openai_rates(1.25, 10.00, 1.25, 0.125));
     }
 
     // ── o-series (starts_with, most-specific first) ──────────────────────────
 
     if model.starts_with("o4-mini") {
-        return openai_rates(1.10, 4.40, 1.10, 0.275);
+        return Some(openai_rates(1.10, 4.40, 1.10, 0.275));
     }
     if model.starts_with("o3-mini") {
-        return openai_rates(1.10, 4.40, 1.10, 0.55);
+        return Some(openai_rates(1.10, 4.40, 1.10, 0.55));
     }
     if model.starts_with("o3") {
-        return openai_rates(2.00, 8.00, 2.00, 0.50);
+        return Some(openai_rates(2.00, 8.00, 2.00, 0.50));
     }
     if model.starts_with("o1-mini") {
-        return openai_rates(1.10, 4.40, 1.10, 0.55);
+        return Some(openai_rates(1.10, 4.40, 1.10, 0.55));
     }
     if model.starts_with("o1") {
-        return openai_rates(15.00, 60.00, 15.00, 7.50);
+        return Some(openai_rates(15.00, 60.00, 15.00, 7.50));
     }
 
     // ── Fuzzy fallback ───────────────────────────────────────────────────────
     get_fallback_rates(model)
 }
 
-fn get_fallback_rates(model: &str) -> ModelRates {
+fn get_fallback_rates(model: &str) -> Option<ModelRates> {
     match detect_model_family(model) {
         ModelFamily::Anthropic => {
-            if model.contains("opus") {
+            if model.contains("fable") || model.contains("mythos") {
+                Some(claude_api_rates(10.00, 50.00))
+            } else if model.contains("opus") {
                 if model.contains("fast") {
-                    claude_rates(30.00, 150.00)
+                    Some(claude_rates(30.00, 150.00))
                 } else {
-                    claude_rates(5.00, 25.00)
+                    Some(claude_rates(5.00, 25.00))
                 }
             } else if model.contains("sonnet") {
-                claude_rates(3.00, 15.00)
+                Some(claude_rates(3.00, 15.00))
             } else if model.contains("haiku") {
-                claude_rates(1.00, 5.00)
+                Some(claude_rates(1.00, 5.00))
             } else {
-                claude_rates(3.00, 15.00)
+                None
             }
         }
         ModelFamily::OpenAI => {
             if model.contains("codex-mini") {
-                return openai_rates(0.25, 2.00, 0.25, 0.025);
+                return Some(openai_rates(0.25, 2.00, 0.25, 0.025));
             }
             if model.contains("codex") || model.contains("gpt-5") {
-                return openai_rates(1.25, 10.00, 1.25, 0.125);
+                return Some(openai_rates(1.25, 10.00, 1.25, 0.125));
             }
 
             let bytes = model.as_bytes();
             if bytes.first() == Some(&b'o') && bytes.get(1).is_some_and(|b| b.is_ascii_digit()) {
-                return openai_rates(1.10, 4.40, 1.10, 0.275);
+                return Some(openai_rates(1.10, 4.40, 1.10, 0.275));
             }
 
-            openai_rates(1.25, 10.00, 1.25, 0.125)
+            Some(openai_rates(1.25, 10.00, 1.25, 0.125))
         }
         ModelFamily::Google
         | ModelFamily::Moonshot
@@ -261,7 +303,7 @@ fn get_fallback_rates(model: &str) -> ModelRates {
         | ModelFamily::Glm
         | ModelFamily::DeepSeek
         | ModelFamily::Cursor
-        | ModelFamily::Unknown => zero_rates(),
+        | ModelFamily::Unknown => None,
     }
 }
 
@@ -304,6 +346,28 @@ mod tests {
     #[test]
     fn haiku_4_5_pricing() {
         assert!(approx_eq(cost("claude-haiku-4-5-20260101", M, M), 6.00));
+    }
+
+    #[test]
+    fn fable_5_pricing() {
+        assert!(approx_eq(cost("claude-fable-5", M, M), 60.00));
+    }
+
+    #[test]
+    fn mythos_5_pricing() {
+        assert!(approx_eq(cost("claude-mythos-5", M, M), 60.00));
+    }
+
+    #[test]
+    fn fable_5_cache_pricing_uses_official_anthropic_rates() {
+        assert!(approx_eq(cost_cache_5m("claude-fable-5", M, M), 13.50));
+        assert!(approx_eq(cost_cache_1h("claude-fable-5", M, M), 21.00));
+    }
+
+    #[test]
+    fn future_claude_family_without_pricing_returns_zero_cost() {
+        assert!(approx_eq(cost("claude-cipher-5", M, M), 0.00));
+        assert!(!pricing_available_for_key("cipher-5"));
     }
 
     #[test]
@@ -442,6 +506,11 @@ mod tests {
     }
 
     #[test]
+    fn unknown_fable_falls_back() {
+        assert!(approx_eq(cost("claude-fable-6", M, M), 60.00));
+    }
+
+    #[test]
     fn unknown_codex_mini_falls_back() {
         assert!(approx_eq(cost("gpt-6-codex-mini", M, M), 2.25));
     }
@@ -457,9 +526,17 @@ mod tests {
     }
 
     #[test]
+    fn pricing_fallback_covers_gemini_and_composer() {
+        assert!(pricing_available_for_key("gemini-2.5-pro"));
+        assert!(pricing_available_for_key("composer-2.5"));
+        assert!(approx_eq(cost("gemini-2.5-pro", M, M), 14.0));
+        assert!(approx_eq(cost("composer-2.5", M, M), 3.0));
+    }
+
+    #[test]
     fn unsupported_family_defaults_to_zero_until_priced() {
-        assert!(approx_eq(cost("gemini-2.5-pro", M, M), 0.00));
         assert!(approx_eq(cost("totally-unknown-model", M, M), 0.00));
+        assert!(!pricing_available_for_key("totally-unknown-model"));
     }
 
     #[test]
@@ -472,6 +549,50 @@ mod tests {
 
     #[test]
     fn pricing_version_is_set() {
-        assert_eq!(PRICING_VERSION, "2026-03-15");
+        assert_eq!(PRICING_VERSION, "2026-06-17");
+    }
+
+    #[test]
+    fn provider_multiplier_bedrock_geo() {
+        assert!(approx_eq(
+            provider_multiplier("us.anthropic.claude-opus-4-6-v1") * 10.0,
+            11.0
+        ));
+        assert!(approx_eq(
+            provider_multiplier("eu.anthropic.claude-sonnet-4-5-20250929-v1:0") * 10.0,
+            11.0
+        ));
+        assert!(approx_eq(
+            provider_multiplier("ap.anthropic.claude-haiku-4-5-20251001-v1:0") * 10.0,
+            11.0
+        ));
+    }
+
+    #[test]
+    fn provider_multiplier_global_no_surcharge() {
+        assert!(approx_eq(
+            provider_multiplier("global.anthropic.claude-opus-4-6-v1") * 10.0,
+            10.0
+        ));
+    }
+
+    #[test]
+    fn provider_multiplier_direct_api_no_surcharge() {
+        assert!(approx_eq(
+            provider_multiplier("claude-opus-4-6") * 10.0,
+            10.0
+        ));
+        assert!(approx_eq(
+            provider_multiplier("claude-sonnet-4-5-20250929") * 10.0,
+            10.0
+        ));
+    }
+
+    #[test]
+    fn provider_multiplier_non_anthropic_prefix_ignored() {
+        assert!(approx_eq(
+            provider_multiplier("us.some-other-provider.model-v1") * 10.0,
+            10.0
+        ));
     }
 }
