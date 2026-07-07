@@ -191,6 +191,29 @@ describe("createResizeOrchestrator", () => {
     orchestrator.destroy();
   });
 
+  it("can reconcile the native window rect even when height is unchanged", async () => {
+    installWindowStub(420);
+    installRafStub();
+    const popEl = createPopEl(420);
+    const invoke = vi.fn(() => Promise.resolve());
+    const orchestrator = createTestOrchestrator({
+      invoke,
+      popEl: popEl.element,
+    });
+
+    orchestrator.syncSizeAndVerify("same-height");
+    expect(invoke).not.toHaveBeenCalled();
+
+    orchestrator.reconcileWindowGeometry("monitor-change");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenLastCalledWith("set_window_size_and_align", {
+      width: WINDOW_WIDTH,
+      height: 420,
+    });
+
+    orchestrator.destroy();
+  });
+
   it("defers a shrink while the pointer is over the window, then flushes it on mouse-leave", async () => {
     installWindowStub(420);
     const { runNextFrame } = installRafStub();

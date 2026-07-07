@@ -35,6 +35,7 @@ export interface ResizeOrchestratorDeps {
 
 export interface ResizeOrchestrator {
   syncSizeAndVerify: (source?: string) => void;
+  reconcileWindowGeometry: (source?: string) => void;
   animateWindowHeight: (
     targetHeight: number,
     durationMs: number,
@@ -281,6 +282,32 @@ export function createResizeOrchestrator(
     applyWindowHeight(measurement.nextHeight, source);
   }
 
+  function forceApplyWindowHeight(targetHeight: number, source = "unknown"): void {
+    const effectiveMaxWindowH = getEffectiveWindowMaxHeight();
+    const nextHeight = clampWindowHeight(
+      targetHeight,
+      effectiveMaxWindowH,
+      MIN_WINDOW_HEIGHT,
+    );
+    deps.logDebug("resize:force-apply-request", {
+      source,
+      targetHeight,
+      nextHeight,
+      effectiveMaxWindowH,
+      scrollLocked: isScrollLocked,
+      deltaFromLast: nextHeight - lastWindowH,
+      ...captureDebugSnapshot(`force-apply-${source}`),
+    });
+
+    deferredShrinkHeight = null;
+    lastWindowH = nextHeight;
+    pendingWindowHeightRequest = {
+      height: nextHeight,
+      source,
+    };
+    flushWindowHeightRequest();
+  }
+
   function applyWindowHeight(targetHeight: number, source = "unknown"): void {
     const effectiveMaxWindowH = getEffectiveWindowMaxHeight();
     const nextHeight = clampWindowHeight(
@@ -417,6 +444,13 @@ export function createResizeOrchestrator(
     const measurement = measureWindowHeight(`sync-${source}`);
     if (!measurement) return;
     applyMeasuredHeight(measurement, `${source}:sync`);
+  }
+
+  function reconcileWindowGeometry(source = "unknown"): void {
+    deps.logDebug("resize:reconcile-window-geometry", { source });
+    const measurement = measureWindowHeight(`reconcile-${source}`);
+    if (!measurement) return;
+    forceApplyWindowHeight(measurement.nextHeight, `${source}:reconcile`);
   }
 
   function animateWindowHeight(
@@ -665,6 +699,7 @@ export function createResizeOrchestrator(
 
   return {
     syncSizeAndVerify,
+    reconcileWindowGeometry,
     animateWindowHeight,
     followContentDuringTransition,
     resizeToContent,
