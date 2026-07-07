@@ -1017,6 +1017,9 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 6px 10px;
+    flex-wrap: wrap;
+    min-width: 0;
   }
   .row.border {
     border-bottom: 1px solid var(--border-subtle);
@@ -1111,6 +1114,8 @@
   }
 
   .label {
+    flex: 1 1 110px;
+    min-width: 0;
     font: 400 10px/1 'Inter', sans-serif;
     color: var(--t1);
   }
@@ -1128,7 +1133,12 @@
   .value-group {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 10px;
+    flex: 0 1 auto;
+    flex-wrap: wrap;
+    min-width: 0;
+    max-width: 100%;
   }
 
   .status {
@@ -1138,6 +1148,11 @@
     font: 500 11px/1 'Inter', sans-serif;
     padding-left: 2px;
     transition: color 180ms ease;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .status-dot {
     width: 5px;
@@ -1182,6 +1197,9 @@
   }
 
   .currency-select {
+    flex: 0 1 150px;
+    min-width: 0;
+    max-width: 150px;
     background: var(--surface-hover);
     border: 1px solid var(--border);
     border-radius: 5px;
@@ -1197,7 +1215,11 @@
   .cost-row-right {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
+    flex: 0 1 auto;
+    flex-wrap: wrap;
     gap: 8px;
+    min-width: 0;
   }
   .cost-input {
     display: flex;
@@ -1227,21 +1249,29 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    flex: 1 1 170px;
     flex-wrap: wrap;
     justify-content: flex-end;
+    min-width: 0;
   }
   .auto-export-right {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 8px;
+    flex: 1 1 160px;
+    flex-wrap: wrap;
     min-width: 0;
   }
   .auto-export-folder {
+    min-width: 0;
     max-width: 130px;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .channel-select {
+    flex: 0 1 150px;
+    min-width: 0;
     max-width: 150px;
     padding: 2px 6px;
     border: 1px solid var(--border-subtle);
