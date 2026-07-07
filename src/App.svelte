@@ -49,7 +49,7 @@
   } from "./lib/stores/settings.js";
   import { initializeRuntimeFromSettings } from "./lib/bootstrap.js";
   import { syncTrayConfig } from "./lib/tray/sync.js";
-  import { DEFAULT_MAX_WINDOW_HEIGHT } from "./lib/windowSizing.js";
+  import { DEFAULT_MAX_WINDOW_HEIGHT, WINDOW_WIDTH } from "./lib/windowSizing.js";
   import { createResizeOrchestrator, type ResizeOrchestrator } from "./lib/resizeOrchestrator.js";
   import { syncNativeWindowSurface } from "./lib/window/appearance.js";
   import {
@@ -500,6 +500,10 @@
     let onViewportPointerEnter: (() => void) | undefined;
     let onViewportPointerLeave: (() => void) | undefined;
     let onViewportPointerMove: (() => void) | undefined;
+    let monitorRecalibrationTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastViewportWidth = typeof window === "undefined" ? WINDOW_WIDTH : Math.round(window.innerWidth);
+    let lastDevicePixelRatio = typeof window === "undefined" ? 1 : window.devicePixelRatio;
+    let lastTauriWindowWidth: number | null = null;
 
     // Create the resize orchestrator (all resize state lives in its closure)
     let persistedWindowHeight = 0;
@@ -543,15 +547,69 @@
           })
         : {};
 
+    const applyMonitorMetricsToView = () => {
+      const fixedH = resizeOrch?.getFixedWindowH() ?? 0;
+      const rawThreshold = resizeOrch?.getScrollThresholdH() ?? DEFAULT_MAX_WINDOW_HEIGHT;
+      scrollThresholdH = fixedH > 0 ? Math.min(rawThreshold, fixedH) : rawThreshold;
+    };
+
+    async function recalibrateWindowGeometry(source: string) {
+      if (!resizeOrch) return;
+      try {
+        logResizeDebug("resize:monitor-recalibration-start", {
+          source,
+          viewportWidth: Math.round(window.innerWidth),
+          devicePixelRatio: window.devicePixelRatio,
+          ...captureSnapshot(`monitor-recalibration-start-${source}`),
+        });
+        await resizeOrch.refreshWindowMetrics();
+        if (cancelled) return;
+        applyMonitorMetricsToView();
+        await tick();
+        if (cancelled) return;
+        resizeOrch.reconcileWindowGeometry(source);
+      } catch (error) {
+        logResizeDebug("resize:monitor-recalibration-failed", {
+          source,
+          error: formatDebugError(error),
+        });
+      }
+    }
+
+    function scheduleWindowGeometryRecalibration(source: string, delayMs = 120) {
+      if (!isWindows()) return;
+      if (monitorRecalibrationTimer) clearTimeout(monitorRecalibrationTimer);
+      monitorRecalibrationTimer = setTimeout(() => {
+        monitorRecalibrationTimer = null;
+        void recalibrateWindowGeometry(source);
+      }, delayMs);
+    }
+
     initResizeDebug();
 
     const cleanupListeners = setupAppEventListeners({
       onResize: () => {
-        logResizeDebug("browser:resize", captureSnapshot("browser-resize"));
+        const viewportWidth = Math.round(window.innerWidth);
+        const devicePixelRatio = window.devicePixelRatio;
+        const viewportChanged =
+          viewportWidth !== lastViewportWidth ||
+          devicePixelRatio !== lastDevicePixelRatio;
+        lastViewportWidth = viewportWidth;
+        lastDevicePixelRatio = devicePixelRatio;
+        logResizeDebug("browser:resize", {
+          viewportWidth,
+          devicePixelRatio,
+          viewportChanged,
+          ...captureSnapshot("browser-resize"),
+        });
+        if (viewportChanged) {
+          scheduleWindowGeometryRecalibration("browser-resize");
+        }
       },
       onFocus: () => {
         logResizeDebug("window:focus", captureSnapshot("window-focus"));
         void syncNativeWindowSurface(undefined, get(settings).glassEffect).catch((e) => logger.debug("appearance", `syncNativeWindowSurface failed: ${e}`));
+        scheduleWindowGeometryRecalibration("window-focus", 0);
         syncSizeAndVerify("window-focus");
         // Refresh silently — never drop the live view back to the spinner.
         fetchData(provider, period, offset, { silent: true });
@@ -605,9 +663,7 @@
       const _t0 = performance.now();
       console.log('[PROFILE] init:start');
       await resizeOrch!.refreshWindowMetrics();
-      const fixedH0 = resizeOrch!.getFixedWindowH();
-      const rawThreshold = resizeOrch!.getScrollThresholdH();
-      scrollThresholdH = fixedH0 > 0 ? Math.min(rawThreshold, fixedH0) : rawThreshold;
+      applyMonitorMetricsToView();
       console.log(`[PROFILE] init:window-metrics = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       // Load persisted settings and apply theme + defaults (non-blocking)
@@ -637,7 +693,7 @@
         if (!cancelled && restoredHeight) {
           try {
             await invoke("set_window_size_and_align", {
-              width: 340,
+              width: WINDOW_WIDTH,
               height: restoredHeight,
             });
             persistedWindowHeight = restoredHeight;
@@ -723,11 +779,20 @@
       });
 
       unlistenWindowResize = await tauriWindow.onResized(({ payload }) => {
+        const resizedWidth = Math.round(payload.width);
+        const widthChanged =
+          lastTauriWindowWidth !== null &&
+          resizedWidth !== lastTauriWindowWidth;
+        lastTauriWindowWidth = resizedWidth;
         logResizeDebug("tauri:window-resized", {
           width: payload.width,
           height: payload.height,
+          widthChanged,
           ...captureSnapshot("tauri-window-resized"),
         });
+        if (widthChanged) {
+          scheduleWindowGeometryRecalibration("tauri-window-resized");
+        }
       });
 
       if (cancelled) {
@@ -754,6 +819,7 @@
       if (onViewportPointerEnter) docEl.removeEventListener("mouseenter", onViewportPointerEnter);
       if (onViewportPointerLeave) docEl.removeEventListener("mouseleave", onViewportPointerLeave);
       if (onViewportPointerMove) window.removeEventListener("mousemove", onViewportPointerMove);
+      if (monitorRecalibrationTimer) clearTimeout(monitorRecalibrationTimer);
       observer?.disconnect();
       window.removeEventListener("chart-hover", onChartHover);
       resizeOrch?.destroy();
