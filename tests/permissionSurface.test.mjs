@@ -31,8 +31,7 @@ describe("native permission surface", () => {
     );
     expect(dialogPermissions).toEqual(["dialog:allow-save", "dialog:allow-open"]);
     expect(flatPermissions).not.toContain("dialog:default");
-    expect(flatPermissions).not.toContain("notification:default");
-    expect(flatPermissions).toContain("notification:allow-is-permission-granted");
+    expect(flatPermissions.some((permission) => permission.startsWith("notification:"))).toBe(false);
   });
 
   it("keeps updater checks on the in-app banner path instead of OS notifications", () => {

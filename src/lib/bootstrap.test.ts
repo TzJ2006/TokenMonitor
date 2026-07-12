@@ -52,7 +52,6 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     glassEffect: true,
     showModelChangeStats: false,
     floatBall: false,
-    taskbarPanel: false,
     sshHosts: [],
     remoteDeviceIncludes: [],
     debugLogging: false,
@@ -107,7 +106,7 @@ describe("initializeRuntimeFromSettings", () => {
     expect(syncNativeWindowThemeFn).toHaveBeenCalledWith("system");
     // Native glass effect is applied via Tauri Window API (setEffects), not invokeFn.
     expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: false });
-    expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith(invokeFn, true);
+    expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith();
     expect(invokeFn).toHaveBeenCalledWith("set_refresh_interval", { interval: 300 });
     expect(invokeFn).toHaveBeenCalledWith("set_usage_access_enabled", { enabled: true });
     expect(invokeFn).toHaveBeenCalledWith("set_cursor_auth_config", {
@@ -152,7 +151,7 @@ describe("initializeRuntimeFromSettings", () => {
     expect(applyGlassFn).toHaveBeenCalledWith(true);
     expect(syncNativeWindowThemeFn).toHaveBeenCalledWith("dark");
     expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: false });
-    expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith(invokeFn, true);
+    expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith();
     expect(get(activeProvider)).toBe("codex");
     expect(get(activePeriod)).toBe("5h");
   });
@@ -232,7 +231,7 @@ describe("initializeRuntimeFromSettings", () => {
     expect(syncNativeWindowThemeFn).toHaveBeenCalledWith("dark");
     // Native glass effect is applied via Tauri Window API (setEffects), not invokeFn.
     expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: false });
-    expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith(invokeFn, true);
+    expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith();
   });
 
   it("does not enable glass when setting is false", async () => {
@@ -251,7 +250,7 @@ describe("initializeRuntimeFromSettings", () => {
     expect(syncNativeWindowThemeFn).toHaveBeenCalledWith("dark");
     // Native glass effect is applied via Tauri Window API (setEffects), not invokeFn.
     expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: false });
-    expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith(invokeFn, false);
+    expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith();
   });
 
   it("applies dock icon visibility on startup", async () => {

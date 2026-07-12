@@ -33,7 +33,6 @@ function settings(overrides: Partial<Settings> = {}): Settings {
     glassEffect: false,
     showModelChangeStats: false,
     floatBall: false,
-    taskbarPanel: false,
     sshHosts: [],
     remoteDeviceIncludes: [],
     debugLogging: false,
