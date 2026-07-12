@@ -1,11 +1,14 @@
 # Auto-Update Manual Test Matrix
 
+Use this checklist for release-candidate updater artifacts. Run it against the
+official channel and repeat the channel-selection checks for any supported fork.
+
 ## Pre-release smoke test
 
 Before tagging a real version:
 
-1. Build the app from the current branch: `npm run tauri build`.
-2. Temporarily set the version one patch behind in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`.
+1. Build the app from the current branch: `npx tauri build`.
+2. Temporarily set the version one patch behind in `package.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json`.
 3. Re-build and install the older version. Quit.
 4. Restore the real version. Build + publish the release with the updated workflow.
 5. Launch the older version — within ~10 seconds you should see the banner.
@@ -34,6 +37,11 @@ Before tagging a real version:
 
 ## Failure-mode checks
 
+### Update channel
+- [ ] Official channel discovers and verifies the official release
+- [ ] A compatible fork with releases can be selected and its public key is cached
+- [ ] A fork without `updater-pubkey.txt` reports an actionable error and does not install
+
 ### Offline
 - [ ] Disconnect network; launch app; no crash, no banner, Settings shows "Last checked: never" or preserved timestamp
 
@@ -45,4 +53,4 @@ Before tagging a real version:
 
 ## Dev-mode note
 
-The updater plugin does not fetch endpoints in debug builds by default. Verify by running `npm run tauri build` (release) and launching the bundled binary directly — not `npm run tauri dev`.
+The updater plugin does not fetch endpoints in debug builds by default. Verify by running `npx tauri build` and launching the bundled binary directly, not `npx tauri dev`.

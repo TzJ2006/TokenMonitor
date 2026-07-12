@@ -1,7 +1,7 @@
 # TokenMonitor Development Guide
 
 This guide describes the current repository. User-facing setup and features live in
-[README.md](README.md); release history lives in [CHANGELOG.md](CHANGELOG.md).
+[README.md](../README.md); release history lives in [CHANGELOG.md](CHANGELOG.md).
 
 ## Prerequisites
 
@@ -31,7 +31,7 @@ For frontend-only layout work, run `npm run dev` and open
 │   ├── float-ball.ts              FloatBall entry point
 │   └── lib/
 │       ├── components/            UI components; settings/ and float-ball/ own feature files
-│       ├── permissions/           Permission disclosures and Keychain flow
+│       ├── permissions/           Permission disclosures and statusline setup
 │       ├── stores/                Settings, usage, rate-limit, and updater state
 │       ├── tray/                  Tray synchronization and title formatting
 │       ├── types/                 Shared frontend payload types
@@ -66,7 +66,8 @@ Tests are colocated with frontend and build modules. Rust unit tests use inline
 
 1. The frontend requests usage for a provider, period, and offset through Tauri IPC.
 2. Rust reads local Claude, Codex, or Cursor data, plus configured SSH sources.
-3. Provider parsers normalize events and the pricing layer computes costs.
+3. Provider parsers normalize events and the pricing layer computes costs. Claude
+   rate limits prefer fresh statusline events; other configured sources are fallbacks.
 4. Memory and disk caches speed up repeat queries; completed hours are persisted in
    the usage archive.
 5. Svelte stores project the payload into charts, summaries, tray state, and the
@@ -114,16 +115,17 @@ Build and collect installer artifacts under `outputs/<platform>/`:
 npm run build:installers -- --platform current
 ```
 
-Versions must match in `package.json`, `src-tauri/Cargo.toml`, and
-`src-tauri/tauri.conf.json`. The release helper updates all three, commits, tags, and
-pushes:
+Versions must match in `package.json`, `src-tauri/Cargo.toml`,
+`src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json`. The release helper updates
+them, commits, tags, and pushes:
 
 ```bash
 npm run release -- X.Y.Z
 ```
 
 Tag pushes trigger the cross-platform release workflow. See
-`docs/testing/auto-update.md` for the maintained updater smoke-test matrix.
+[`testing/auto-update.md`](testing/auto-update.md) for the maintained updater
+smoke-test matrix.
 
 ## Conventions
 

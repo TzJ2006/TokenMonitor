@@ -44,7 +44,7 @@ Go to the [latest release page](https://github.com/Michael-OvO/TokenMonitor/rele
 | **Windows** | `.exe` (NSIS) | Run the installer, follow the prompts |
 | **Linux** | `.deb` | `sudo dpkg -i token-monitor_*.deb` |
 
-> **macOS first launch:** macOS may show a security prompt. Go to **System Settings > Privacy & Security** and click **Open Anyway**.
+> **macOS first launch:** Official releases are signed and notarized. If you built the app yourself and Gatekeeper reports that it is damaged, move it to Applications and run `xattr -cr /Applications/TokenMonitor.app` once.
 
 > **Windows first launch:** Windows SmartScreen may show a warning for unsigned builds. Click **More info > Run anyway**.
 
@@ -78,7 +78,9 @@ There is no Dock/Taskbar window by default — TokenMonitor is a tray utility.
 
 **Click the tray icon** to open the popover window.
 
-If you have existing Claude Code or Codex session logs on your machine, TokenMonitor will immediately show your usage data. If not, the app stays idle until you start a coding session.
+On first launch, onboarding explains each local data surface before access is enabled. On macOS, approve App Data access when prompted. You can also install TokenMonitor's Claude Code statusline helper, which records fresh server-reported rate-limit percentages in `~/.tokenmonitor/statusline/`. The installer writes a small platform-specific script and updates Claude Code's `statusLine` setting.
+
+After onboarding, existing Claude Code, Codex, and Cursor usage appears automatically. If no source data exists, the app stays idle until you start a coding session.
 
 ### Where does the data come from?
 
@@ -180,10 +182,10 @@ This updates automatically based on your configured refresh interval (default: e
 When rate limit data is available, TokenMonitor shows utilization bars for each provider:
 
 - **Claude**:
-  - **macOS**: Reads the OAuth authentication state already on your machine via the Anthropic API
-  - **Windows / Linux**: Uses CLI probe to query rate limit status
-- **Codex**: Reads rate limit metadata from local Codex session files (all platforms)
-- **Cursor**: Fetches plan usage and spend limit data from the Cursor API. The access token is auto-detected from Cursor IDE's local storage (zero-config on macOS/Windows) or can be manually provided in Settings.
+  - **All platforms**: Prefers fresh events from the optional Claude Code statusline helper
+  - **Fallbacks**: Uses locally available OAuth or CLI data when the statusline is stale or unavailable
+- **Codex**: Reads local session metadata and can use the Codex CLI fallback
+- **Cursor**: Fetches plan usage and spend limits with a configured Admin API key or locally detected authentication state
 
 Rate limit panels show:
 - Current utilization percentage
@@ -283,7 +285,8 @@ TokenMonitor includes a built-in auto-updater that checks for new versions and o
 You can manage auto-update behavior in **Settings > Updates**:
 - Enable/disable automatic checks
 - View last check time and any errors
-- Manage skipped versions
+- Check immediately or install an available release
+- Select the official update channel or a compatible fork with signed updater artifacts
 
 ## 15. Settings
 
@@ -304,6 +307,9 @@ Click the **gear icon** in the popover to open the settings panel:
 
 ### Data
 - **Currency** — Display costs in USD, EUR, GBP, JPY, or CNY
+- **Import / Export** — Move a JSON usage archive between installations
+- **Auto Sync** — Mirror the current archive to a selected folder on each refresh
+- **Cache** — Clear cached payloads or pre-warm common views
 
 ### Visibility
 Grouped into a single card, each row is collapsible:
@@ -317,7 +323,7 @@ Grouped into a single card, each row is collapsible:
 ### Updates
 - Enable/disable automatic update checks
 - View current version and last check time
-- Manage skipped versions (see [Auto-Updater](#14-auto-updater))
+- Select an update channel and install available releases (see [Auto-Updater](#14-auto-updater))
 
 ### Privacy & Permissions
 - View all filesystem paths and credential surfaces the app accesses
@@ -360,10 +366,9 @@ TokenMonitor uses built-in fallback prices and periodically cached dynamic prici
 ### Rate limits not showing
 
 Rate limit data requires:
-- **Claude on macOS**: An active Claude authentication on your machine (the same one Claude Code uses)
-- **Claude on Windows/Linux**: Claude CLI must be available for probe-based rate limit checking
-- **Codex (all platforms)**: Recent Codex session files with rate limit metadata
-- **Cursor (all platforms)**: An access token — auto-detected from Cursor IDE on macOS/Windows, or manually entered in Settings
+- **Claude**: The TokenMonitor statusline helper, or a usable local OAuth/CLI fallback
+- **Codex**: Recent session metadata or an available Codex CLI fallback
+- **Cursor**: A configured Admin API key or usable locally detected authentication state
 
 If none are available, the rate limit panels are simply hidden. Rate limits must be enabled (opt-in from the first-launch welcome card or Settings).
 
@@ -390,3 +395,5 @@ If none are available, the rate limit panels are simply hidden. Rate limits must
 - **Cursor spend limits**: If you use Cursor with a spend limit, TokenMonitor shows both plan usage and spend limit utilization
 - **Auto-update**: Keep auto-update enabled to get the latest pricing tables and bug fixes automatically
 - **Pie chart**: Use pie chart mode for a quick visual breakdown of model share within a period
+
+For repository setup and validation commands, see the [development guide](DEVELOPMENT.md). Release history is in the [changelog](CHANGELOG.md).
