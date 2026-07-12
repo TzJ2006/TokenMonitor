@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## Unreleased
+
+- Reorganized frontend window utilities, cross-layer tests, and native test resources.
+- Removed the obsolete standalone profiler, retired no-op commands/settings, and the unused notification integration.
+- Refreshed repository documentation and ignore rules to match the current project.
+
 ## v0.13.1 — Settings 重构 + SSH 搜索扩展 + FloatBall 修复
 
 ### UI
@@ -339,7 +345,6 @@ src/lib/
 | 变更 | 说明 |
 |---|---|
 | 新增 `docs/tutorial.md` (338 行) | 用户教程 |
-| 新增 `docs/ecl/code-optimization.yaml` (376 行) | 工程变更记录 |
 | 删除 6 个设计文档 (~4,480 行) | `change-stats-plan`、`subagent-stats-plan` 等设计文档移除（已完成实施） |
 
 ---

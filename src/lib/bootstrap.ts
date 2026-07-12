@@ -64,7 +64,7 @@ type StartupDeps = {
   applyThemeFn?: typeof applyTheme;
   applyGlassFn?: typeof applyGlass;
   syncNativeWindowThemeFn?: (theme: Settings["theme"]) => Promise<void>;
-  syncNativeWindowSurfaceFn?: (invokeFn?: typeof invoke, glassEnabled?: boolean) => Promise<void>;
+  syncNativeWindowSurfaceFn?: () => Promise<void>;
 };
 
 export async function initializeRuntimeFromSettings(
@@ -109,7 +109,7 @@ export async function initializeRuntimeFromSettings(
   await Promise.allSettled([
     setNativeGlassEffect(saved.glassEffect),
     syncNativeWindowThemeFn(saved.theme),
-    syncNativeWindowSurfaceFn(invokeFn, saved.glassEffect),
+    syncNativeWindowSurfaceFn(),
   ]);
 
   if (isMacOS()) {
@@ -152,8 +152,6 @@ export async function initializeRuntimeFromSettings(
   if (saved.floatBall) {
     calls.push(invokeFn("create_float_ball"));
   }
-  // The Windows taskbar panel is retired (it froze the tray); the persisted
-  // `taskbarPanel` flag is intentionally ignored — never re-invoke it.
   await Promise.allSettled(calls);
 
   // Sync debug log level to Rust backend

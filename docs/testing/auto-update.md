@@ -5,7 +5,7 @@
 Before tagging a real version:
 
 1. Build the app from the current branch: `npm run tauri build`.
-2. Temporarily edit `src-tauri/tauri.conf.json` `version` back one patch (e.g. `0.7.1` if current is `0.7.2`). Also bump `package.json` and `src-tauri/Cargo.toml` to match.
+2. Temporarily set the version one patch behind in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`.
 3. Re-build and install the older version. Quit.
 4. Restore the real version. Build + publish the release with the updated workflow.
 5. Launch the older version — within ~10 seconds you should see the banner.
@@ -18,7 +18,6 @@ Before tagging a real version:
 - [ ] `latest.json` is present in release assets
 - [ ] Banner appears in popover on old version
 - [ ] Tray icon shows red dot in top-right corner
-- [ ] OS notification fires once per new version (deduped across 6h checks)
 - [ ] "Update Now" → download progress → app relaunches on new version
 - [ ] "Skip" hides banner; next release re-triggers
 - [ ] "Later" dismisses for this session only

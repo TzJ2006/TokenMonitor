@@ -503,7 +503,7 @@ impl ArchiveManager {
         }
     }
 
-    // ── Export / import (see docs/ecl/usage-import-export.yaml) ──
+    // ── Export / import ──
 
     /// List every source that has an archive directory on disk.
     /// Returns keys like "local:claude", "local:codex", "device:{alias}".

@@ -9,23 +9,23 @@
     settings,
     updateSetting,
     type Settings as SettingsType,
-  } from "../stores/settings.js";
-  import { clearUsageCache } from "../stores/usage.js";
+  } from "../../stores/settings.js";
+  import { clearUsageCache } from "../../stores/usage.js";
   import {
     exportUsageData,
     importUsageData,
     formatExportSummary,
     formatImportSummary,
-  } from "../stores/usageIo.js";
-  import { updaterStore, checkNow, setAutoCheck, setChannel, discoverChannels, fetchChannelPubkey, installUpdate, dismissBanner } from "../stores/updater.js";
-  import type { ChannelInfo } from "../stores/updater.js";
-  import { isMacOS } from "../utils/platform.js";
-  import type { PermissionSurfaceId } from "../permissions/surfaces.js";
-  import { currencySymbol } from "../utils/format.js";
-  import { logger } from "../utils/logger.js";
+  } from "../../stores/usageIo.js";
+  import { updaterStore, checkNow, setAutoCheck, setChannel, discoverChannels, fetchChannelPubkey, installUpdate, dismissBanner } from "../../stores/updater.js";
+  import type { ChannelInfo } from "../../stores/updater.js";
+  import { isMacOS } from "../../utils/platform.js";
+  import type { PermissionSurfaceId } from "../../permissions/surfaces.js";
+  import { currencySymbol } from "../../utils/format.js";
+  import { logger } from "../../utils/logger.js";
   import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
-  import SegmentedControl from "./SegmentedControl.svelte";
-  import ToggleSwitch from "./ToggleSwitch.svelte";
+  import SegmentedControl from "../SegmentedControl.svelte";
+  import ToggleSwitch from "../ToggleSwitch.svelte";
 
   import AppearanceSettings from "./AppearanceSettings.svelte";
   import HeaderTabsSettings from "./HeaderTabsSettings.svelte";
@@ -33,8 +33,7 @@
   import HiddenModelsSettings from "./HiddenModelsSettings.svelte";
   import SshHostsSettings from "./SshHostsSettings.svelte";
   import CacheWarmupSettings from "./CacheWarmupSettings.svelte";
-  import PermissionDisclosure from "./PermissionDisclosure.svelte";
-  import PermissionSettings from "./PermissionSettings.svelte";
+  import PermissionDisclosure from "../PermissionDisclosure.svelte";
 
   interface Props {
     onBack: () => void;
@@ -934,10 +933,7 @@
         </button>
         <div class="privacy-collapse" class:open={privacyExpanded}>
           <div class="collapse-inner">
-            <PermissionSettings />
-            <div class="permissions-meta">
-              <PermissionDisclosure mode="settings" onManage={handleManagePermission} />
-            </div>
+            <PermissionDisclosure mode="settings" onManage={handleManagePermission} />
           </div>
         </div>
       </div>
@@ -1079,9 +1075,6 @@
 
   .cursor-section {
     padding: 8px 10px;
-  }
-  .permissions-meta {
-    margin-top: 8px;
   }
   .secret-input {
     width: 100%;

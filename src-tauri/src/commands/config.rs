@@ -5,28 +5,6 @@ use crate::secrets;
 use crate::usage::cursor_parser::CursorAuthStatus;
 use tauri::{AppHandle, State};
 
-/// Apply native window surface adjustments.
-/// On Windows: sets DWM rounded corners. On other platforms: noop.
-#[tauri::command]
-pub async fn set_window_surface(
-    _app: tauri::AppHandle,
-    _state: State<'_, AppState>,
-    _surface: serde_json::Value,
-    _corner_radius: Option<f64>,
-) -> Result<(), String> {
-    Ok(())
-}
-
-/// Noop -- glass effects removed for cross-platform compatibility.
-#[tauri::command]
-pub async fn set_glass_effect(
-    _app: tauri::AppHandle,
-    _state: State<'_, AppState>,
-    _enabled: bool,
-) -> Result<(), String> {
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn set_refresh_interval(interval: u64, state: State<'_, AppState>) -> Result<(), String> {
     let mut current = state.refresh_interval.write().await;

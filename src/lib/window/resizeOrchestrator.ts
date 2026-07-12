@@ -1,4 +1,4 @@
-import type { AccordionToggleDetail } from "./types/index.js";
+import type { AccordionToggleDetail } from "../types/index.js";
 import {
   DEFAULT_MAX_WINDOW_HEIGHT,
   MIN_WINDOW_HEIGHT,
@@ -14,7 +14,7 @@ import {
   resolveMonitorMaxWindowHeight,
   resolveFixedWindowHeight,
   resolveScrollThresholdHeight,
-} from "./windowSizing.js";
+} from "./sizing.js";
 
 export interface ResizeOrchestratorDeps {
   getPopEl: () => HTMLDivElement | null;

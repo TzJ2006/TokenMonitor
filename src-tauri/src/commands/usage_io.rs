@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Usage import / export — back up the usage archive and merge it back in with
-// idempotent dedup. See docs/ecl/usage-import-export.yaml.
+// idempotent dedup.
 //
 // Operates on the ArchivedHourly aggregate layer (the durable, provider-agnostic
 // record). The ARCHIVE dedups by bucket identity (source, d, h, mk, p) with
