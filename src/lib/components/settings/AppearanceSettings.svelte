@@ -1,22 +1,21 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import {
     applyGlass,
     applyTheme,
     settings,
     updateSetting,
     type Settings as SettingsType,
-  } from "../stores/settings.js";
-  import { syncTrayConfig } from "../tray/sync.js";
+  } from "../../stores/settings.js";
+  import { syncTrayConfig } from "../../tray/sync.js";
   import {
     setNativeGlassEffect,
     syncNativeWindowSurface,
     syncNativeWindowTheme,
-  } from "../window/appearance.js";
-  import { isMacOS, isWindows } from "../utils/platform.js";
-  import { logger } from "../utils/logger.js";
-  import SegmentedControl from "./SegmentedControl.svelte";
-  import ToggleSwitch from "./ToggleSwitch.svelte";
+  } from "../../window/appearance.js";
+  import { isMacOS, isWindows } from "../../utils/platform.js";
+  import { logger } from "../../utils/logger.js";
+  import SegmentedControl from "../SegmentedControl.svelte";
+  import ToggleSwitch from "../ToggleSwitch.svelte";
 
   let current = $derived($settings as SettingsType);
 
@@ -27,7 +26,7 @@
     applyTheme(theme);
     void Promise.allSettled([
       syncNativeWindowTheme(theme),
-      syncNativeWindowSurface(invoke, current.glassEffect),
+      syncNativeWindowSurface(),
       syncTrayConfig(current.trayConfig, null),
     ]);
   }
@@ -38,7 +37,7 @@
     applyGlass(checked);
     try {
       await setNativeGlassEffect(checked);
-      await syncNativeWindowSurface(invoke, checked);
+      await syncNativeWindowSurface();
     } catch (e) {
       console.error("Failed to toggle glass effect:", e);
     }

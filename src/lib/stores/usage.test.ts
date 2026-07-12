@@ -18,7 +18,7 @@ vi.mock("../utils/logger.js", () => ({
   logger: mockLogger,
 }));
 
-vi.mock("../uiStability.js", () => ({
+vi.mock("../window/uiStability.js", () => ({
   isResizeDebugEnabled: () => false,
   logResizeDebug: vi.fn(),
   formatDebugError: (e: unknown) => ({ message: String(e) }),

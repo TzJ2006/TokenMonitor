@@ -43,10 +43,6 @@ export interface Settings {
   glassEffect: boolean;
   showModelChangeStats: boolean;
   floatBall: boolean;
-  /** @deprecated Retired — the Windows taskbar panel froze the tray (it
-   * embedded a child window into explorer's Shell_TrayWnd). Kept only so
-   * persisted settings still parse; it has no effect and no UI toggle. */
-  taskbarPanel: boolean;
   sshHosts: SshHostConfig[];
   remoteDeviceIncludes: RemoteDeviceIncludeConfig[];
   debugLogging: boolean;
@@ -155,7 +151,6 @@ const DEFAULTS: Settings = {
   glassEffect: false,
   showModelChangeStats: false,
   floatBall: false,
-  taskbarPanel: false,
   sshHosts: [],
   remoteDeviceIncludes: [],
   debugLogging: false,
@@ -419,7 +414,6 @@ export function normalizeSettings(saved?: Partial<Settings> | null): Settings {
     glassEffect: normalizeBoolean(saved?.glassEffect, DEFAULTS.glassEffect),
     showModelChangeStats: normalizeBoolean(saved?.showModelChangeStats, DEFAULTS.showModelChangeStats),
     floatBall: normalizeBoolean(saved?.floatBall, DEFAULTS.floatBall),
-    taskbarPanel: normalizeBoolean(saved?.taskbarPanel, DEFAULTS.taskbarPanel),
     sshHosts: normalizeSshHosts(saved?.sshHosts),
     remoteDeviceIncludes: normalizeRemoteDeviceIncludes(saved?.remoteDeviceIncludes),
     debugLogging: normalizeBoolean(saved?.debugLogging, DEFAULTS.debugLogging),
