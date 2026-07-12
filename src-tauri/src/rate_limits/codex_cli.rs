@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
-use super::RateLimitFetchError;
+use super::{codex::codex_window_label, RateLimitFetchError};
 
 static CACHED_CODEX_CLI_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
@@ -160,13 +160,7 @@ fn app_server_window_to_rate_limit(id: &str, w: &AppServerWindow) -> RateLimitWi
     let mins = w
         .window_duration_mins
         .unwrap_or(if id == "primary" { 300 } else { 10080 });
-    let label = match (id, mins) {
-        ("primary", 300) => "Session (5hr)".to_string(),
-        ("primary", _) => format!("Primary ({mins}m)"),
-        ("secondary", 10080) => "Weekly (7 day)".to_string(),
-        ("secondary", _) => format!("Secondary ({mins}m)"),
-        _ => id.to_string(),
-    };
+    let label = codex_window_label(id, mins);
 
     let resets_at = w
         .resets_at
