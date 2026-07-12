@@ -863,8 +863,8 @@
           onChange={handleProviderChange}
           {brandTheming}
         />
+        <TimeTabs active={period} onChange={handlePeriodChange} />
       </div>
-      <TimeTabs active={period} onChange={handlePeriodChange} />
       {#if period !== "5h" && data}
         <DateNav
           periodLabel={data.period_label}
@@ -1054,7 +1054,9 @@
         {/if}
       </div>
       {/if}
-      <Footer {data} {provider} {period} {rateLimits} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} onDevices={() => { showDevices = true; }} />
+      <div class="app-footer">
+        <Footer {data} {provider} {period} {rateLimits} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} onDevices={() => { showDevices = true; }} />
+      </div>
       </div>
     {:else}
       <div class="loading">
@@ -1091,25 +1093,14 @@
   .pop-content::-webkit-scrollbar {
     display: none;
   }
-  /* Sticky main-app header. Pins the provider Toggle (All / Claude /
-     Codex / Cursor) at the top of the popover scroll viewport so the
-     active-provider context stays visible when the user scrolls deep
-     into charts, breakdowns, or rate-limit panels. TimeTabs and DateNav
-     deliberately scroll with the data — they're sub-controls, not
-     primary identity. `--surface` matches the popover's own base in
-     dark/light modes (opaque) and gives the header a frosted shell in
-     glass mode (translucent + backdrop-filter), so scrolled data never
-     bleeds through. The bottom box-shadow is the same vertical-offset/
-     blur the Settings page uses for visual parity between the two
-     scroll surfaces. */
   .app-header {
     position: sticky;
     top: 0;
     z-index: 3;
     background: var(--surface);
+    background-image: linear-gradient(var(--provider-bg), var(--provider-bg));
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
     /* No `transform: translateZ(0)` here. On `position: sticky`
        elements, that creates a new containing block which can throw
        off `popEl.scrollHeight` measurements while the layout is in
@@ -1121,6 +1112,15 @@
        if upswipe judder returns, prefer `will-change: transform` over
        `translateZ(0)` since `will-change` alone doesn't change
        layout. */
+  }
+  .app-footer {
+    position: sticky;
+    bottom: 0;
+    z-index: 3;
+    background: var(--surface);
+    background-image: linear-gradient(var(--provider-bg), var(--provider-bg));
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
   }
   .hr { height: 1px; background: var(--border-subtle); margin: 0 12px; }
   .loading {
