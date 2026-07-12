@@ -856,12 +856,14 @@
     {:else if data}
       <div class={viewTransitionClass}>
       {#if showRefresh}<div class="refresh-bar" aria-hidden="true"></div>{/if}
-      <Toggle
-        active={provider}
-        options={headerToggleOptions}
-        onChange={handleProviderChange}
-        {brandTheming}
-      />
+      <div class="app-header">
+        <Toggle
+          active={provider}
+          options={headerToggleOptions}
+          onChange={handleProviderChange}
+          {brandTheming}
+        />
+      </div>
       <TimeTabs active={period} onChange={handlePeriodChange} />
       {#if period !== "5h" && data}
         <DateNav
@@ -1075,9 +1077,50 @@
     min-width: 0;
     scrollbar-width: none;
     -ms-overflow-style: none;
+    /* `none` disables the macOS rubber-band overscroll on this region.
+       Without it, an over-swipe past the top translates the entire
+       scroll content (including the sticky `.app-header` below) as a
+       single visual unit — the header rides along with the bounce
+       instead of staying pinned, which reads as a bug since the header
+       is the user's stable anchor. With elastic motion off, the sticky
+       header truly stays put on every gesture. Also implies
+       `overscroll-behavior: contain`, so bounces don't chain to
+       ancestors. */
+    overscroll-behavior: none;
   }
   .pop-content::-webkit-scrollbar {
     display: none;
+  }
+  /* Sticky main-app header. Pins the provider Toggle (All / Claude /
+     Codex / Cursor) at the top of the popover scroll viewport so the
+     active-provider context stays visible when the user scrolls deep
+     into charts, breakdowns, or rate-limit panels. TimeTabs and DateNav
+     deliberately scroll with the data — they're sub-controls, not
+     primary identity. `--surface` matches the popover's own base in
+     dark/light modes (opaque) and gives the header a frosted shell in
+     glass mode (translucent + backdrop-filter), so scrolled data never
+     bleeds through. The bottom box-shadow is the same vertical-offset/
+     blur the Settings page uses for visual parity between the two
+     scroll surfaces. */
+  .app-header {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    background: var(--surface);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+    /* No `transform: translateZ(0)` here. On `position: sticky`
+       elements, that creates a new containing block which can throw
+       off `popEl.scrollHeight` measurements while the layout is in
+       flux during a background refresh — the resize orchestrator was
+       briefly writing an over-measured height to the OS window,
+       making the popover look stretched while the refresh-bar was
+       up. Now that `saturate` is gone the blur is cheap enough that
+       a dedicated compositor layer isn't required for smooth scroll;
+       if upswipe judder returns, prefer `will-change: transform` over
+       `translateZ(0)` since `will-change` alone doesn't change
+       layout. */
   }
   .hr { height: 1px; background: var(--border-subtle); margin: 0 12px; }
   .loading {
@@ -1283,7 +1326,10 @@
     left: 0;
     right: 0;
     height: 2px;
-    z-index: 2;
+    /* Must sit above `.app-header` (z-index: 3); otherwise the header's
+       `backdrop-filter: blur(...)` smears the shimmer since absolute +
+       sticky both anchor at top: 0 and overlap. */
+    z-index: 4;
     pointer-events: none;
     background: linear-gradient(90deg, transparent 0%, var(--t3) 50%, transparent 100%);
     background-size: 200% 100%;

@@ -34,6 +34,7 @@
   import SshHostsSettings from "./SshHostsSettings.svelte";
   import CacheWarmupSettings from "./CacheWarmupSettings.svelte";
   import PermissionDisclosure from "./PermissionDisclosure.svelte";
+  import PermissionSettings from "./PermissionSettings.svelte";
 
   interface Props {
     onBack: () => void;
@@ -933,7 +934,10 @@
         </button>
         <div class="privacy-collapse" class:open={privacyExpanded}>
           <div class="collapse-inner">
-            <PermissionDisclosure mode="settings" onManage={handleManagePermission} />
+            <PermissionSettings />
+            <div class="permissions-meta">
+              <PermissionDisclosure mode="settings" onManage={handleManagePermission} />
+            </div>
           </div>
         </div>
       </div>
@@ -990,7 +994,7 @@
   .scroll {
     flex: 1;
     overflow-y: auto;
-    padding: 0 10px 10px;
+    padding: 8px 10px 10px;
     scrollbar-width: none;
   }
   .scroll::-webkit-scrollbar { display: none; }
@@ -1075,6 +1079,9 @@
 
   .cursor-section {
     padding: 8px 10px;
+  }
+  .permissions-meta {
+    margin-top: 8px;
   }
   .secret-input {
     width: 100%;

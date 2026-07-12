@@ -59,7 +59,7 @@
     </div>
   {/if}
   <div class="tog">
-    <div class="sl" style="width: calc({100 / options.length}% - 2.5px); transform: translateX({activeIdx * 100}%)"></div>
+    <div class="sl" style="width: calc((100% - 5px) / {options.length}); transform: translateX({activeIdx * 100}%)"></div>
     {#each options as opt}
       <button class:on={active === opt.value} onclick={() => onChange(opt.value)} title={opt.label}>
         {opt.label}
@@ -86,7 +86,7 @@
   }
   button {
     flex: 1; min-width: 0; padding: 6px 8px; border: none; background: none;
-    font: 500 10.5px/1 'Inter', sans-serif;
+    font: 500 8.5px/1 'Inter', sans-serif;
     color: var(--t3); cursor: pointer; position: relative; z-index: 1;
     letter-spacing: .2px; transition: color var(--t-normal) ease;
     overflow: hidden;
