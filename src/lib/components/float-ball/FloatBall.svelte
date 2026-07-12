@@ -4,14 +4,14 @@
   import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { currentMonitor } from "@tauri-apps/api/window";
   import { onMount, tick } from "svelte";
-  import { isLinux } from "../utils/platform.js";
-  import { logger } from "../utils/logger.js";
+  import { isLinux } from "../../utils/platform.js";
+  import { logger } from "../../utils/logger.js";
   import type {
     FloatBallExpandDirection,
     RateLimitProviderId,
     StatusWidgetSummary,
     TrayConfig,
-  } from "../types/index.js";
+  } from "../../types/index.js";
   import {
     detectScreenToPhysicalScale,
     getPhysicalWindowPositionFromPointer,
@@ -311,7 +311,7 @@
   }
 
   function onPointerDown(event: PointerEvent) {
-    if (!shouldHandleFloatBallPointerButton(event.button, IS_LINUX)) return;
+    if (!shouldHandleFloatBallPointerButton(event.button)) return;
     event.preventDefault();
     const interactionId = nextInteractionId(event.button === 2 ? "secondary" : "pointer");
     logger.info(

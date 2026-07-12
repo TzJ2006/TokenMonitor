@@ -1,7 +1,7 @@
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
-  import { activeProvider, activePeriod } from "../stores/usage.js";
+  import { activeProvider, activePeriod } from "../../stores/usage.js";
   import { get } from "svelte/store";
 
   type WarmupProgress = {
