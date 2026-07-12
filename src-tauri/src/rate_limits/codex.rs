@@ -122,18 +122,37 @@ fn is_codex_data_stale(
 }
 
 fn codex_window_to_rate_limit(id: &str, w: &CodexWindowData) -> RateLimitWindow {
-    let label = match (id, w.window_minutes) {
-        ("primary", 300) => "Session (5hr)".to_string(),
-        ("primary", _) => format!("Primary ({}m)", w.window_minutes),
-        ("secondary", 10080) => "Weekly (7 day)".to_string(),
-        ("secondary", _) => format!("Secondary ({}m)", w.window_minutes),
-        _ => id.to_string(),
-    };
+    let label = codex_window_label(id, w.window_minutes);
 
     let resets_at =
         DateTime::<Utc>::from_timestamp(w.resets_at as i64, 0).map(|dt| dt.to_rfc3339());
 
     RateLimitWindow::new(id.to_string(), label, w.used_percent, resets_at)
+}
+
+pub(super) fn codex_window_label(id: &str, minutes: u64) -> String {
+    match (id, minutes) {
+        ("primary", 300) => "Session (5hr)".to_string(),
+        ("secondary", 10080) => "Weekly (7 day)".to_string(),
+        ("primary", _) => format!("Primary ({})", format_window_duration(minutes)),
+        ("secondary", _) => format!("Secondary ({})", format_window_duration(minutes)),
+        _ => id.to_string(),
+    }
+}
+
+fn format_window_duration(minutes: u64) -> String {
+    let days = minutes / 1_440;
+    let hours = minutes % 1_440 / 60;
+    let minutes = minutes % 60;
+
+    match (days, hours, minutes) {
+        (days, 0, 0) if days > 0 => format!("{days}d"),
+        (days, hours, 0) if days > 0 => format!("{days}d {hours}h"),
+        (days, hours, minutes) if days > 0 => format!("{days}d {hours}h {minutes}m"),
+        (0, hours, 0) if hours > 0 => format!("{hours}h"),
+        (0, hours, minutes) if hours > 0 => format!("{hours}h {minutes}m"),
+        _ => format!("{minutes}m"),
+    }
 }
 
 fn find_newest_jsonl(
@@ -195,6 +214,11 @@ mod tests {
         assert_eq!(window.label, "Session (5hr)");
         assert_eq!(window.utilization, 1.0);
         assert_eq!(window.window_id, "primary");
+    }
+
+    #[test]
+    fn formats_long_primary_window_as_days_and_hours() {
+        assert_eq!(codex_window_label("primary", 10_080), "Primary (7d)");
     }
 
     #[test]
