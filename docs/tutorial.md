@@ -60,7 +60,7 @@ Platform-specific dependencies:
 ```bash
 git clone https://github.com/Michael-OvO/TokenMonitor.git
 cd TokenMonitor
-npm install
+npm ci
 npx tauri build
 ```
 
@@ -262,7 +262,6 @@ TokenMonitor includes a built-in auto-updater that checks for new versions and o
 - After launch, the app checks for updates (initial check after ~10 seconds, then every 6 hours)
 - When a new version is available, an **update banner** appears at the top of the popover
 - The **tray icon** shows a small **red badge dot** in the top-right corner
-- An **OS notification** fires once per new version (deduped across checks)
 
 ### Update actions
 
@@ -292,7 +291,7 @@ Click the **gear icon** in the popover to open the settings panel:
 
 ### Appearance
 - **Theme** — Light, Dark, or System (follows OS appearance)
-- **Glass effect** — Enable/disable the macOS vibrancy blur behind the popover (macOS only; hidden on Windows/Linux)
+- **Glass effect** — Enable/disable macOS vibrancy or Windows Mica/Acrylic (not available on Linux)
 - **Brand theming** — Color the header and accents based on the selected provider
 
 ### Behavior
@@ -347,7 +346,7 @@ TokenMonitor reads session logs that Claude Code, Codex, and Cursor IDE write to
 
 ### Cost numbers look wrong
 
-TokenMonitor uses built-in pricing tables. If you notice discrepancies:
+TokenMonitor uses built-in fallback prices and periodically cached dynamic pricing sources. If you notice discrepancies:
 
 - Check which models you're using — pricing varies significantly between models
 - Claude cache-write pricing has two tiers (5-minute and 1-hour) that affect totals

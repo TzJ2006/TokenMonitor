@@ -49,8 +49,8 @@
   } from "./lib/stores/settings.js";
   import { initializeRuntimeFromSettings } from "./lib/bootstrap.js";
   import { syncTrayConfig } from "./lib/tray/sync.js";
-  import { DEFAULT_MAX_WINDOW_HEIGHT, WINDOW_WIDTH } from "./lib/windowSizing.js";
-  import { createResizeOrchestrator, type ResizeOrchestrator } from "./lib/resizeOrchestrator.js";
+  import { DEFAULT_MAX_WINDOW_HEIGHT, WINDOW_WIDTH } from "./lib/window/sizing.js";
+  import { createResizeOrchestrator, type ResizeOrchestrator } from "./lib/window/resizeOrchestrator.js";
   import { syncNativeWindowSurface } from "./lib/window/appearance.js";
   import {
     captureResizeDebugSnapshot,
@@ -58,7 +58,7 @@
     initResizeDebug,
     isResizeDebugEnabled,
     logResizeDebug,
-  } from "./lib/uiStability.js";
+  } from "./lib/window/uiStability.js";
   import { setupAppEventListeners } from "./lib/appEventListeners.js";
   import { isMacOS, isWindows } from "./lib/utils/platform.js";
   import {
@@ -76,7 +76,7 @@
   import Footer from "./lib/components/Footer.svelte";
   import SetupScreen from "./lib/components/SetupScreen.svelte";
   import SplashScreen from "./lib/components/SplashScreen.svelte";
-  import Settings from "./lib/components/Settings.svelte";
+  import Settings from "./lib/components/settings/Settings.svelte";
   import Calendar from "./lib/components/Calendar.svelte";
   import DateNav from "./lib/components/DateNav.svelte";
   import DevicesView from "./lib/components/DevicesView.svelte";
@@ -478,7 +478,7 @@
     syncSizeAndVerify("device-back");
   }
 
-  // ── Window resize (delegated to resizeOrchestrator.ts) ──
+  // ── Window resize ──
   //
   // All resize state, measurement, throttling, and animation logic lives in
   // the orchestrator closure. App.svelte only holds the reactive Svelte state
@@ -608,7 +608,7 @@
       },
       onFocus: () => {
         logResizeDebug("window:focus", captureSnapshot("window-focus"));
-        void syncNativeWindowSurface(undefined, get(settings).glassEffect).catch((e) => logger.debug("appearance", `syncNativeWindowSurface failed: ${e}`));
+        void syncNativeWindowSurface().catch((e) => logger.debug("appearance", `syncNativeWindowSurface failed: ${e}`));
         scheduleWindowGeometryRecalibration("window-focus", 0);
         syncSizeAndVerify("window-focus");
         // Refresh silently — never drop the live view back to the spinner.
@@ -651,7 +651,7 @@
 
         const updates: Promise<unknown>[] = [syncTrayConfig(get(settings).trayConfig, null)];
         if (followsSystemTheme) {
-          updates.push(syncNativeWindowSurface(undefined, get(settings).glassEffect));
+          updates.push(syncNativeWindowSurface());
         }
 
         void Promise.allSettled(updates);

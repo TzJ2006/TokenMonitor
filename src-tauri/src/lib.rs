@@ -175,7 +175,6 @@ pub fn run() {
             Some(vec![]),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
@@ -421,8 +420,6 @@ pub fn run() {
             commands::calendar::get_monthly_usage,
             commands::usage_query::get_known_models,
             commands::config::get_last_usage_debug,
-            commands::config::set_window_surface,
-            commands::config::set_glass_effect,
             commands::config::set_dock_icon_visible,
             commands::config::suppress_next_auto_hide,
             commands::config::set_auto_export_config,
@@ -461,8 +458,6 @@ pub fn run() {
             commands::float_ball::move_float_ball_to,
             commands::float_ball::snap_float_ball,
             commands::float_ball::get_float_ball_position,
-            commands::float_ball::init_taskbar_panel,
-            commands::float_ball::destroy_taskbar_panel_cmd,
             commands::ssh::get_ssh_hosts,
             commands::ssh::get_ssh_host_statuses,
             commands::ssh::init_ssh_hosts,

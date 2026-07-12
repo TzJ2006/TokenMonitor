@@ -46,7 +46,7 @@ TokenMonitor is a local-first cross-platform system tray app for people who use 
 
 It reads the session logs already on your machine, applies provider-aware pricing rules in Rust, and turns them into a compact desktop interface for current-session spend, history, model mix, and rate-limit context.
 
-No API keys. No cloud sync. No runtime dependency on `ccusage` or any other external CLI.
+No provider API key is required for local usage history. No cloud sync. No runtime dependency on `ccusage` or any other external CLI.
 
 ## Quick Install
 
@@ -90,7 +90,7 @@ Grab the installer for your platform from the [latest release](https://github.co
 
 - In-app update banner with download progress
 - Tray icon red badge dot when an update is available
-- OS notification (deduped per version, 6h check interval with exponential backoff)
+- In-app update checks every 6 hours with exponential backoff after failures
 - Skip / Later / Update Now actions
 - Persisted updater state across restarts (skipped versions, last check)
 - Platform-aware: macOS/Linux auto-install, Windows passive NSIS, Linux .deb shows "Download" link
@@ -113,10 +113,11 @@ Grab the installer for your platform from the [latest release](https://github.co
 - Native system tray popover on all platforms
 - Launch-at-login support (LaunchAgent / Registry / XDG autostart)
 - Theme, currency, refresh interval, and branding controls
-- macOS glass (vibrancy) effect with toggle (opaque on Windows/Linux)
+- Native glass effect with a toggle (macOS vibrancy, Windows Mica/Acrylic)
 - Integrated settings and calendar panels inside the same popover flow
 - First-launch welcome card with permission disclosures and opt-in toggles
 - Dynamic exchange rates (USD, EUR, GBP, JPY, CNY) with 24h cache
+- Manual import/export and optional automatic usage exports
 
 ### Pricing Accuracy
 
@@ -162,7 +163,7 @@ Grab the installer for your platform from the [latest release](https://github.co
 | Rate limits (Claude) | OAuth via Keychain + API, CLI probe fallback | CLI probe only | CLI probe only |
 | Rate limits (Codex) | JSONL session files | JSONL session files | JSONL session files |
 | Rate limits (Cursor) | API (auto-detected or manual token) | API (auto-detected or manual token) | API (manual token) |
-| Glass blur effect | Supported (toggle in Settings) | Not available (opaque) | Not available (opaque) |
+| Glass blur effect | Vibrancy | Mica/Acrylic | Not available |
 | Dock icon toggle | Supported | Not applicable | Not applicable |
 | Autostart | LaunchAgent | Registry | XDG autostart |
 | Auto-update | DMG in-place replace | NSIS passive install | AppImage replace (.deb: download link) |
@@ -208,7 +209,7 @@ Grab the latest installer from the [Releases](https://github.com/Michael-OvO/Tok
 ```bash
 git clone https://github.com/Michael-OvO/TokenMonitor.git
 cd TokenMonitor
-npm install
+npm ci
 npx tauri build
 ```
 
@@ -236,7 +237,7 @@ Platform-specific bundle output:
 ### Development
 
 ```bash
-npm install
+npm ci
 npx tauri dev          # full app: hot-reload frontend + debug Rust backend
 npm run dev            # frontend only at http://localhost:1420 (no Rust)
 ```
@@ -286,14 +287,12 @@ src/
     │   ├── Breakdown.svelte       # Per-model cost breakdown
     │   ├── Calendar.svelte        # Heatmap calendar view
     │   ├── DevicesView.svelte     # SSH remote device management
-    │   ├── FloatBall.svelte       # Always-on-top overlay component
-    │   ├── floatBallInteraction.ts # FloatBall drag/scale detection
-    │   ├── floatBallUtils.ts      # FloatBall formatting and constants
+    │   ├── float-ball/            # Overlay component, interactions, and move queue
     │   ├── Footer.svelte          # Active session, burn rate
     │   ├── PermissionDisclosure.svelte # Privacy/permission surface display
-    │   ├── Settings.svelte        # Settings panel
+    │   ├── settings/              # Settings panel and focused subpanels
     │   ├── SubagentList.svelte    # Agent/subagent cost breakdown
-    │   ├── UpdateBanner.svelte    # In-app update notification banner
+    │   ├── UpdateBanner.svelte    # In-app update banner
     │   ├── UsageBars.svelte       # Rate limit utilization bars
     │   └── WelcomeCard.svelte     # First-launch onboarding card
     ├── permissions/
@@ -304,8 +303,10 @@ src/
     │   └── title.ts               # Tray title formatting
     ├── views/                     # View-model logic (footer, rate limits, devices)
     ├── window/
-    │   └── appearance.ts          # Window surface syncing
-    ├── windowSizing.ts            # Window size management
+    │   ├── appearance.ts          # Native theme and visual effects
+    │   ├── sizing.ts              # Window size calculations
+    │   ├── resizeOrchestrator.ts  # Resize lifecycle
+    │   └── uiStability.ts         # Resize stability and diagnostics
     └── utils/
         ├── platform.ts            # OS detection (macOS/Windows/Linux)
         ├── plans.ts               # Plan tier cost lookups
@@ -364,7 +365,6 @@ src-tauri/src/
     ├── mod.rs                     # Cross-platform helpers
     ├── macos/                     # macOS window management
     ├── windows/
-    │   ├── taskbar.rs             # GDI taskbar panel
     │   └── window.rs              # Taskbar-aligned positioning
     └── linux/                     # Linux window management
 ```
@@ -384,7 +384,7 @@ src-tauri/src/
 | Desktop shell | [Tauri v2](https://v2.tauri.app/) |
 | Frontend | [Svelte 5](https://svelte.dev/) + TypeScript |
 | Backend | Rust |
-| Build tool | [Vite 6](https://vitejs.dev/) |
+| Build tool | [Vite 8](https://vite.dev/) |
 | State path | Local JSONL parsing + Tauri IPC + Svelte stores |
 
 ## For Builders
