@@ -129,6 +129,9 @@ mod tests {
     #[test]
     fn grok_and_gemini_entries_exist() {
         assert!(lookup("grok-4.3").is_some());
+        assert!(lookup("grok-4.5").is_some());
+        assert!(lookup("grok-4.5-fast").is_some());
+        assert!(lookup("cursor-grok-4.5-high-fast").is_some());
         assert!(lookup("gemini-2.5-pro").is_some());
     }
 
