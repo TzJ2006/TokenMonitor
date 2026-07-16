@@ -135,7 +135,7 @@
   let brandTheming = $state(true);
   let headerTabs = $state<HeaderTabs>(DEFAULT_HEADER_TABS);
   let popEl: HTMLDivElement | null = null;
-  let footerEl: HTMLDivElement | null = null;
+  let footerEl = $state<HTMLDivElement | null>(null);
   let showMainFooter = $derived(
     !showSplash
       && !showPermissionsOnboarding
