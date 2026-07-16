@@ -385,6 +385,9 @@ mod tests {
     #[test]
     fn humanizes_camel_case_percent_fields() {
         assert_eq!(humanize_percent_field("bonusPoolPercentUsed"), "Bonus Pool");
-        assert_eq!(window_id_for_percent_field("bonusPoolPercentUsed"), "bonus_pool");
+        assert_eq!(
+            window_id_for_percent_field("bonusPoolPercentUsed"),
+            "bonus_pool"
+        );
     }
 }

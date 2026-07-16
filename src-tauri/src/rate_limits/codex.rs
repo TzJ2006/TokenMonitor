@@ -153,9 +153,7 @@ pub(super) fn codex_windows_from_rate_limits(rl: &Value) -> Vec<RateLimitWindow>
 
     let mut extras: Vec<(&String, &Value)> = obj
         .iter()
-        .filter(|(key, value)| {
-            !consumed.contains(key.as_str()) && looks_like_codex_window(value)
-        })
+        .filter(|(key, value)| !consumed.contains(key.as_str()) && looks_like_codex_window(value))
         .collect();
     extras.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -322,10 +320,7 @@ mod tests {
     #[test]
     fn formats_long_primary_window_as_days_and_hours() {
         assert_eq!(codex_window_label("primary", 10_080), "Primary (7d)");
-        assert_eq!(
-            codex_window_label("secondary", 2_040),
-            "Secondary (1d 10h)"
-        );
+        assert_eq!(codex_window_label("secondary", 2_040), "Secondary (1d 10h)");
     }
 
     #[test]
