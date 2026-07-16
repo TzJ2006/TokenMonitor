@@ -61,27 +61,22 @@ fn fetch_claude_from_statusline() -> Option<ProviderRateLimits> {
     }
 
     // We need at least one window to consider this a usable payload.
-    if session.five_hour.is_none() && session.seven_day.is_none() {
+    if session.windows.is_empty() {
         return None;
     }
 
-    let mut windows = Vec::with_capacity(2);
-    if let Some(w) = session.five_hour {
-        windows.push(RateLimitWindow::new(
-            "five_hour".to_string(),
-            "Session (5hr)".to_string(),
-            w.used_percentage,
-            DateTime::from_timestamp(w.resets_at_unix, 0).map(|dt| dt.to_rfc3339()),
-        ));
-    }
-    if let Some(w) = session.seven_day {
-        windows.push(RateLimitWindow::new(
-            "seven_day".to_string(),
-            "Weekly (7d)".to_string(),
-            w.used_percentage,
-            DateTime::from_timestamp(w.resets_at_unix, 0).map(|dt| dt.to_rfc3339()),
-        ));
-    }
+    let windows = session
+        .windows
+        .iter()
+        .map(|named| {
+            RateLimitWindow::new(
+                named.window_id.clone(),
+                claude::claude_window_label(&named.window_id),
+                named.window.used_percentage,
+                DateTime::from_timestamp(named.window.resets_at_unix, 0).map(|dt| dt.to_rfc3339()),
+            )
+        })
+        .collect();
 
     Some(ProviderRateLimits {
         provider: "claude".to_string(),

@@ -111,7 +111,8 @@
     if (windowId === "five_hour" || windowId === "primary") return 5;
     if (windowId === "secondary") return 168;
     if (windowId.startsWith("seven_day")) return 168;
-    if (windowId === "auto_composer" || windowId === "api") return 720;
+    // Cursor billing-cycle pools (monthly). Keep auto_composer for stale caches.
+    if (windowId === "first_party" || windowId === "auto_composer" || windowId === "api") return 720;
     return 5;
   }
 
@@ -210,7 +211,7 @@
   {#if rateLimits.extraUsage?.isEnabled}
     <div class="ub-row">
       <div class="ub-head">
-        <span class="ub-label">Extra Usage</span>
+        <span class="ub-label">{rateLimits.provider === "cursor" ? "On-demand" : "Extra Usage"}</span>
         <span class="ub-val">{formatUsdAmount(rateLimits.extraUsage.usedCredits)} / {formatUsdAmount(rateLimits.extraUsage.monthlyLimit)}</span>
       </div>
       <div class="ub-track">
@@ -219,7 +220,7 @@
           style="width: {Math.min((rateLimits.extraUsage.utilization ?? 0), 100)}%; background: {utilizationColor(rateLimits.extraUsage.utilization ?? 0)}; opacity: {utilizationFillOpacity(rateLimits.extraUsage.utilization ?? 0)}; --bar-delay: {rateLimits.windows.length * 0.09 + 0.04}s;"
         ></div>
       </div>
-      <div class="ub-sub">Monthly overuse budget</div>
+      <div class="ub-sub">{rateLimits.provider === "cursor" ? "On-demand spend limit" : "Monthly overuse budget"}</div>
     </div>
   {/if}
 

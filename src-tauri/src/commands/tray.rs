@@ -146,7 +146,7 @@ fn primary_window_id(provider: &str) -> &'static str {
     match provider {
         "claude" => "five_hour",
         "codex" => "primary",
-        "cursor" => "auto_composer",
+        "cursor" => "first_party",
         _ => "primary",
     }
 }
@@ -695,11 +695,11 @@ mod tests {
     }
 
     #[test]
-    fn cursor_uses_auto_composer_window() {
+    fn cursor_uses_first_party_window() {
         let rate_limits = make_provider(
             "cursor",
             vec![
-                make_window("auto_composer", 55.0, None),
+                make_window("first_party", 55.0, None),
                 make_window("api", 80.0, None),
             ],
         );
