@@ -135,6 +135,17 @@
   let brandTheming = $state(true);
   let headerTabs = $state<HeaderTabs>(DEFAULT_HEADER_TABS);
   let popEl: HTMLDivElement | null = null;
+  let footerEl: HTMLDivElement | null = null;
+  let showMainFooter = $derived(
+    !showSplash
+      && !showPermissionsOnboarding
+      && appReady
+      && !!data
+      && !showSettings
+      && !showCalendar
+      && !selectedDevice
+      && !showDevices,
+  );
   let resizeOrch: ResizeOrchestrator | null = null;
   let scrollThresholdH = $state(DEFAULT_MAX_WINDOW_HEIGHT);
   // Written by orchestrator callback; read by future scroll-lock UI indicator.
@@ -197,6 +208,12 @@
     dataTransitionCounter = untrack(() => dataTransitionCounter) + 1;
   });
 
+  // Footer mounts outside the measured scroll body — remeasure when it appears/leaves.
+  $effect(() => {
+    void showMainFooter;
+    tick().then(() => resizeOrch?.syncSizeAndVerify("footer-chrome"));
+  });
+
   let headerToggleOptions = $derived.by(() =>
     getVisibleHeaderProviders(headerTabs).map((value) => ({
       value,
@@ -212,6 +229,8 @@
   $effect(() => {
     const unsub1 = usageData.subscribe((v) => (data = v));
     const unsub2 = isLoading.subscribe((v) => (loading = v));
+    const unsubProvider = activeProvider.subscribe((v) => (provider = v));
+    const unsubPeriod = activePeriod.subscribe((v) => (period = v));
     const unsubPL = isPlaceholderLoading.subscribe((v) => {
       placeholderLoading = v;
       tick().then(() => resizeOrch?.syncSizeAndVerify(v ? "content-loading" : "content-loaded"));
@@ -224,7 +243,7 @@
     });
     const unsub4 = rateLimitsData.subscribe((v) => (rateLimits = v));
     const unsub5 = rateLimitsRequestState.subscribe((v) => (rateLimitsRequest = v));
-    return () => { unsub1(); unsub2(); unsubPL(); unsub3(); unsub4(); unsub5(); };
+    return () => { unsub1(); unsub2(); unsubProvider(); unsubPeriod(); unsubPL(); unsub3(); unsub4(); unsub5(); };
   });
 
   // Apply/remove data-provider attribute reactively
@@ -520,6 +539,7 @@
 
     resizeOrch = createResizeOrchestrator({
       getPopEl: () => popEl,
+      getFooterEl: () => footerEl,
       invoke: (cmd, args) => invoke(cmd, args),
       onScrollLockChange: (locked) => {
         isScrollLocked = locked;
@@ -672,8 +692,6 @@
         if (cancelled) return;
         const runtime = await initializeRuntimeFromSettings(saved);
         if (cancelled) return;
-        provider = runtime.provider;
-        period = runtime.period;
         logResizeDebug("app:settings-loaded", {
           provider: runtime.provider,
           period: runtime.period,
@@ -831,251 +849,258 @@
 
 <div class="pop">
   <div
-    class="pop-content"
-    bind:this={popEl}
-    style:max-height="{scrollThresholdH}px"
+    class="pop-scroll"
     style:overflow-y={scrollThresholdH < DEFAULT_MAX_WINDOW_HEIGHT ? 'auto' : 'visible'}
   >
-    {#if !showSettings}<UpdateBanner />{/if}
-    {#if showSplash}
-      <SplashScreen ready={appReady} onComplete={() => { showSplash = false; tick().then(() => syncSizeAndVerify("splash-complete")); }} />
-    {:else if showPermissionsOnboarding}
-      <PermissionsOnboarding
-        onFinish={handleOnboardingFinish}
-      />
-    {:else if appReady && !data}
-      <div class={viewTransitionClass}><SetupScreen /></div>
-    {:else if showSettings}
-      <div class={viewTransitionClass}><Settings onBack={handleSettingsClose} /></div>
-    {:else if showCalendar}
-      <div class={viewTransitionClass}><Calendar onBack={handleCalendarClose} /></div>
-    {:else if selectedDevice}
-      <div class={viewTransitionClass}><SingleDeviceView device={selectedDevice} onBack={handleDeviceBack} /></div>
-    {:else if showDevices}
-      <div class={viewTransitionClass}><DevicesView onBack={() => { showDevices = false; }} onDeviceSelect={handleDeviceSelect} onSettings={handleSettingsOpen} /></div>
-    {:else if data}
-      <div class={viewTransitionClass}>
-      {#if showRefresh}<div class="refresh-bar" aria-hidden="true"></div>{/if}
-      <div class="app-header">
-        <Toggle
-          active={provider}
-          options={headerToggleOptions}
-          onChange={handleProviderChange}
-          {brandTheming}
+    <div class="pop-content" bind:this={popEl}>
+      {#if !showSettings}<UpdateBanner />{/if}
+      {#if showSplash}
+        <SplashScreen ready={appReady} onComplete={() => { showSplash = false; tick().then(() => syncSizeAndVerify("splash-complete")); }} />
+      {:else if showPermissionsOnboarding}
+        <PermissionsOnboarding
+          onFinish={handleOnboardingFinish}
         />
-        <TimeTabs active={period} onChange={handlePeriodChange} />
-      </div>
-      {#if period !== "5h" && data}
-        <DateNav
-          periodLabel={data.period_label}
-          hasEarlierData={data.has_earlier_data}
-          isAtPresent={offset === 0}
-          onBack={() => handleOffsetChange(-1)}
-          onForward={() => handleOffsetChange(1)}
-          onReset={handleOffsetReset}
-        />
-      {/if}
-      {#if placeholderLoading}
+      {:else if appReady && !data}
+        <div class={viewTransitionClass}><SetupScreen /></div>
+      {:else if showSettings}
+        <div class={viewTransitionClass}><Settings onBack={handleSettingsClose} /></div>
+      {:else if showCalendar}
+        <div class={viewTransitionClass}><Calendar onBack={handleCalendarClose} /></div>
+      {:else if selectedDevice}
+        <div class={viewTransitionClass}><SingleDeviceView device={selectedDevice} onBack={handleDeviceBack} /></div>
+      {:else if showDevices}
+        <div class={viewTransitionClass}><DevicesView onBack={() => { showDevices = false; }} onDeviceSelect={handleDeviceSelect} onSettings={handleSettingsOpen} /></div>
+      {:else if data}
+        <div class={viewTransitionClass}>
+        {#if showRefresh}<div class="refresh-bar" aria-hidden="true"></div>{/if}
+        <div class="app-header">
+          <Toggle
+            active={provider}
+            options={headerToggleOptions}
+            onChange={handleProviderChange}
+            {brandTheming}
+          />
+          <TimeTabs active={period} onChange={handlePeriodChange} />
+        </div>
+        {#if period !== "5h" && data}
+          <DateNav
+            periodLabel={data.period_label}
+            hasEarlierData={data.has_earlier_data}
+            isAtPresent={offset === 0}
+            onBack={() => handleOffsetChange(-1)}
+            onForward={() => handleOffsetChange(1)}
+            onReset={handleOffsetReset}
+          />
+        {/if}
+        {#if placeholderLoading}
+          <div class="loading">
+            <div class="spinner"></div>
+            <div class="loading-text">Loading data...</div>
+          </div>
+        {:else}
+          <div class="data-content" style:animation-name={dataTransitionCounter > 1 ? 'contentFade' : 'none'}>
+          <MetricsRow {data} />
+          {#if data.usage_warning && data.usage_warning !== dismissedWarningText}
+            <div class="usage-warning">
+              <div class="usage-warning-header">
+                <div class="usage-warning-title">Usage warning</div>
+                <button
+                  class="usage-warning-dismiss"
+                  onclick={() => { dismissedWarningText = data?.usage_warning ?? null; }}
+                  aria-label="Dismiss warning"
+                >&times;</button>
+              </div>
+              <div class="usage-warning-text">{data.usage_warning}</div>
+            </div>
+          {/if}
+          <div class="hr"></div>
+
+          {#if period === "5h"}
+            {#if showKeychainPermissionPanel && isMacOS() && !$settings.keychainAccessRequested}
+              <div class="rate-limit-permission" role="dialog" aria-labelledby="rate-limit-permission-title">
+                <div class="rate-limit-empty-title" id="rate-limit-permission-title">
+                  Keychain fallback for live limits
+                </div>
+                <div class="rate-limit-empty-text">
+                  TokenMonitor normally reads Claude live limits from your Claude
+                  credentials file without any macOS prompt. If that file is missing
+                  or unreadable, you can allow a one-time Keychain fallback.
+                </div>
+                <PermissionDisclosure mode="rate-limit" />
+                <div class="rate-limit-empty-text">
+                  macOS may show a Keychain window after you continue. Choose
+                  <strong>Always Allow</strong> if you want future fallback checks to stay silent.
+                </div>
+                <div class="rate-limit-actions">
+                  <button
+                    type="button"
+                    class="rate-limit-secondary"
+                    onclick={handleSkipKeychainForRateLimits}
+                    disabled={keychainPermissionBusy}
+                  >
+                    Do not use Keychain
+                  </button>
+                  <button
+                    type="button"
+                    class="rate-limit-cta"
+                    onclick={handleAllowKeychainForRateLimits}
+                    disabled={keychainPermissionBusy}
+                  >
+                    Allow Keychain access
+                  </button>
+                </div>
+              </div>
+            {:else if $settings.rateLimitsEnabled && visibleUsableRateLimitProviders.length > 0}
+              {#each visibleUsableRateLimitProviders as rateLimitProvider, index}
+                <UsageBars
+                  providerLabel={provider === ALL_USAGE_PROVIDER_ID ? getUsageProviderLabel(rateLimitProvider) : undefined}
+                  rateLimits={providerPayload(rateLimits, rateLimitProvider)!}
+                />
+                {#if index < visibleUsableRateLimitProviders.length - 1}
+                  <div class="hr"></div>
+                {/if}
+              {/each}
+              {#if statuslineProbeStatus === "script_missing" || statuslineProbeStatus === "not_installed"}
+                <div class="rate-limit-stale-banner" data-state="warn">
+                  <div class="rl-stale-row">
+                    <span class="rl-stale-dot" aria-hidden="true"></span>
+                    <span class="rl-stale-headline">Statusline needs attention</span>
+                  </div>
+                  <div class="rl-stale-body">
+                    Reinstall the statusline to restore live updates.
+                  </div>
+                  <button
+                    type="button"
+                    class="rate-limit-cta"
+                    onclick={handleInstallStatusline}
+                    disabled={statuslineBusy}
+                  >
+                    {statuslineBusy ? "Reinstalling…" : "Reinstall statusline"}
+                  </button>
+                </div>
+              {/if}
+            {:else if !$settings.rateLimitsEnabled}
+              <div class="rate-limit-empty">
+                <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                </svg>
+                <div class="rate-limit-empty-title">Live rate limits are off</div>
+                <div class="rate-limit-empty-text">
+                  Turn this on to see live rate-limit percentages.
+                  TokenMonitor uses your Claude credentials file first and does not open Keychain from this button.
+                </div>
+                <button
+                  type="button"
+                  class="rate-limit-cta"
+                  onclick={handleEnableRateLimits}
+                  disabled={keychainPermissionBusy}
+                >
+                  Enable rate limits
+                </button>
+              </div>
+            {:else if rateLimitsRequest.loading}
+              <div class="rate-limit-skeleton" aria-busy="true">
+                {#each [1, 2] as _}
+                  <div class="rate-limit-skeleton-row">
+                    <div class="skeleton" style="width: 50px; height: 8px"></div>
+                    <div class="skeleton" style="width: 100%; height: 14px; border-radius: 7px"></div>
+                  </div>
+                {/each}
+              </div>
+            {:else}
+              <div class="rate-limit-empty">
+                <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <line x1="12" y1="8" x2="12" y2="12"></line>
+                  <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                </svg>
+                <div class="rate-limit-empty-title">Rate limits unavailable</div>
+                <div class="rate-limit-empty-text">
+                  {#if isRateLimitProvider(provider) && (data.total_tokens > 0 || data.total_cost > 0)}
+                    {getRateLimitIdleSummary(provider)}
+                  {:else}
+                    {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
+                  {/if}
+                </div>
+                {#if isMacOS() && !$settings.keychainAccessRequested}
+                  <button
+                    type="button"
+                    class="rate-limit-secondary"
+                    onclick={handleShowKeychainFallback}
+                    disabled={keychainPermissionBusy}
+                  >
+                    Review Keychain fallback
+                  </button>
+                {/if}
+              </div>
+            {/if}
+          {:else if data.total_cost === 0 && data.total_tokens === 0}
+            <div class="empty-period">
+              {#if data.provider_detected === false}
+                <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="7 10 12 15 17 10"></polyline>
+                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                <span class="empty-title">{providerNotInstalledTitle(provider)}</span>
+                <span class="empty-subtitle">{providerNotInstalledHint(provider)}</span>
+              {:else}
+                <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+                  <path d="M2 17l10 5 10-5"></path>
+                  <path d="M2 12l10 5 10-5"></path>
+                </svg>
+                <span>{emptyPeriodLabel(period, offset)}</span>
+              {/if}
+            </div>
+          {:else}
+            <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} deviceBuckets={data.device_chart_buckets} />
+          {/if}
+
+          {#if (period !== "5h" && data.model_breakdown.length > 0) || data.subagent_stats || (data.device_breakdown && data.device_breakdown.length > 0)}
+            <div class="hr"></div>
+            <Breakdown
+              models={period !== "5h" ? data.model_breakdown : []}
+              onAccordionToggle={(detail) => resizeOrch?.handleBreakdownAccordionToggle(detail)}
+              subagentStats={data.subagent_stats}
+              deviceBreakdown={data.device_breakdown}
+              onDeviceSelect={handleDeviceSelect}
+              onShowAllDevices={() => { showDevices = true; }}
+            />
+          {/if}
+        </div>
+        {/if}
+        </div>
+      {:else}
         <div class="loading">
           <div class="spinner"></div>
           <div class="loading-text">Loading data...</div>
         </div>
-      {:else}
-        <div class="data-content" style:animation-name={dataTransitionCounter > 1 ? 'contentFade' : 'none'}>
-        <MetricsRow {data} />
-        {#if data.usage_warning && data.usage_warning !== dismissedWarningText}
-          <div class="usage-warning">
-            <div class="usage-warning-header">
-              <div class="usage-warning-title">Usage warning</div>
-              <button
-                class="usage-warning-dismiss"
-                onclick={() => { dismissedWarningText = data?.usage_warning ?? null; }}
-                aria-label="Dismiss warning"
-              >&times;</button>
-            </div>
-            <div class="usage-warning-text">{data.usage_warning}</div>
-          </div>
-        {/if}
-        <div class="hr"></div>
-
-        {#if period === "5h"}
-          {#if showKeychainPermissionPanel && isMacOS() && !$settings.keychainAccessRequested}
-            <div class="rate-limit-permission" role="dialog" aria-labelledby="rate-limit-permission-title">
-              <div class="rate-limit-empty-title" id="rate-limit-permission-title">
-                Keychain fallback for live limits
-              </div>
-              <div class="rate-limit-empty-text">
-                TokenMonitor normally reads Claude live limits from your Claude
-                credentials file without any macOS prompt. If that file is missing
-                or unreadable, you can allow a one-time Keychain fallback.
-              </div>
-              <PermissionDisclosure mode="rate-limit" />
-              <div class="rate-limit-empty-text">
-                macOS may show a Keychain window after you continue. Choose
-                <strong>Always Allow</strong> if you want future fallback checks to stay silent.
-              </div>
-              <div class="rate-limit-actions">
-                <button
-                  type="button"
-                  class="rate-limit-secondary"
-                  onclick={handleSkipKeychainForRateLimits}
-                  disabled={keychainPermissionBusy}
-                >
-                  Do not use Keychain
-                </button>
-                <button
-                  type="button"
-                  class="rate-limit-cta"
-                  onclick={handleAllowKeychainForRateLimits}
-                  disabled={keychainPermissionBusy}
-                >
-                  Allow Keychain access
-                </button>
-              </div>
-            </div>
-          {:else if $settings.rateLimitsEnabled && visibleUsableRateLimitProviders.length > 0}
-            {#each visibleUsableRateLimitProviders as rateLimitProvider, index}
-              <UsageBars
-                providerLabel={provider === ALL_USAGE_PROVIDER_ID ? getUsageProviderLabel(rateLimitProvider) : undefined}
-                rateLimits={providerPayload(rateLimits, rateLimitProvider)!}
-              />
-              {#if index < visibleUsableRateLimitProviders.length - 1}
-                <div class="hr"></div>
-              {/if}
-            {/each}
-            {#if statuslineProbeStatus === "script_missing" || statuslineProbeStatus === "not_installed"}
-              <div class="rate-limit-stale-banner" data-state="warn">
-                <div class="rl-stale-row">
-                  <span class="rl-stale-dot" aria-hidden="true"></span>
-                  <span class="rl-stale-headline">Statusline needs attention</span>
-                </div>
-                <div class="rl-stale-body">
-                  Reinstall the statusline to restore live updates.
-                </div>
-                <button
-                  type="button"
-                  class="rate-limit-cta"
-                  onclick={handleInstallStatusline}
-                  disabled={statuslineBusy}
-                >
-                  {statuslineBusy ? "Reinstalling…" : "Reinstall statusline"}
-                </button>
-              </div>
-            {/if}
-          {:else if !$settings.rateLimitsEnabled}
-            <div class="rate-limit-empty">
-              <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
-                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
-              </svg>
-              <div class="rate-limit-empty-title">Live rate limits are off</div>
-              <div class="rate-limit-empty-text">
-                Turn this on to see live rate-limit percentages.
-                TokenMonitor uses your Claude credentials file first and does not open Keychain from this button.
-              </div>
-              <button
-                type="button"
-                class="rate-limit-cta"
-                onclick={handleEnableRateLimits}
-                disabled={keychainPermissionBusy}
-              >
-                Enable rate limits
-              </button>
-            </div>
-          {:else if rateLimitsRequest.loading}
-            <div class="rate-limit-skeleton" aria-busy="true">
-              {#each [1, 2] as _}
-                <div class="rate-limit-skeleton-row">
-                  <div class="skeleton" style="width: 50px; height: 8px"></div>
-                  <div class="skeleton" style="width: 100%; height: 14px; border-radius: 7px"></div>
-                </div>
-              {/each}
-            </div>
-          {:else}
-            <div class="rate-limit-empty">
-              <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="10"></circle>
-                <line x1="12" y1="8" x2="12" y2="12"></line>
-                <line x1="12" y1="16" x2="12.01" y2="16"></line>
-              </svg>
-              <div class="rate-limit-empty-title">Rate limits unavailable</div>
-              <div class="rate-limit-empty-text">
-                {#if isRateLimitProvider(provider) && (data.total_tokens > 0 || data.total_cost > 0)}
-                  {getRateLimitIdleSummary(provider)}
-                {:else}
-                  {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
-                {/if}
-              </div>
-              {#if isMacOS() && !$settings.keychainAccessRequested}
-                <button
-                  type="button"
-                  class="rate-limit-secondary"
-                  onclick={handleShowKeychainFallback}
-                  disabled={keychainPermissionBusy}
-                >
-                  Review Keychain fallback
-                </button>
-              {/if}
-            </div>
-          {/if}
-        {:else if data.total_cost === 0 && data.total_tokens === 0}
-          <div class="empty-period">
-            {#if data.provider_detected === false}
-              <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                <polyline points="7 10 12 15 17 10"></polyline>
-                <line x1="12" y1="15" x2="12" y2="3"></line>
-              </svg>
-              <span class="empty-title">{providerNotInstalledTitle(provider)}</span>
-              <span class="empty-subtitle">{providerNotInstalledHint(provider)}</span>
-            {:else}
-              <svg class="empty-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--t4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
-                <path d="M2 17l10 5 10-5"></path>
-                <path d="M2 12l10 5 10-5"></path>
-              </svg>
-              <span>{emptyPeriodLabel(period, offset)}</span>
-            {/if}
-          </div>
-        {:else}
-          <Chart buckets={data.chart_buckets} dataKey={`${provider}-${period}-${offset}`} deviceBuckets={data.device_chart_buckets} />
-        {/if}
-
-        {#if (period !== "5h" && data.model_breakdown.length > 0) || data.subagent_stats || (data.device_breakdown && data.device_breakdown.length > 0)}
-          <div class="hr"></div>
-          <Breakdown
-            models={period !== "5h" ? data.model_breakdown : []}
-            onAccordionToggle={(detail) => resizeOrch?.handleBreakdownAccordionToggle(detail)}
-            subagentStats={data.subagent_stats}
-            deviceBreakdown={data.device_breakdown}
-            onDeviceSelect={handleDeviceSelect}
-            onShowAllDevices={() => { showDevices = true; }}
-          />
-        {/if}
-      </div>
       {/if}
-      <div class="app-footer">
-        <Footer {data} {provider} {period} {rateLimits} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} onDevices={() => { showDevices = true; }} />
-      </div>
-      </div>
-    {:else}
-      <div class="loading">
-        <div class="spinner"></div>
-        <div class="loading-text">Loading data...</div>
-      </div>
-    {/if}
+    </div>
   </div>
+  {#if showMainFooter && data}
+    <div class="app-footer" bind:this={footerEl}>
+      <Footer {data} {provider} {period} {rateLimits} onSettings={handleSettingsOpen} onCalendar={handleCalendarOpen} onDevices={() => { showDevices = true; }} />
+    </div>
+  {/if}
 </div>
 
 
 <style>
   .pop {
     width: 340px;
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
     box-shadow: none;
     animation: popIn var(--t-slow) var(--ease-out) both;
   }
-  .pop-content {
-    position: relative;
+  .pop-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
     min-width: 0;
     scrollbar-width: none;
     -ms-overflow-style: none;
@@ -1090,8 +1115,12 @@
        ancestors. */
     overscroll-behavior: none;
   }
-  .pop-content::-webkit-scrollbar {
+  .pop-scroll::-webkit-scrollbar {
     display: none;
+  }
+  .pop-content {
+    position: relative;
+    min-width: 0;
   }
   .app-header {
     position: sticky;
@@ -1114,8 +1143,7 @@
        layout. */
   }
   .app-footer {
-    position: sticky;
-    bottom: 0;
+    flex: 0 0 auto;
     z-index: 3;
     background: var(--surface);
     background-image: linear-gradient(var(--provider-bg), var(--provider-bg));

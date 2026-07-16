@@ -18,6 +18,8 @@ import {
 
 export interface ResizeOrchestratorDeps {
   getPopEl: () => HTMLDivElement | null;
+  /** Optional fixed chrome below the scroll body (e.g. main-view footer). */
+  getFooterEl?: () => HTMLElement | null;
   invoke: (cmd: string, args: Record<string, unknown>) => Promise<void>;
   onScrollLockChange: (locked: boolean) => void;
   currentMonitor: () => Promise<{
@@ -205,7 +207,10 @@ export function createResizeOrchestrator(
   } | null {
     const popEl = deps.getPopEl();
     if (!popEl) return null;
-    const rawMeasuredHeight = measureTargetWindowHeight(popEl.scrollHeight);
+    const footerHeight = deps.getFooterEl?.()?.offsetHeight ?? 0;
+    const rawMeasuredHeight = measureTargetWindowHeight(
+      popEl.scrollHeight + footerHeight,
+    );
     const effectiveMaxWindowH = getEffectiveWindowMaxHeight();
     const scrollLocked = isWindowScrollLocked(
       rawMeasuredHeight,
@@ -238,12 +243,26 @@ export function createResizeOrchestrator(
         height: request.height,
       })
       .then(() => {
+        // When the OS clamps below the request, re-align hysteresis to the
+        // applied height. Ignore stale innerHeight that still matches the
+        // pre-resize window (common briefly after invoke resolves).
+        if (typeof window !== "undefined") {
+          const applied = window.innerHeight;
+          if (
+            Number.isFinite(applied)
+            && applied > 0
+            && applied < request.height - RESIZE_HYSTERESIS_PX
+          ) {
+            lastWindowH = applied;
+          }
+        }
         deps.logDebug("resize:set-size-resolved", {
           source: request.source,
           nextHeight: request.height,
+          appliedHeight: lastWindowH,
           ...captureDebugSnapshot(`set-size-resolved-${request.source}`),
         });
-        deps.onHeightApplied?.(request.height);
+        deps.onHeightApplied?.(lastWindowH > 0 ? lastWindowH : request.height);
       })
       .catch((error) => {
         deps.logDebug("resize:set-size-rejected", {

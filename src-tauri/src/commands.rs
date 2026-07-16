@@ -21,7 +21,7 @@ use crate::usage::ssh_remote::{SshCacheManager, SshHostConfig};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 #[allow(dead_code)]
@@ -50,6 +50,11 @@ pub struct AppState {
     /// the first-run local access disclosure. Existing installs enable this at
     /// bootstrap; new installs flip it after the welcome card is dismissed.
     pub usage_access_enabled: Arc<AtomicBool>,
+    /// Last non-pending tray daily cost. Kept across Cursor remote-cache TTL
+    /// gaps so the menu bar does not flash `$0` while a refetch is in flight.
+    pub last_tray_daily_cost: Arc<Mutex<Option<f64>>>,
+    /// Dedupes concurrent Cursor remote fetches spawned from tray + usage query.
+    pub cursor_remote_fetch_inflight: Arc<AtomicBool>,
     /// Plan tier used to compute the rolling-window utilization percentages.
     /// Updated by `set_claude_plan_tier`; defaults to `Pro` for new installs.
     pub claude_plan_tier: Arc<RwLock<ClaudePlanTier>>,
@@ -80,6 +85,8 @@ impl AppState {
             suppress_auto_hide: Arc::new(AtomicBool::new(false)),
             rate_limits_enabled: Arc::new(AtomicBool::new(false)),
             usage_access_enabled: Arc::new(AtomicBool::new(false)),
+            last_tray_daily_cost: Arc::new(Mutex::new(None)),
+            cursor_remote_fetch_inflight: Arc::new(AtomicBool::new(false)),
             claude_plan_tier: Arc::new(RwLock::new(ClaudePlanTier::default())),
             payload_disk_cache: Arc::new(RwLock::new(None)),
             auto_export: Arc::new(RwLock::new(usage_io::AutoExportConfig::default())),

@@ -1,7 +1,8 @@
-use super::usage_query::get_provider_data;
+use super::usage_query::{get_provider_data, spawn_cursor_remote_fetch_if_needed};
 use super::AppState;
 use crate::models::*;
 use crate::usage::integrations::all_usage_integrations;
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 #[cfg(target_os = "macos")]
@@ -13,6 +14,7 @@ pub enum BarDisplay {
     Off,
     Single,
     Both,
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,12 +239,58 @@ fn usage_access_enabled(state: &AppState) -> bool {
         .load(std::sync::atomic::Ordering::SeqCst)
 }
 
-fn current_daily_total_cost_if_allowed(state: &AppState) -> f64 {
-    if usage_access_enabled(state) {
-        current_daily_total_cost(state)
-    } else {
-        0.0
+/// Decide which daily cost the tray should show, and what to remember next.
+/// When Cursor remote data is pending/expired and the cold recompute is `$0`,
+/// keep the previous non-zero cost so the menu bar does not flash zero.
+fn resolve_tray_daily_cost_display(
+    usage_access: bool,
+    computed: f64,
+    needs_cursor_remote: bool,
+    last: Option<f64>,
+) -> (f64, Option<f64>) {
+    if !usage_access {
+        return (0.0, None);
     }
+    if computed <= 0.0 && needs_cursor_remote {
+        if let Some(previous) = last {
+            if previous > 0.0 {
+                return (previous, last);
+            }
+        }
+        return (computed, last);
+    }
+    (computed, Some(computed))
+}
+
+fn current_daily_total_cost_if_allowed(state: &AppState) -> f64 {
+    let last = state
+        .last_tray_daily_cost
+        .lock()
+        .ok()
+        .and_then(|guard| *guard);
+    let today = Local::now().date_naive();
+    let (display, next_last) = resolve_tray_daily_cost_display(
+        usage_access_enabled(state),
+        if usage_access_enabled(state) {
+            current_daily_total_cost(state)
+        } else {
+            0.0
+        },
+        state.parser.needs_cursor_remote_fetch(Some(today)),
+        last,
+    );
+    if let Ok(mut guard) = state.last_tray_daily_cost.lock() {
+        *guard = next_last;
+    }
+    display
+}
+
+fn ensure_tray_cursor_remote_fresh(app: &tauri::AppHandle, state: &AppState) {
+    if !usage_access_enabled(state) {
+        return;
+    }
+    let today = Local::now().date_naive();
+    spawn_cursor_remote_fetch_if_needed(app, state, Some(today));
 }
 
 fn should_update_tray_icon(config: &TrayConfig, utilization: TrayUtilization) -> bool {
@@ -342,6 +390,7 @@ fn apply_tray_presentation(
                 config,
                 utilization.claude,
                 utilization.codex,
+                utilization.cursor,
                 dark_bar,
                 update_available,
             );
@@ -378,7 +427,7 @@ async fn current_tray_utilization(state: &AppState) -> TrayUtilization {
     tray_utilization_from_rate_limits(cached.as_ref())
 }
 
-pub async fn sync_tray_title(app: &tauri::AppHandle, state: &AppState) {
+async fn apply_tray_title_now(app: &tauri::AppHandle, state: &AppState) {
     let config = state.tray_config.read().await.clone();
     let total_cost = current_daily_total_cost_if_allowed(state);
     let utilization = current_tray_utilization(state).await;
@@ -388,6 +437,16 @@ pub async fn sync_tray_title(app: &tauri::AppHandle, state: &AppState) {
     };
     apply_tray_presentation(app, &config, total_cost, utilization, update_available);
     emit_status_widget_updated(app);
+}
+
+pub async fn sync_tray_title(app: &tauri::AppHandle, state: &AppState) {
+    ensure_tray_cursor_remote_fresh(app, state);
+    apply_tray_title_now(app, state).await;
+}
+
+/// Refresh the tray title after a Cursor remote fetch without spawning another fetch.
+pub async fn refresh_tray_title_after_cursor_fetch(app: &tauri::AppHandle, state: &AppState) {
+    apply_tray_title_now(app, state).await;
 }
 
 #[tauri::command]
@@ -421,6 +480,7 @@ pub async fn set_tray_config(
         let guard = state.updater.read().await;
         guard.should_show_banner()
     };
+    ensure_tray_cursor_remote_fresh(&app, &state);
     apply_tray_presentation(
         &app,
         &config,
@@ -459,6 +519,27 @@ pub(crate) fn current_daily_total_cost_for_test(state: &AppState) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_cost_holdover_keeps_last_while_cursor_remote_pending() {
+        let (display, next) = resolve_tray_daily_cost_display(true, 0.0, true, Some(12.34));
+        assert_eq!(display, 12.34);
+        assert_eq!(next, Some(12.34));
+    }
+
+    #[test]
+    fn tray_cost_holdover_updates_when_compute_succeeds() {
+        let (display, next) = resolve_tray_daily_cost_display(true, 8.5, false, Some(12.34));
+        assert_eq!(display, 8.5);
+        assert_eq!(next, Some(8.5));
+    }
+
+    #[test]
+    fn tray_cost_holdover_clears_when_usage_access_disabled() {
+        let (display, next) = resolve_tray_daily_cost_display(false, 0.0, true, Some(12.34));
+        assert_eq!(display, 0.0);
+        assert_eq!(next, None);
+    }
 
     #[test]
     fn format_tray_title_returns_empty_string_when_hidden() {
