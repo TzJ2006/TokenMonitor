@@ -17,10 +17,72 @@ use chrono::NaiveDate;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::Emitter;
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 
 const USAGE_PAYLOAD_CACHE_VERSION: &str = "model-pricing-2026-06-13";
+
+/// Spawn a background Cursor remote fetch when the cache is missing/expired.
+/// Deduped via `AppState::cursor_remote_fetch_inflight`. Always refreshes the
+/// tray title when the fetch finishes so the menu bar does not stay at `$0`.
+pub(crate) fn spawn_cursor_remote_fetch_if_needed(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    since: Option<NaiveDate>,
+) {
+    if !state.parser.needs_cursor_remote_fetch(since) {
+        return;
+    }
+    if state
+        .cursor_remote_fetch_inflight
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+
+    let app_handle = app.clone();
+    let parser_arc = Arc::clone(&state.parser);
+    let disk_cache_arc = Arc::clone(&state.payload_disk_cache);
+    let inflight = Arc::clone(&state.cursor_remote_fetch_inflight);
+    tokio::spawn(async move {
+        tracing::info!("[cursor-async] Starting background Cursor remote fetch");
+        let result = tokio::task::spawn_blocking(move || {
+            crate::usage::cursor_parser::fetch_cursor_remote_entries(since)
+        })
+        .await;
+        match result {
+            Ok(Ok(Some(entries))) => {
+                tracing::info!(
+                    "[cursor-async] Background fetch complete: {} entries",
+                    entries.len()
+                );
+                parser_arc.store_cursor_remote(entries, since);
+                parser_arc.clear_payload_cache();
+                // Drop persisted cursor/all payloads so the refresh
+                // recomputes with the freshly-fetched remote data
+                // instead of re-serving a stale or empty disk entry.
+                if let Some(ref disk_cache) = *disk_cache_arc.read().await {
+                    disk_cache.clear_prefix("usage-view:");
+                }
+                let _ = app_handle.emit("data-updated", 0u64);
+            }
+            Ok(Ok(None)) => {
+                tracing::info!("[cursor-async] No cursor auth configured");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("[cursor-async] Cursor remote fetch failed: {e}");
+                let _ = app_handle.emit("data-updated", 0u64);
+            }
+            Err(e) => {
+                tracing::warn!("[cursor-async] Cursor remote task panicked: {e}");
+            }
+        }
+        inflight.store(false, Ordering::SeqCst);
+        let state = app_handle.state::<AppState>();
+        // Refresh title only — do not call sync_tray_title here or a failed
+        // fetch would immediately re-enter ensure → spawn in a tight loop.
+        super::tray::refresh_tray_title_after_cursor_fetch(&app_handle, &state).await;
+    });
+}
 
 /// Ensure every day in [start, end) has a chart bucket, inserting empty buckets
 /// for days with no data.  This prevents the chart from appearing "cut off" when
@@ -683,44 +745,7 @@ pub(crate) async fn get_usage_data_inner(
     // Spawn background Cursor remote fetch if needed.
     if needs_cursor_remote {
         if let Some(app_ref) = app {
-            let app_handle = app_ref.clone();
-            let parser_arc = Arc::clone(&state.parser);
-            let disk_cache_arc = Arc::clone(&state.payload_disk_cache);
-            let since = cursor_since;
-            tokio::spawn(async move {
-                tracing::info!("[cursor-async] Starting background Cursor remote fetch");
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::usage::cursor_parser::fetch_cursor_remote_entries(since)
-                })
-                .await;
-                match result {
-                    Ok(Ok(Some(entries))) => {
-                        tracing::info!(
-                            "[cursor-async] Background fetch complete: {} entries",
-                            entries.len()
-                        );
-                        parser_arc.store_cursor_remote(entries, since);
-                        parser_arc.clear_payload_cache();
-                        // Drop persisted cursor/all payloads so the refresh
-                        // recomputes with the freshly-fetched remote data
-                        // instead of re-serving a stale or empty disk entry.
-                        if let Some(ref disk_cache) = *disk_cache_arc.read().await {
-                            disk_cache.clear_prefix("usage-view:");
-                        }
-                        let _ = app_handle.emit("data-updated", 0u64);
-                    }
-                    Ok(Ok(None)) => {
-                        tracing::info!("[cursor-async] No cursor auth configured");
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("[cursor-async] Cursor remote fetch failed: {e}");
-                        let _ = app_handle.emit("data-updated", 0u64);
-                    }
-                    Err(e) => {
-                        tracing::warn!("[cursor-async] Cursor remote task panicked: {e}");
-                    }
-                }
-            });
+            spawn_cursor_remote_fetch_if_needed(app_ref, state, cursor_since);
         }
     }
 
