@@ -1,6 +1,7 @@
 use crate::models::{ExtraUsageInfo, ProviderRateLimits, RateLimitWindow};
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use serde::Deserialize;
+use serde_json::Value;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -435,23 +436,21 @@ fn invalidate_oauth_credentials_after_unauthorized() {
 
 // ── Claude API response types ──
 
-#[derive(Deserialize)]
-pub(crate) struct ClaudeUsageResponse {
-    pub five_hour: Option<ClaudeWindowData>,
-    pub seven_day: Option<ClaudeWindowData>,
-    pub seven_day_sonnet: Option<ClaudeWindowData>,
-    pub seven_day_opus: Option<ClaudeWindowData>,
-    pub seven_day_oauth_apps: Option<ClaudeWindowData>,
-    pub seven_day_cowork: Option<ClaudeWindowData>,
-    pub iguana_necktie: Option<ClaudeWindowData>,
-    pub extra_usage: Option<ClaudeExtraUsageData>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct ClaudeWindowData {
-    pub utilization: f64,
-    pub resets_at: Option<String>,
-}
+/// Known Claude usage windows, in dashboard display order.
+///
+/// Anthropic's OAuth usage payload and Claude Code's statusline `rate_limits`
+/// object share these keys. Missing keys are omitted; any additional object
+/// with a numeric `utilization` / `used_percentage` becomes a new bar via
+/// [`claude_usage_windows`] / statusline extraction.
+const KNOWN_CLAUDE_WINDOWS: &[(&str, &str)] = &[
+    // (apiField, label)
+    ("five_hour", "Session (5hr)"),
+    ("seven_day", "Weekly (7 day)"),
+    ("seven_day_sonnet", "Weekly Sonnet"),
+    ("seven_day_opus", "Weekly Opus"),
+    ("seven_day_oauth_apps", "Weekly OAuth Apps"),
+    ("seven_day_cowork", "Weekly Cowork"),
+];
 
 #[derive(Deserialize)]
 pub(crate) struct ClaudeExtraUsageData {
@@ -459,6 +458,112 @@ pub(crate) struct ClaudeExtraUsageData {
     pub monthly_limit: f64,
     pub used_credits: f64,
     pub utilization: Option<f64>,
+}
+
+/// Display label for a Claude window id. Known ids get Anthropic-aligned
+/// names; unknown ids are humanized from the field name so new pools surface
+/// without a TokenMonitor release for *structure* changes.
+pub(super) fn claude_window_label(window_id: &str) -> String {
+    KNOWN_CLAUDE_WINDOWS
+        .iter()
+        .find(|(id, _)| *id == window_id)
+        .map(|(_, label)| (*label).to_string())
+        .unwrap_or_else(|| humanize_snake_case(window_id))
+}
+
+fn humanize_snake_case(field: &str) -> String {
+    field
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut out = first.to_uppercase().collect::<String>();
+                    out.push_str(&chars.as_str().to_lowercase());
+                    out
+                }
+                None => part.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn claude_window_from_value(value: &Value) -> Option<(f64, Option<String>)> {
+    // OAuth usage uses `utilization`; statusline uses `used_percentage`.
+    let utilization = value
+        .get("utilization")
+        .and_then(as_f64)
+        .or_else(|| value.get("used_percentage").and_then(as_f64))?;
+    let resets_at = value.get("resets_at").and_then(|v| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => n
+            .as_i64()
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+            .map(|dt| dt.to_rfc3339()),
+        _ => None,
+    });
+    Some((utilization, resets_at))
+}
+
+/// Build rate-limit windows from whatever meters Claude/Anthropic returns.
+///
+/// Known fields keep stable display names; unknown window objects become
+/// additional bars so count changes track the API without a release.
+pub(super) fn claude_usage_windows(usage: &Value) -> Vec<RateLimitWindow> {
+    let Some(obj) = usage.as_object() else {
+        return Vec::new();
+    };
+
+    let mut windows = Vec::new();
+    let mut consumed = std::collections::HashSet::new();
+    consumed.insert("extra_usage");
+
+    for (api_field, _) in KNOWN_CLAUDE_WINDOWS {
+        consumed.insert(*api_field);
+        let Some(value) = obj.get(*api_field) else {
+            continue;
+        };
+        let Some((utilization, resets_at)) = claude_window_from_value(value) else {
+            continue;
+        };
+        windows.push(RateLimitWindow::new(
+            (*api_field).to_string(),
+            claude_window_label(api_field),
+            utilization,
+            resets_at,
+        ));
+    }
+
+    let mut extras: Vec<(&String, f64, Option<String>)> = obj
+        .iter()
+        .filter(|(key, _)| !consumed.contains(key.as_str()))
+        .filter_map(|(key, value)| {
+            let (utilization, resets_at) = claude_window_from_value(value)?;
+            Some((key, utilization, resets_at))
+        })
+        .collect();
+    extras.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (field, utilization, resets_at) in extras {
+        windows.push(RateLimitWindow::new(
+            field.clone(),
+            claude_window_label(field),
+            utilization,
+            resets_at,
+        ));
+    }
+
+    windows
 }
 
 pub(crate) fn normalize_claude_extra_usage(extra_usage: ClaudeExtraUsageData) -> ExtraUsageInfo {
@@ -672,7 +777,7 @@ async fn try_fetch_claude_rate_limits() -> FetchAttempt {
             FetchAttempt::Other(err)
         };
     }
-    let usage: ClaudeUsageResponse = match usage_resp.json().await {
+    let usage: Value = match usage_resp.json().await {
         Ok(u) => u,
         Err(e) => {
             return FetchAttempt::Other(RateLimitFetchError::message(format!(
@@ -691,34 +796,12 @@ async fn try_fetch_claude_rate_limits() -> FetchAttempt {
         _ => None,
     };
 
-    // Build windows from non-null entries
-    let mut windows = Vec::new();
-    let window_specs: &[(&str, &str, &Option<ClaudeWindowData>)] = &[
-        ("five_hour", "Session (5hr)", &usage.five_hour),
-        ("seven_day", "Weekly (7 day)", &usage.seven_day),
-        ("seven_day_sonnet", "Weekly Sonnet", &usage.seven_day_sonnet),
-        ("seven_day_opus", "Weekly Opus", &usage.seven_day_opus),
-        (
-            "seven_day_oauth_apps",
-            "Weekly OAuth Apps",
-            &usage.seven_day_oauth_apps,
-        ),
-        ("seven_day_cowork", "Weekly Cowork", &usage.seven_day_cowork),
-        ("iguana_necktie", "Iguana Necktie", &usage.iguana_necktie),
-    ];
-
-    for (id, label, data) in window_specs {
-        if let Some(w) = data {
-            windows.push(RateLimitWindow::new(
-                id.to_string(),
-                label.to_string(),
-                w.utilization,
-                w.resets_at.clone(),
-            ));
-        }
-    }
-
-    let extra_usage = usage.extra_usage.map(normalize_claude_extra_usage);
+    let windows = claude_usage_windows(&usage);
+    let extra_usage = usage
+        .get("extra_usage")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<ClaudeExtraUsageData>(v).ok())
+        .map(normalize_claude_extra_usage);
 
     tracing::debug!(
         windows_count = windows.len(),
@@ -868,6 +951,40 @@ mod tests {
         assert_eq!(extra_usage.monthly_limit, 50.0);
         assert_eq!(extra_usage.used_credits, 7.1);
         assert_eq!(extra_usage.utilization, Some(14.2));
+    }
+
+    #[test]
+    fn builds_windows_from_oauth_usage_payload() {
+        let usage = serde_json::json!({
+            "five_hour": { "utilization": 12.5, "resets_at": "2026-07-16T20:00:00Z" },
+            "seven_day": { "utilization": 40.0, "resets_at": "2026-07-20T00:00:00Z" },
+            "extra_usage": {
+                "is_enabled": true,
+                "monthly_limit": 5000.0,
+                "used_credits": 100.0,
+                "utilization": 2.0
+            }
+        });
+        let windows = claude_usage_windows(&usage);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].window_id, "five_hour");
+        assert_eq!(windows[0].label, "Session (5hr)");
+        assert_eq!(windows[1].window_id, "seven_day");
+        assert_eq!(windows[1].label, "Weekly (7 day)");
+    }
+
+    #[test]
+    fn omits_missing_claude_meters_and_surfaces_unknown_ones() {
+        let usage = serde_json::json!({
+            "seven_day": { "utilization": 10.0 },
+            "bonus_pool": { "utilization": 3.0, "resets_at": "2026-07-20T00:00:00Z" }
+        });
+        let windows = claude_usage_windows(&usage);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].window_id, "seven_day");
+        assert_eq!(windows[1].window_id, "bonus_pool");
+        assert_eq!(windows[1].label, "Bonus Pool");
+        assert_eq!(windows[1].utilization, 3.0);
     }
 
     #[test]
