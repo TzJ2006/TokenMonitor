@@ -356,13 +356,14 @@
 
 html, body {
   width: 100%;
-  /* Fill the window vertically so the app surface (#app, min-height:100%)
+  /* Fill the window vertically so the app surface (#app)
      always paints down to the window's bottom edge. The window can legitimately
      be taller than its content — e.g. while a shrink is deferred until the
      pointer leaves the popover — and without a definite height here that extra
      space was a transparent strip that showed the desktop through as an empty
-     gap below the card. Content height is still measured from .pop-content's
-     scrollHeight, so this does not affect window-to-content sizing. */
+     gap below the card. Content height is measured from .pop-content's
+     scrollHeight plus the fixed footer, so this does not affect
+     window-to-content sizing. */
   height: 100%;
   background: transparent;
 }
@@ -375,11 +376,15 @@ html {
 }
 
 /* Paint the single app surface on the root container so the transparent
-   native window and the web content stay visually unified. */
+   native window and the web content stay visually unified. height:100% keeps
+   the flex chrome (scroll body + fixed footer) pinned to the window even when
+   the OS height briefly lags content measurement. */
 #app {
   width: 100%;
-  height: auto;
+  height: 100%;
   min-height: 100%;
+  display: flex;
+  flex-direction: column;
   background: var(--surface);
   background-image: linear-gradient(var(--provider-bg), var(--provider-bg));
   border-radius: 14px;

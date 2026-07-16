@@ -73,9 +73,11 @@ function installRafStub() {
 function createTestOrchestrator(options?: {
   invoke?: (cmd: string, args: Record<string, unknown>) => Promise<void>;
   popEl?: HTMLDivElement | null;
+  footerEl?: HTMLElement | null;
 }) {
   return createResizeOrchestrator({
     getPopEl: () => options?.popEl ?? null,
+    getFooterEl: () => options?.footerEl ?? null,
     invoke: options?.invoke ?? (() => Promise.resolve()),
     onScrollLockChange: () => {},
     currentMonitor: async () => null,
@@ -275,6 +277,29 @@ describe("createResizeOrchestrator", () => {
     }
 
     expect(invoke).toHaveBeenCalledTimes(3);
+    orchestrator.destroy();
+  });
+
+  it("includes fixed footer chrome in the measured window height", async () => {
+    installWindowStub(320);
+    installRafStub();
+    const popEl = createPopEl(400);
+    const footerEl = { offsetHeight: 44 } as HTMLElement;
+    const invoke = vi.fn(() => Promise.resolve());
+    const orchestrator = createTestOrchestrator({
+      invoke,
+      popEl: popEl.element,
+      footerEl,
+    });
+
+    orchestrator.syncSizeAndVerify("with-footer");
+    await flushMicrotasks();
+
+    expect(invoke).toHaveBeenCalledWith("set_window_size_and_align", {
+      width: WINDOW_WIDTH,
+      height: 444,
+    });
+
     orchestrator.destroy();
   });
 });
