@@ -1,5 +1,5 @@
 #[cfg_attr(not(test), allow(dead_code))]
-pub const PRICING_VERSION: &str = "2026-06-17";
+pub const PRICING_VERSION: &str = "2026-07-14";
 
 use crate::models::{detect_model_family, ModelFamily};
 use crate::usage::litellm::DynamicModelRates;
@@ -198,6 +198,28 @@ fn get_rates_for_key(model: &str) -> Option<ModelRates> {
     // Claude models: handled entirely by get_fallback_rates() using family-level
     // detection (opus/sonnet/haiku). LiteLLM dynamic pricing above provides
     // per-version accuracy; the family fallback uses latest known rates.
+
+    // ── Grok 4.5 (Cursor / xAI) ───────────────────────────────────────────────
+    // Cursor docs: standard $2/$6, Fast $4/$18. Cache read = 25% of input.
+    // Fuzzy match covers Cursor slug variants (cursor-grok-4.5-high-fast, etc.).
+    if model.contains("grok-4.5") {
+        if model.contains("fast") {
+            return Some(ModelRates {
+                input: 4.0,
+                output: 18.0,
+                cache_write_5m: 5.0,
+                cache_write_1h: 5.0,
+                cache_read: 1.0,
+            });
+        }
+        return Some(ModelRates {
+            input: 2.0,
+            output: 6.0,
+            cache_write_5m: 2.5,
+            cache_write_1h: 2.5,
+            cache_read: 0.5,
+        });
+    }
 
     // ── OpenAI / Codex models ────────────────────────────────────────────────
 
@@ -534,6 +556,22 @@ mod tests {
     }
 
     #[test]
+    fn grok_4_5_standard_pricing() {
+        assert!(pricing_available_for_key("grok-4.5"));
+        assert!(approx_eq(cost("grok-4.5", M, M), 8.0));
+        assert!(approx_eq(cost("cursor-grok-4.5-high", M, M), 8.0));
+    }
+
+    #[test]
+    fn grok_4_5_fast_pricing() {
+        // Fast: $4/$18 → $22 per 1M in + 1M out
+        assert!(pricing_available_for_key("cursor-grok-4.5-high-fast"));
+        assert!(approx_eq(cost("cursor-grok-4.5-high-fast", M, M), 22.0));
+        assert!(approx_eq(cost("grok-4.5-fast", M, M), 22.0));
+        assert!(approx_eq(cost("grok-4.5-fast-xhigh", M, M), 22.0));
+    }
+
+    #[test]
     fn unsupported_family_defaults_to_zero_until_priced() {
         assert!(approx_eq(cost("totally-unknown-model", M, M), 0.00));
         assert!(!pricing_available_for_key("totally-unknown-model"));
@@ -549,7 +587,7 @@ mod tests {
 
     #[test]
     fn pricing_version_is_set() {
-        assert_eq!(PRICING_VERSION, "2026-06-17");
+        assert_eq!(PRICING_VERSION, "2026-07-14");
     }
 
     #[test]
