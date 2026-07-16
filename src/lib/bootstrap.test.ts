@@ -171,6 +171,31 @@ describe("initializeRuntimeFromSettings", () => {
     expect(invokeFn).toHaveBeenCalledWith("set_usage_access_enabled", { enabled: false });
   });
 
+  it("enables usage access before the first tray config sync", async () => {
+    const invokeOrder: string[] = [];
+    const invokeFn = vi.fn().mockImplementation(async (cmd: string) => {
+      invokeOrder.push(cmd);
+    });
+    const applyGlassFn = vi.fn();
+    const applyThemeFn = vi.fn();
+    const syncNativeWindowThemeFn = vi.fn().mockResolvedValue(undefined);
+    const syncNativeWindowSurfaceFn = vi.fn().mockResolvedValue(undefined);
+
+    await initializeRuntimeFromSettings(makeSettings(), {
+      invokeFn,
+      applyThemeFn,
+      applyGlassFn,
+      syncNativeWindowThemeFn,
+      syncNativeWindowSurfaceFn,
+    });
+
+    const accessIdx = invokeOrder.indexOf("set_usage_access_enabled");
+    const trayIdx = invokeOrder.indexOf("set_tray_config");
+    expect(accessIdx).toBeGreaterThanOrEqual(0);
+    expect(trayIdx).toBeGreaterThanOrEqual(0);
+    expect(accessIdx).toBeLessThan(trayIdx);
+  });
+
   it("forwards stored Cursor auth config on startup", async () => {
     const invokeFn = vi.fn().mockResolvedValue(undefined);
     const applyGlassFn = vi.fn();

@@ -1038,6 +1038,7 @@
 
   .collapsible-toggle {
     width: 100%;
+    text-align: left;
     background: none;
     border: none;
     cursor: pointer;
@@ -1197,13 +1198,13 @@
   }
 
   .currency-select {
-    flex: 0 1 150px;
-    min-width: 0;
-    max-width: 150px;
+    width: fit-content;
+    max-width: 100%;
+    field-sizing: content;
     background: var(--surface-hover);
     border: 1px solid var(--border);
     border-radius: 5px;
-    padding: 3px 6px;
+    padding: 2px 5px;
     font: 400 9px/1 'Inter', sans-serif;
     color: var(--t1);
     cursor: pointer;
@@ -1270,9 +1271,9 @@
     text-overflow: ellipsis;
   }
   .channel-select {
-    flex: 0 1 150px;
-    min-width: 0;
-    max-width: 150px;
+    width: fit-content;
+    max-width: 100%;
+    field-sizing: content;
     padding: 2px 6px;
     border: 1px solid var(--border-subtle);
     border-radius: 4px;

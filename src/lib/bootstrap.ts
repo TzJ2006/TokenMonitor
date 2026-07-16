@@ -119,14 +119,17 @@ export async function initializeRuntimeFromSettings(
     ]);
   }
 
+  // Enable usage access before the first tray cost sync so the menu bar does
+  // not flash `$0` while access is still gated off.
+  // Parser runs only when both gates are true: the user has finished
+  // onboarding (`hasSeenWelcome`) AND the user-controlled toggle in
+  // Settings → Privacy & Permissions (`usageAccessEnabled`) is on.
+  await invokeFn("set_usage_access_enabled", {
+    enabled: saved.hasSeenWelcome && saved.usageAccessEnabled,
+  }).catch(() => {});
+
   const calls: Promise<unknown>[] = [
     invokeFn("set_refresh_interval", { interval: saved.refreshInterval }),
-    // Parser runs only when both gates are true: the user has finished
-    // onboarding (`hasSeenWelcome`) AND the user-controlled toggle in
-    // Settings → Privacy & Permissions (`usageAccessEnabled`) is on.
-    invokeFn("set_usage_access_enabled", {
-      enabled: saved.hasSeenWelcome && saved.usageAccessEnabled,
-    }),
     invokeFn("set_rate_limits_enabled", { enabled: saved.rateLimitsEnabled }),
     invokeFn("set_auto_export_config", {
       enabled: saved.autoExportEnabled,

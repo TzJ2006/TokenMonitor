@@ -136,6 +136,10 @@ fn resize_window_pos_flags() -> windows::Win32::UI::WindowsAndMessaging::SET_WIN
     SWP_NOZORDER | SWP_NOACTIVATE
 }
 
+fn clamp_window_height_to_work_area(work: RECT, height: i32) -> i32 {
+    height.min(work.bottom - work.top)
+}
+
 /// Position the window near the system tray area.
 ///
 /// Uses Win32 APIs to find the `TrayNotifyWnd` inside `Shell_TrayWnd`, then
@@ -285,7 +289,7 @@ pub fn set_size_and_align(window: &WebviewWindow, physical_width: u32, physical_
     }
 
     let win_w = physical_width as i32;
-    let win_h = physical_height as i32;
+    let win_h = clamp_window_height_to_work_area(work, physical_height as i32);
 
     let anchor = current_anchor();
     let (target_x, clamped_y) = anchored_resize_origin(work, win_rect, win_w, win_h, anchor);
@@ -482,5 +486,6 @@ mod tests {
             anchored_resize_origin(work, current, 340, 1200, AnchorCorner::BottomRight);
 
         assert_eq!(target_y, 0);
+        assert_eq!(clamp_window_height_to_work_area(work, 1200), 900);
     }
 }
