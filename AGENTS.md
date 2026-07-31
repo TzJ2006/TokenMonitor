@@ -1,37 +1,87 @@
-# Repository Guidelines
+# TokenMonitor — Agent Guide
 
-## Project Structure & Module Organization
+Local-first, cross-platform (macOS/Windows/Linux) system-tray app that monitors Claude Code, Codex CLI, and
+Cursor token usage. Stack: Tauri v2 + Svelte 5 frontend (`src/`), Rust backend (`src-tauri/`). It parses JSONL
+session logs from disk, prices them in Rust, and shows spend + rate limits in a tray popover and an optional
+FloatBall overlay. Entry points: `src/main.ts` (main window), `src/float-ball.ts` (FloatBall, separate Vite
+entry), `src-tauri/src/main.rs` → `lib.rs` (backend). There is no root README; `docs/DEVELOPMENT.md` is the
+maintained dev guide. Current version: 0.14.x.
 
-`src/` contains the Svelte 5 frontend. `App.svelte` is the main shell, `lib/components/` holds UI components, `lib/stores/` manages app state and IPC-backed data loading, `lib/permissions/` handles privacy and Claude statusline setup, and `lib/utils/`, `lib/window/`, `lib/tray/`, and `lib/views/` contain focused helpers. Frontend tests live beside the code as `*.test.ts`.
+## Commands
 
-`src-tauri/` contains the Rust backend. `src/lib.rs` wires the app, `src/commands/` exposes Tauri commands, and modules such as `usage/`, `stats/`, `statusline/`, `tray/`, `platform/`, `rate_limits/`, `secrets/`, and `updater/` hold domain logic. `paths.rs` is the central filesystem path registry. Use `docs/` for maintained guides and release notes, `build/` for packaging scripts, and `scripts/` for release/setup helpers.
+- `npm ci` — install frontend deps from the lockfile
+- `npx tauri dev` — full app (hot-reload frontend + debug Rust backend); runs until killed
+- `npm run dev` — Vite frontend only at http://localhost:1420 (no native IPC); runs until killed
+- `npm test` — Vitest, one-shot (`src/**/*.test.ts`, `build/**/*.test.mjs`, `tests/**/*.test.mjs`)
+- `npx vitest run src/lib/stores/usage.test.ts` — single frontend test file
+- `npm run test:watch` — Vitest watch mode (never exits); `npm run test:coverage` — V8 coverage into `coverage/`
+- `npm run test:rust` — `cd src-tauri && cargo test` (see Gotchas for Windows)
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib test_name` — single Rust test
+- `npm run test:all` — Rust then frontend tests
+- CI parity: `npx svelte-check`, `cargo fmt --manifest-path src-tauri/Cargo.toml --check`,
+  `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`
+- `npm run build` — frontend into `dist/`; `npx tauri build` — production desktop bundles
+- `npm run build:installers -- --platform current` — build + collect installers under `outputs/<platform>/`
+- `npm run release -- X.Y.Z` — bump versions, commit, tag, push (must be on up-to-date `main`; the tag push
+  triggers the release workflow — do not run casually)
 
-## Build, Test, and Development Commands
+## Architecture
 
-- `npm ci`: install frontend dependencies from `package-lock.json`.
-- `npx tauri dev`: run the desktop app with the Svelte frontend and Rust backend together.
-- `npm run dev`: run the Vite frontend only.
-- `npm run build`: build the frontend into `dist/`.
-- `npx tauri build`: create production desktop bundles (macOS DMG, Windows NSIS, Linux .deb/.AppImage).
-- `npm test`: run Vitest.
-- `npm run test:rust`: run Rust backend tests.
-- `npm run test:coverage`: generate V8 coverage in `coverage/`.
-- `npm run test:all`: run Rust and TypeScript tests together.
-- `npm run release -- X.Y.Z`: bump the four version-bearing files, commit, tag, and push.
-- `npx svelte-check`, `cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`: match the main validation checks.
+```
+src/                     Svelte 5 frontend
+  App.svelte               main popover shell
+  lib/bootstrap.ts         startup entry (settings → stores → native IPC, deps injected for testability)
+  lib/providerMetadata.ts  single source of truth for provider UI behavior (tabs, labels, colors, plans)
+  lib/components/          UI components; settings/ and float-ball/ own feature files
+  lib/stores/              usage / rateLimits / settings / updater state + IPC calls
+  lib/permissions/         privacy disclosures and Claude statusline setup
+  lib/tray/  lib/views/    tray title/sync formatting; view-model calculations
+  lib/window/              appearance, sizing, resizeOrchestrator (content-height → window-resize IPC loop)
+  lib/types/               shared payload types mirroring Rust structs
+src-tauri/src/           Rust backend
+  commands/                Tauri IPC dispatch, split by domain (usage_query, calendar, tray, ssh, statusline…)
+  usage/                   parsers (claude/codex/cursor), pricing, caches, archive, SSH remote sync
+  rate_limits/             claude (OAuth/statusline), codex, codex_cli, cursor
+  statusline/              installs a shell/PowerShell statusline script into Claude Code; reads its JSONL events
+  stats/  secrets/         change/subagent aggregation; keyring-backed credential access
+  single_instance/         process ownership + focus protocol
+  tray/  platform/         RGBA tray icon rendering in pure Rust; OS-specific window behavior
+  updater/  paths.rs       update scheduling/state; central registry of every filesystem path the app reads
+build/                   installer build code (index.mjs) + per-platform tauri config overlays
+scripts/                 release.sh, sync-tauri-versions.mjs
+tests/                   cross-layer repository invariant tests (*.test.mjs)
+docs/                    DEVELOPMENT.md, CHANGELOG.md, testing/ procedures
+```
 
-## Coding Style & Naming Conventions
+Data flow: local JSONL logs → Rust parsers + pricing → in-memory/disk caches → Tauri IPC → Svelte stores → UI.
+Claude rate limits prefer fresh statusline events; OAuth/API and other sources are fallbacks. Completed hours
+are persisted to the usage archive so history survives log deletion. Models missing from the static pricing
+table (`usage/pricing.rs`, bump `PRICING_VERSION` when editing) resolve via LiteLLM/OpenRouter with 24h TTL.
 
-Use 2-space indentation in TypeScript and Svelte, 4 spaces in Rust, double quotes in TS, and semicolons enabled. Name Svelte components in PascalCase, such as `Settings.svelte`; TS modules in camelCase, such as `providerMetadata.ts`; and Rust modules in snake_case. Keep shared frontend payload types under `src/lib/types/`.
+Platform notes (verified in code): tray cost text uses `set_title()` beside the icon on macOS; on
+Windows/Linux `set_title` is a noop and the cost goes in the tooltip (`commands/tray.rs`). Glass effect =
+NSVisualEffectView hudWindow on macOS, Mica (Win11)/Acrylic (Win10), noop on Linux (`lib/window/appearance.ts`).
 
-## Testing Guidelines
+## Conventions
 
-Use Vitest for frontend/unit tests and inline `#[cfg(test)]` modules for Rust. Add targeted tests when changing parsing, pricing, rate-limit logic, store behavior, provider merges, updater logic, statusline setup, or secret management. Keep test files colocated with source and named `*.test.ts`; use `tests/` only for cross-layer repository checks.
+- TypeScript/Svelte: 2-space indent, double quotes, semicolons. Rust: rustfmt defaults (4-space).
+- Naming: `PascalCase.svelte` components, `camelCase.ts` modules, `snake_case.rs` modules.
+- Tests are colocated: `*.test.ts` beside frontend source, inline `#[cfg(test)]` modules in Rust; `tests/` is
+  only for cross-layer checks.
+- Every filesystem location the app reads must be registered in `src-tauri/src/paths.rs`.
+- Shared frontend payload types live in `src/lib/types/`.
+- Commits: short imperative subject with type prefix — `feat:`, `fix:`, `docs:`, `test(scope):`, `chore(release):`.
 
-## Commit & Pull Request Guidelines
+## Gotchas
 
-Prefer short, imperative commit subjects. Recent history favors prefixes like `feat:`, `docs:`, `test(scope):`, and `chore(release):`. Pull requests should describe the problem and fix, list validation commands run, link related issues, and include screenshots or GIFs for UI changes.
-
-## Configuration & Safety Notes
-
-This app is local-first and reads logs from paths like `~/.claude/projects/**`, `~/.codex/sessions/**`, Cursor workspace storage, and `~/.tokenmonitor/statusline/`. All filesystem paths the app reads are registered in `src-tauri/src/paths.rs`. Prefer config-aware paths over hardcoded user directories. Do not commit generated outputs such as `dist/`, `coverage/`, `outputs/`, `src-tauri/target/`, `src-tauri/gen/`, or signing artifacts.
+- Windows Rust tests: plain `cargo test` builds a test binary without the Common-Controls v6 manifest and it
+  fails to load (0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND). Use
+  `TM_EMBED_TEST_MANIFEST=1 cargo test --lib` from `src-tauri/` instead (see `src-tauri/build.rs` and
+  `.github/workflows/ci.yml`); this is what `npm run test:rust` cannot do for you on Windows.
+- `npm run tauri …` triggers the `pretauri` hook (`scripts/sync-tauri-versions.mjs`), which may run
+  `npm install` to realign `@tauri-apps/api` with the tauri crate minor version; `npx tauri …` skips it.
+- Version must stay in sync across four files: `package.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`
+  (token-monitor entry), `src-tauri/tauri.conf.json`. Always use `npm run release -- X.Y.Z`.
+- Merging to `main` does NOT release; the release workflow is tag-triggered (`v*.*.*`).
+- Quit any running TokenMonitor from the tray before restarting `tauri dev` — it is single-instance.
+- `CLAUDE.md` and `.claude/` are gitignored (local-only); `signing/`, `outputs/`, `coverage/` too.
