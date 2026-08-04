@@ -240,8 +240,11 @@ fn usage_access_enabled(state: &AppState) -> bool {
 }
 
 /// Decide which daily cost the tray should show, and what to remember next.
-/// When Cursor remote data is pending/expired and the cold recompute is `$0`,
-/// keep the previous non-zero cost so the menu bar does not flash zero.
+///
+/// While a Cursor remote refetch is needed, never paint an undercount: keep the
+/// previous non-zero cost when the cold recompute is lower (full `$0` *or* a
+/// partial drop after Cursor falls out of the sum). Also avoid poisoning `last`
+/// with a pending zero/undercount.
 fn resolve_tray_daily_cost_display(
     usage_access: bool,
     computed: f64,
@@ -251,13 +254,15 @@ fn resolve_tray_daily_cost_display(
     if !usage_access {
         return (0.0, None);
     }
-    if computed <= 0.0 && needs_cursor_remote {
-        if let Some(previous) = last {
-            if previous > 0.0 {
+    if needs_cursor_remote {
+        if let Some(previous) = last.filter(|value| *value > 0.0) {
+            if computed < previous {
                 return (previous, last);
             }
         }
-        return (computed, last);
+        if computed <= 0.0 {
+            return (computed, last);
+        }
     }
     (computed, Some(computed))
 }
@@ -525,6 +530,21 @@ mod tests {
         let (display, next) = resolve_tray_daily_cost_display(true, 0.0, true, Some(12.34));
         assert_eq!(display, 12.34);
         assert_eq!(next, Some(12.34));
+    }
+
+    #[test]
+    fn tray_cost_holdover_keeps_last_on_partial_undercount() {
+        // Claude/Codex still contribute a little after Cursor drops out of the sum.
+        let (display, next) = resolve_tray_daily_cost_display(true, 3.0, true, Some(47.0));
+        assert_eq!(display, 47.0);
+        assert_eq!(next, Some(47.0));
+    }
+
+    #[test]
+    fn tray_cost_holdover_does_not_poison_last_with_pending_zero() {
+        let (display, next) = resolve_tray_daily_cost_display(true, 0.0, true, None);
+        assert_eq!(display, 0.0);
+        assert_eq!(next, None);
     }
 
     #[test]

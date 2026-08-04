@@ -171,7 +171,7 @@ describe("initializeRuntimeFromSettings", () => {
     expect(invokeFn).toHaveBeenCalledWith("set_usage_access_enabled", { enabled: false });
   });
 
-  it("enables usage access before the first tray config sync", async () => {
+  it("enables usage access and Cursor auth before the first tray config sync", async () => {
     const invokeOrder: string[] = [];
     const invokeFn = vi.fn().mockImplementation(async (cmd: string) => {
       invokeOrder.push(cmd);
@@ -190,10 +190,13 @@ describe("initializeRuntimeFromSettings", () => {
     });
 
     const accessIdx = invokeOrder.indexOf("set_usage_access_enabled");
+    const authIdx = invokeOrder.indexOf("set_cursor_auth_config");
     const trayIdx = invokeOrder.indexOf("set_tray_config");
     expect(accessIdx).toBeGreaterThanOrEqual(0);
+    expect(authIdx).toBeGreaterThanOrEqual(0);
     expect(trayIdx).toBeGreaterThanOrEqual(0);
     expect(accessIdx).toBeLessThan(trayIdx);
+    expect(authIdx).toBeLessThan(trayIdx);
   });
 
   it("forwards stored Cursor auth config on startup", async () => {
