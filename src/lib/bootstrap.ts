@@ -119,14 +119,19 @@ export async function initializeRuntimeFromSettings(
     ]);
   }
 
-  // Enable usage access before the first tray cost sync so the menu bar does
-  // not flash `$0` while access is still gated off.
+  // Enable usage access + Cursor auth before the first tray cost sync so the
+  // menu bar does not flash `$0` while access/auth are still gated off.
   // Parser runs only when both gates are true: the user has finished
   // onboarding (`hasSeenWelcome`) AND the user-controlled toggle in
   // Settings → Privacy & Permissions (`usageAccessEnabled`) is on.
-  await invokeFn("set_usage_access_enabled", {
-    enabled: saved.hasSeenWelcome && saved.usageAccessEnabled,
-  }).catch(() => {});
+  await Promise.allSettled([
+    invokeFn("set_usage_access_enabled", {
+      enabled: saved.hasSeenWelcome && saved.usageAccessEnabled,
+    }),
+    invokeFn("set_cursor_auth_config", {
+      apiKey: saved.cursorApiKey,
+    }),
+  ]);
 
   const calls: Promise<unknown>[] = [
     invokeFn("set_refresh_interval", { interval: saved.refreshInterval }),
@@ -138,9 +143,6 @@ export async function initializeRuntimeFromSettings(
     }),
     invokeFn("init_remote_device_include_flags", {
       flags: saved.remoteDeviceIncludes,
-    }),
-    invokeFn("set_cursor_auth_config", {
-      apiKey: saved.cursorApiKey,
     }),
     invokeFn("set_claude_plan_tier", {
       tier: saved.claudePlanTier,
