@@ -749,19 +749,18 @@ impl UsageParser {
     }
 
     /// Non-consuming read of the cursor remote cache for a requested `since`.
-    /// Returns `None` when there is no fresh cache covering the request (the
-    /// caller then triggers a background fetch); otherwise returns the cached
-    /// entries filtered to `timestamp.date_naive() >= since`. Because it does
-    /// not consume the cache, every period view can serve from one fetch.
+    ///
+    /// Returns cached entries even when the TTL has expired (stale-while-revalidate)
+    /// so tray/UI cost does not drop to `$0` during the refresh window. Freshness
+    /// is owned by [`Self::needs_cursor_remote_fetch`], which still triggers a
+    /// background refetch after `CACHE_TTL_SECS`. Returns `None` only when there
+    /// is no cache or the cache does not cover `req_since`.
     pub(crate) fn cursor_remote_for(
         &self,
         req_since: Option<NaiveDate>,
     ) -> Option<Vec<ParsedEntry>> {
         let guard = self.cursor_remote_cache.lock().unwrap();
         let cache = guard.as_ref()?;
-        if cache.stored_at.elapsed().as_secs() >= CACHE_TTL_SECS {
-            return None;
-        }
         if !cursor_range_covers(cache.covered_since, req_since) {
             return None;
         }
@@ -775,6 +774,24 @@ impl UsageParser {
             None => cache.entries.clone(),
         };
         Some(entries)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_cursor_remote_cache_for_test(&self, age: std::time::Duration) {
+        let mut guard = self.cursor_remote_cache.lock().unwrap();
+        if let Some(cache) = guard.as_mut() {
+            if let Some(aged) = Instant::now().checked_sub(age) {
+                cache.stored_at = aged;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_remote_ttl_expired_for_test(&self) -> bool {
+        let guard = self.cursor_remote_cache.lock().unwrap();
+        guard
+            .as_ref()
+            .is_some_and(|cache| cache.stored_at.elapsed().as_secs() >= CACHE_TTL_SECS)
     }
 
     /// Create with default home-directory paths.
@@ -4709,6 +4726,19 @@ mod cursor_remote_cache_tests {
         // A year request wants older data we don't have -> miss (triggers fetch).
         assert!(parser.cursor_remote_for(Some(jan1)).is_none());
         // The narrow request it does cover is still served.
+        assert_eq!(parser.cursor_remote_for(Some(jun1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cursor_remote_for_serves_stale_entries_after_ttl() {
+        let parser = UsageParser::new();
+        let jun1 = date(2026, 6, 1);
+        parser.store_cursor_remote(vec![make_cursor_entry(jun1)], Some(jun1));
+        parser.age_cursor_remote_cache_for_test(std::time::Duration::from_secs(CACHE_TTL_SECS + 1));
+
+        // Stale-while-revalidate: still serve for cost/UI after TTL.
+        // (needs_cursor_remote_fetch also requires auth, so assert TTL aging directly.)
+        assert!(parser.cursor_remote_ttl_expired_for_test());
         assert_eq!(parser.cursor_remote_for(Some(jun1)).unwrap().len(), 1);
     }
 
