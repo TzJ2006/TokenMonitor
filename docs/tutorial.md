@@ -44,7 +44,7 @@ Go to the [latest release page](https://github.com/Michael-OvO/TokenMonitor/rele
 | **Windows** | `.exe` (NSIS) | Run the installer, follow the prompts |
 | **Linux** | `.deb` | `sudo dpkg -i token-monitor_*.deb` |
 
-> **macOS first launch:** Official releases are signed and notarized. If you built the app yourself and Gatekeeper reports that it is damaged, move it to Applications and run `xattr -cr /Applications/TokenMonitor.app` once.
+> **macOS first launch:** All builds are unsigned (no Apple Developer ID certificate), so Gatekeeper may report the app as damaged. Move it to Applications and run `xattr -cr /Applications/TokenMonitor.app` once. In-app auto-updates are unaffected: they are verified with the Tauri updater (minisign) key, which is independent of Apple code signing.
 
 > **Windows first launch:** Windows SmartScreen may show a warning for unsigned builds. Click **More info > Run anyway**.
 
