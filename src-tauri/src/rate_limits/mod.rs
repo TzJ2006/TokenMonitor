@@ -4,11 +4,6 @@ mod codex;
 mod codex_cli;
 mod cursor;
 mod http;
-// Refresh-grant flow uses the owned-mirror keychain item, which is
-// macOS-only. Gating the module avoids dead-code warnings on
-// Linux/Windows where nothing imports it.
-#[cfg(target_os = "macos")]
-mod oauth_refresh;
 
 use crate::models::RateLimitWindow;
 use crate::models::{ProviderRateLimits, RateLimitsPayload};
@@ -102,36 +97,9 @@ use http::{
     provider_rate_limit_error,
 };
 
-/// Trigger the one-time interactive Keychain prompt so the user can grant
-/// "Always Allow" access for TokenMonitor. Only the explicit setup flow
-/// should invoke this — every other Keychain read uses the silent path.
-#[cfg(target_os = "macos")]
-pub fn request_claude_keychain_access() -> Result<(), String> {
-    claude::prime_token_from_keychain_interactive()
-}
-
-/// Returns `true` when a silent token read currently succeeds — either
-/// from our owned mirror item or from Claude Code-credentials' ACL. Used
-/// by the onboarding wizard to detect the already-granted state without
-/// requiring a click. Never opens a UI prompt.
-#[cfg(target_os = "macos")]
-pub fn has_silent_claude_token() -> bool {
-    claude::get_claude_oauth_token().is_ok()
-}
-
-/// Test-only: force a refresh-grant attempt against the owned mirror's
-/// refresh token. Returns a short status string describing the outcome.
-/// Used to exercise the refresh path live without waiting for Anthropic
-/// to rotate the access token naturally.
-#[cfg(target_os = "macos")]
-pub async fn debug_force_refresh() -> String {
-    claude::debug_force_refresh().await
-}
-
-/// Minimum seconds between Claude rate-limit probes.  Both the OAuth API and
-/// the CLI fallback count against the user's rate-limit budget, so we avoid
-/// re-fetching when the cached data is still recent.  The frontend enforces a
-/// matching 5-minute interval via `minFetchIntervalMs`.
+/// Minimum seconds between Claude rate-limit probes. Spans both the CLI probe
+/// (a process spawn) and the OAuth fallback (two requests against the
+/// account's budget), so we skip re-fetching while the cached data is recent.
 const CLAUDE_MIN_REFETCH_SECS: i64 = 300;
 const CODEX_MIN_REFETCH_SECS: i64 = 300;
 
