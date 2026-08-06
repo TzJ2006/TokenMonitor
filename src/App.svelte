@@ -60,11 +60,7 @@
     logResizeDebug,
   } from "./lib/window/uiStability.js";
   import { setupAppEventListeners } from "./lib/appEventListeners.js";
-  import { isMacOS, isWindows } from "./lib/utils/platform.js";
-  import {
-    markClaudeKeychainAccessHandled,
-    requestClaudeKeychainAccessOnce,
-  } from "./lib/permissions/keychain.js";
+  import { isWindows } from "./lib/utils/platform.js";
   import { installStatusline, checkStatusline, type InstalledState } from "./lib/permissions/statusline.js";
 
   import Toggle from "./lib/components/Toggle.svelte";
@@ -82,7 +78,6 @@
   import DevicesView from "./lib/components/DevicesView.svelte";
   import SingleDeviceView from "./lib/components/SingleDeviceView.svelte";
   import UpdateBanner from "./lib/components/UpdateBanner.svelte";
-  import PermissionDisclosure from "./lib/components/PermissionDisclosure.svelte";
   import PermissionsOnboarding from "./lib/components/PermissionsOnboarding.svelte";
   import type { HeaderTabs, UsagePeriod, UsageProvider, RateLimitsPayload } from "./lib/types/index.js";
 
@@ -106,8 +101,7 @@
     error: null as string | null,
     deferredUntil: null as string | null,
   });
-  let showKeychainPermissionPanel = $state(false);
-  let keychainPermissionBusy = $state(false);
+  let rateLimitsEnableBusy = $state(false);
   let statuslineBusy = $state(false);
   let statuslineInstalled = $state<boolean | null>(null);
   let statuslineProbeStatus = $state<InstalledState["status"] | null>(null);
@@ -315,53 +309,23 @@
   }
 
   async function enableRateLimits() {
-    showKeychainPermissionPanel = false;
     await updateSetting("rateLimitsEnabled", true);
     await invoke("set_rate_limits_enabled", { enabled: true });
     // Force the fetch — the cached payload may carry a cooldownUntil from a
-    // previous CLI rejection that the user has just resolved by re-granting,
-    // and the normal eligibility filter would otherwise skip the call.
+    // previous rejection, and the normal eligibility filter would otherwise
+    // skip the very call that is meant to clear it.
     await fetchRateLimits(provider, { force: true });
     await tick();
     syncSizeAndVerify("rate-limits-enabled");
   }
 
   async function handleEnableRateLimits() {
-    if (keychainPermissionBusy) return;
-    keychainPermissionBusy = true;
+    if (rateLimitsEnableBusy) return;
+    rateLimitsEnableBusy = true;
     try {
       await enableRateLimits();
     } finally {
-      keychainPermissionBusy = false;
-    }
-  }
-
-  async function handleShowKeychainFallback() {
-    if (keychainPermissionBusy) return;
-    showKeychainPermissionPanel = true;
-    await tick();
-    syncSizeAndVerify("keychain-permission-open");
-  }
-
-  async function handleAllowKeychainForRateLimits() {
-    if (keychainPermissionBusy) return;
-    keychainPermissionBusy = true;
-    try {
-      await requestClaudeKeychainAccessOnce("rate-limits");
-      await enableRateLimits();
-    } finally {
-      keychainPermissionBusy = false;
-    }
-  }
-
-  async function handleSkipKeychainForRateLimits() {
-    if (keychainPermissionBusy) return;
-    keychainPermissionBusy = true;
-    try {
-      await markClaudeKeychainAccessHandled();
-      await enableRateLimits();
-    } finally {
-      keychainPermissionBusy = false;
+      rateLimitsEnableBusy = false;
     }
   }
 
@@ -916,41 +880,7 @@
           <div class="hr"></div>
 
           {#if period === "5h"}
-            {#if showKeychainPermissionPanel && isMacOS() && !$settings.keychainAccessRequested}
-              <div class="rate-limit-permission" role="dialog" aria-labelledby="rate-limit-permission-title">
-                <div class="rate-limit-empty-title" id="rate-limit-permission-title">
-                  Keychain fallback for live limits
-                </div>
-                <div class="rate-limit-empty-text">
-                  TokenMonitor normally reads Claude live limits from your Claude
-                  credentials file without any macOS prompt. If that file is missing
-                  or unreadable, you can allow a one-time Keychain fallback.
-                </div>
-                <PermissionDisclosure mode="rate-limit" />
-                <div class="rate-limit-empty-text">
-                  macOS may show a Keychain window after you continue. Choose
-                  <strong>Always Allow</strong> if you want future fallback checks to stay silent.
-                </div>
-                <div class="rate-limit-actions">
-                  <button
-                    type="button"
-                    class="rate-limit-secondary"
-                    onclick={handleSkipKeychainForRateLimits}
-                    disabled={keychainPermissionBusy}
-                  >
-                    Do not use Keychain
-                  </button>
-                  <button
-                    type="button"
-                    class="rate-limit-cta"
-                    onclick={handleAllowKeychainForRateLimits}
-                    disabled={keychainPermissionBusy}
-                  >
-                    Allow Keychain access
-                  </button>
-                </div>
-              </div>
-            {:else if $settings.rateLimitsEnabled && visibleUsableRateLimitProviders.length > 0}
+            {#if $settings.rateLimitsEnabled && visibleUsableRateLimitProviders.length > 0}
               {#each visibleUsableRateLimitProviders as rateLimitProvider, index}
                 <UsageBars
                   providerLabel={provider === ALL_USAGE_PROVIDER_ID ? getUsageProviderLabel(rateLimitProvider) : undefined}
@@ -988,13 +918,13 @@
                 <div class="rate-limit-empty-title">Live rate limits are off</div>
                 <div class="rate-limit-empty-text">
                   Turn this on to see live rate-limit percentages.
-                  TokenMonitor uses your Claude credentials file first and does not open Keychain from this button.
+                  TokenMonitor asks Claude Code for them locally — no prompt, no extra API call.
                 </div>
                 <button
                   type="button"
                   class="rate-limit-cta"
                   onclick={handleEnableRateLimits}
-                  disabled={keychainPermissionBusy}
+                  disabled={rateLimitsEnableBusy}
                 >
                   Enable rate limits
                 </button>
@@ -1023,16 +953,6 @@
                     {rateLimitsRequest.error ?? "Unable to load rate limit data right now."}
                   {/if}
                 </div>
-                {#if isMacOS() && !$settings.keychainAccessRequested}
-                  <button
-                    type="button"
-                    class="rate-limit-secondary"
-                    onclick={handleShowKeychainFallback}
-                    disabled={keychainPermissionBusy}
-                  >
-                    Review Keychain fallback
-                  </button>
-                {/if}
               </div>
             {/if}
           {:else if data.total_cost === 0 && data.total_tokens === 0}
