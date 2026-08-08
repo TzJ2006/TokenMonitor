@@ -7,6 +7,7 @@ import {
   formatModelCost,
   formatTokens,
   formatTimeAgo,
+  formatDuration,
   modelColor,
   formatDeviceName,
   deviceIdentityKey,
@@ -152,6 +153,17 @@ describe("formatTimeAgo", () => {
   it("returns hours for >=1h", () => {
     const iso = new Date(Date.now() - 2 * 3_600_000).toISOString();
     expect(formatTimeAgo(iso)).toBe("2h ago");
+  });
+});
+
+describe("formatDuration", () => {
+  it.each([
+    [((2 * 7 + 3) * 24 + 4) * 3_600_000 + 5 * 60_000, "2w 3d 4h"],
+    [18 * 3_600_000, "18h"],
+    [(7 * 24 + 1) * 3_600_000 + 60_000, "1w 1h 1m"],
+    [30_000, "1m"],
+  ])("formats %d ms as %s", (ms, expected) => {
+    expect(formatDuration(ms)).toBe(expected);
   });
 });
 

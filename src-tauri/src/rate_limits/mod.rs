@@ -101,27 +101,28 @@ use http::{
     provider_rate_limit_error,
 };
 
-/// Trigger the one-time interactive Keychain prompt so the user can grant
-/// "Always Allow" access for TokenMonitor. Only the explicit setup flow
-/// should invoke this — every other Keychain read uses the silent path.
+/// Backs the "Allow Keychain access" button. There is no prompt behind it
+/// any more — Claude Code's credentials are read through `/usr/bin/security`,
+/// which is already the item's trusted app — so this just reports whether a
+/// silent read succeeds. Kept so the frontend's granted/denied contract still
+/// resolves.
 #[cfg(target_os = "macos")]
 pub fn request_claude_keychain_access() -> Result<(), String> {
     claude::prime_token_from_keychain_interactive()
 }
 
-/// Returns `true` when a silent token read currently succeeds — either
-/// from our owned mirror item or from Claude Code-credentials' ACL. Used
-/// by the onboarding wizard to detect the already-granted state without
-/// requiring a click. Never opens a UI prompt.
+/// Returns `true` when a silent token read currently succeeds. Used by the
+/// onboarding wizard to detect the already-working state without requiring a
+/// click. Never opens a UI prompt.
 #[cfg(target_os = "macos")]
 pub fn has_silent_claude_token() -> bool {
     claude::get_claude_oauth_token().is_ok()
 }
 
-/// Test-only: force a refresh-grant attempt against the owned mirror's
-/// refresh token. Returns a short status string describing the outcome.
-/// Used to exercise the refresh path live without waiting for Anthropic
-/// to rotate the access token naturally.
+/// Test-only: force a refresh-grant against Claude Code's stored refresh
+/// token. Returns a short status string describing the outcome. Used to
+/// exercise the refresh path live without waiting for Anthropic to rotate
+/// the access token naturally.
 #[cfg(target_os = "macos")]
 pub async fn debug_force_refresh() -> String {
     claude::debug_force_refresh().await
