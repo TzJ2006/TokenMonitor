@@ -75,6 +75,7 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSStatusItem",
     "NSView",
 ] }
+security-framework = "3"
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
 
 [dev-dependencies]

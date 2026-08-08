@@ -4,7 +4,7 @@
     getRateLimitIdleSummary,
     isRateLimitProvider,
   } from "../providerMetadata.js";
-  import { formatRetryIn } from "../utils/format.js";
+  import { formatDuration, formatRetryIn } from "../utils/format.js";
   import {
     currentRateLimitWindows,
     providerHasActiveCooldown,
@@ -94,9 +94,7 @@
     const etaMs = ((100 - w.utilization) * elapsedMs) / w.utilization;
     // Only warn if you'll exhaust before the window resets
     if (etaMs >= remainingMs || etaMs < 300_000) return "";
-    const hours = Math.floor(etaMs / 3_600_000);
-    const mins = Math.floor((etaMs % 3_600_000) / 60_000);
-    return hours > 0 ? `limit in ~${hours}h ${mins}m` : `limit in ~${mins}m`;
+    return `limit in ~${formatDuration(etaMs)}`;
   }
 
   function paceColor(w: RateLimitWindow, windowHours: number): string {
