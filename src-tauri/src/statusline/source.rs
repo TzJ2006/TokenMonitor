@@ -155,6 +155,8 @@ fn extract_rate_limit_windows(payload: &serde_json::Value) -> Vec<NamedStatuslin
         "seven_day",
         "seven_day_sonnet",
         "seven_day_opus",
+        "seven_day_fable",
+        "seven_day_overage_included",
         "seven_day_oauth_apps",
         "seven_day_cowork",
     ];

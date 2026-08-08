@@ -111,216 +111,65 @@ fn update_credentials_with_refresh(
     serde_json::to_string(&parsed).map_err(|e| format!("Failed to serialize updated JSON: {e}"))
 }
 
-/// macOS-only: TokenMonitor's own Keychain item that mirrors the Claude Code
-/// credentials JSON. Created on every successful interactive read in
-/// [`prime_token_from_keychain_interactive`]. The default ACL set by
-/// `set_generic_password` restricts access to the calling code-signing
-/// identity (TokenMonitor), so unlike Claude Code's item this one survives
-/// Claude Code's token rotations — Claude Code never writes here, so its
-/// rotations cannot reset our ACL.
-#[cfg(target_os = "macos")]
-const OWNED_KEYCHAIN_SERVICE: &str = "com.tokenmonitor.app.claude-oauth";
-#[cfg(target_os = "macos")]
-const OWNED_KEYCHAIN_ACCOUNT: &str = "default";
-
-/// Write the full Claude Code credentials JSON into TokenMonitor's owned
-/// Keychain item.
+/// Retired: the Keychain item TokenMonitor used to mirror Claude Code's
+/// credentials into. Kept only so [`purge_legacy_owned_keychain_item`] can
+/// clean it off machines that ran an older build.
 ///
-/// Uses the **legacy** `SecKeychain::set_generic_password` rather than the
-/// unified `passwords::set_generic_password` because the unified API uses
-/// `SecItemAdd`, which (on the macOS file-keychain) creates items with an
-/// **empty trusted-apps list** — so every subsequent silent read fails
-/// with `errSecAuthFailed` even from the same process that wrote it.
-/// `SecKeychainAddGenericPassword` (legacy) registers the calling app's
-/// code-signing identity in the ACL, which is what we need for silent
-/// read-back. Without this, the mirror is effectively write-only.
+/// The mirror is gone because it could not work on this app. Its whole
+/// premise was that `SecKeychainAddGenericPassword` records the *calling
+/// binary's code-signing identity* in the item's ACL, so only TokenMonitor
+/// could read it back. But TokenMonitor ships unsigned — `tauri.conf.json`
+/// declares no `signingIdentity` — so every build is ad-hoc signed with a
+/// cdhash-derived identity that changes on every rebuild *and every release*.
+/// The ACL written by build N therefore rejects build N+1, and the app
+/// auto-updates. Worse, `security_framework`'s `set_generic_password` is a
+/// find-then-modify when the item already exists (decrypt + modify, both ACL
+/// authorizations), so each subsequent write raised the modal "enter your
+/// keychain password" panel — from the background refresh loop, with no user
+/// gesture. Reading Claude Code's item through `/usr/bin/security` instead
+/// (see [`read_raw_credentials_via_security_cli`]) is silent, survives token
+/// rotation, and needs no grant at all, which leaves the mirror with nothing
+/// to contribute.
 #[cfg(target_os = "macos")]
-fn write_credentials_to_owned_keychain(credentials_json: &str) -> Result<(), String> {
-    use security_framework::os::macos::keychain::SecKeychain;
+const LEGACY_OWNED_KEYCHAIN_SERVICE: &str = "com.tokenmonitor.app.claude-oauth";
+#[cfg(target_os = "macos")]
+const LEGACY_OWNED_KEYCHAIN_ACCOUNT: &str = "default";
 
-    let keychain =
-        SecKeychain::default().map_err(|e| format!("Failed to open default keychain: {e}"))?;
-    let result = keychain
-        .set_generic_password(
-            OWNED_KEYCHAIN_SERVICE,
-            OWNED_KEYCHAIN_ACCOUNT,
-            credentials_json.as_bytes(),
-        )
-        .map_err(|e| format!("Failed to write owned Keychain item: {e}"));
-
-    match &result {
-        Ok(()) => tracing::info!(
-            service = OWNED_KEYCHAIN_SERVICE,
-            "Mirrored Claude credentials into owned Keychain item"
-        ),
-        Err(e) => tracing::warn!(error = %e, "Owned Keychain write failed"),
-    }
-    result
-}
-
-/// Read the access token from TokenMonitor's owned Keychain item. Errors when
-/// the item is absent or its payload no longer matches the expected shape.
+/// Remove the retired mirror item, once per process.
 ///
-/// User interaction is disabled for the duration of the read. Without that,
-/// a fresh dev rebuild (different code-signing identity than the one that
-/// wrote the item) would block on a hidden ACL prompt instead of failing
-/// fast — which can hang the async refresh loop because this is a sync call.
-/// On a real ACL miss we'd rather get a fast error and surface a re-grant
-/// banner than wait on UI that may never resolve.
-/// Read the raw credentials JSON from the owned mirror. Returns the full
-/// payload (access + refresh tokens, expiry, scopes, etc.) so the caller
-/// can drive the OAuth refresh flow or write back an updated copy.
-///
-/// Uses the legacy `find_generic_password` to match the legacy write API
-/// — the legacy keychain item we stored has the calling app in its ACL,
-/// so this returns the password without prompting (and without falling
-/// foul of the `errSecAuthFailed` we'd see from the unified API path).
+/// Left in place it is inert — nothing reads it any more — but it is a stale
+/// copy of the user's OAuth credentials sitting in their login keychain, so
+/// we clear it. Uses the unified `SecItemDelete`, which does not consult the
+/// legacy ACL and so cannot raise a panel.
 #[cfg(target_os = "macos")]
-fn read_raw_credentials_from_owned_keychain() -> Result<String, String> {
-    use security_framework::os::macos::keychain::SecKeychain;
-    use security_framework::os::macos::passwords::find_generic_password;
+fn purge_legacy_owned_keychain_item() {
+    use std::sync::Once;
+    static PURGED: Once = Once::new();
 
-    let _ui_lock = SecKeychain::disable_user_interaction()
-        .map_err(|e| format!("Failed to disable Keychain UI for owned read: {e}"))?;
-
-    let (password, _item) =
-        find_generic_password(None, OWNED_KEYCHAIN_SERVICE, OWNED_KEYCHAIN_ACCOUNT).map_err(
-            |e| {
-                // Surface the OSStatus so we can distinguish absent
-                // (`-25300`) from ACL-denied (`-25293`).
-                let detail = format!("{e}");
-                tracing::debug!(error = %detail, "Owned Keychain read failed");
-                format!("Owned Keychain item unavailable: {detail}")
-            },
-        )?;
-
-    let bytes: &[u8] = password.as_ref();
-    String::from_utf8(bytes.to_vec())
-        .map_err(|e| format!("Invalid UTF-8 in owned Keychain item: {e}"))
-}
-
-#[cfg(target_os = "macos")]
-fn read_token_from_owned_keychain() -> Result<String, String> {
-    let raw = read_raw_credentials_from_owned_keychain()?;
-    let token = extract_access_token(&raw)?;
-    tracing::debug!(
-        prefix = &token[..token.len().min(7)],
-        "Owned Keychain read succeeded"
-    );
-    Ok(token)
-}
-
-/// Delete TokenMonitor's owned Keychain item. Called when an API 401 confirms
-/// the cached token is stale; the next read will fall through to the silent
-/// Claude Code Keychain path or surface an auth error to the user.
-#[cfg(target_os = "macos")]
-fn delete_owned_keychain_item() {
-    if let Err(e) = security_framework::passwords::delete_generic_password(
-        OWNED_KEYCHAIN_SERVICE,
-        OWNED_KEYCHAIN_ACCOUNT,
-    ) {
-        // Missing item is the common case — only log other failures.
-        let msg = format!("{e}");
-        if !msg.contains("-25300") && !msg.to_ascii_lowercase().contains("not found") {
-            tracing::debug!(error = %msg, "Failed to delete owned Keychain item");
+    PURGED.call_once(|| {
+        match security_framework::passwords::delete_generic_password(
+            LEGACY_OWNED_KEYCHAIN_SERVICE,
+            LEGACY_OWNED_KEYCHAIN_ACCOUNT,
+        ) {
+            Ok(()) => tracing::info!(
+                service = LEGACY_OWNED_KEYCHAIN_SERVICE,
+                "Removed retired TokenMonitor Keychain mirror"
+            ),
+            Err(e) => {
+                // Absent is the steady state — only log anything else.
+                let msg = format!("{e}");
+                if !msg.contains("-25300") && !msg.to_ascii_lowercase().contains("not found") {
+                    tracing::debug!(error = %msg, "Could not remove retired Keychain mirror");
+                }
+            }
         }
-    }
+    });
 }
 
 /// Service name of the Keychain item Claude Code stores its OAuth
 /// credentials under.
 #[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
-
-/// Upper bound on how long we wait for `/usr/bin/security` to answer.
-///
-/// The read is normally instantaneous. The bound exists because a future
-/// Claude Code build could write the item through a path that leaves
-/// `/usr/bin/security` out of the ACL — then the child would sit on a modal
-/// "Allow / Deny" panel forever and wedge the (synchronous) refresh loop.
-#[cfg(target_os = "macos")]
-const SECURITY_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Run `/usr/bin/security` with `args` and return its trimmed stdout.
-///
-/// Bounded by [`SECURITY_CLI_TIMEOUT`] so an unexpected Keychain panel can
-/// never wedge the caller — every caller here is synchronous.
-#[cfg(target_os = "macos")]
-fn run_security(args: &[&str]) -> Result<String, String> {
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
-
-    let mut child = Command::new("/usr/bin/security")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run /usr/bin/security: {e}"))?;
-
-    // Payloads are a few hundred bytes, far below the pipe buffer, so the
-    // child always exits on its own before we read stdout — polling for exit
-    // first cannot deadlock here.
-    let deadline = Instant::now() + SECURITY_CLI_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "security {} timed out (Keychain prompt?)",
-                        args.first().copied().unwrap_or("")
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Err(e) => return Err(format!("Failed to wait for /usr/bin/security: {e}")),
-        }
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to collect /usr/bin/security output: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!(
-            "security exited with {}: {stderr}",
-            output
-                .status
-                .code()
-                .map_or_else(|| "signal".to_string(), |c| c.to_string())
-        ));
-    }
-
-    Ok(String::from_utf8(output.stdout)
-        .map_err(|e| format!("Invalid UTF-8 from /usr/bin/security: {e}"))?
-        .trim()
-        .to_string())
-}
-
-/// Invoke `security find-generic-password -w` and return the stored password.
-///
-/// `account` maps to `-a`; `None` matches on the service alone.
-#[cfg(target_os = "macos")]
-fn run_security_find_generic_password(
-    service: &str,
-    account: Option<&str>,
-) -> Result<String, String> {
-    let mut args = vec!["find-generic-password"];
-    if let Some(acct) = account {
-        args.extend_from_slice(&["-a", acct]);
-    }
-    args.extend_from_slice(&["-s", service, "-w"]);
-
-    let raw = run_security(&args)?;
-    if raw.is_empty() {
-        return Err("security returned an empty password".to_string());
-    }
-    Ok(raw)
-}
 
 /// Read Claude Code's credentials JSON by shelling out to `/usr/bin/security`.
 ///
@@ -342,12 +191,14 @@ fn run_security_find_generic_password(
 /// name still resolves.
 #[cfg(target_os = "macos")]
 fn read_raw_credentials_via_security_cli() -> Result<String, String> {
+    use crate::platform::macos::keychain::find_generic_password;
+
     let account = std::env::var("USER").ok().filter(|u| !u.trim().is_empty());
 
-    match run_security_find_generic_password(CLAUDE_KEYCHAIN_SERVICE, account.as_deref()) {
+    match find_generic_password(CLAUDE_KEYCHAIN_SERVICE, account.as_deref()) {
         Ok(raw) => Ok(raw),
         Err(with_account) if account.is_some() => {
-            run_security_find_generic_password(CLAUDE_KEYCHAIN_SERVICE, None)
+            find_generic_password(CLAUDE_KEYCHAIN_SERVICE, None)
                 .map_err(|without_account| format!("{with_account}; {without_account}"))
         }
         Err(err) => Err(err),
@@ -387,25 +238,14 @@ fn write_credentials_to_claude_code_keychain(credentials_json: &str) -> Result<(
         .filter(|u| !u.trim().is_empty())
         .ok_or_else(|| "Cannot determine account name for Keychain write".to_string())?;
 
-    run_security(&[
-        "add-generic-password",
-        "-U",
-        "-a",
-        &account,
-        "-s",
+    // `upsert_generic_password` reads the item back before returning Ok, so a
+    // silent no-op write cannot leave Claude Code holding a refresh token
+    // Anthropic has already rotated away.
+    crate::platform::macos::keychain::upsert_generic_password(
         CLAUDE_KEYCHAIN_SERVICE,
-        "-w",
+        &account,
         credentials_json,
-    ])?;
-
-    // Read back before declaring success — a silent no-op write here would
-    // leave Claude Code holding a refresh token Anthropic has already
-    // rotated away.
-    let stored = read_raw_credentials_via_security_cli()
-        .map_err(|e| format!("Wrote credentials but could not read them back: {e}"))?;
-    if stored != credentials_json {
-        return Err("Keychain write did not take effect".to_string());
-    }
+    )?;
 
     tracing::info!("Refreshed Claude credentials written back to Claude Code's Keychain item");
     Ok(())
@@ -432,33 +272,32 @@ fn write_credentials_to_claude_code_keychain(credentials_json: &str) -> Result<(
 ///    UI possible" — macOS only emits that after deciding UI was needed,
 ///    which means the UI-skip flag wasn't consulted.)
 ///
-/// The RAII lock re-enables user interaction on drop, so this function is
-/// a pure silent probe: no process-wide side effect outlives the call.
+/// The UI-suppression flag is process-wide, so the search runs inside
+/// [`with_ui_suppressed`], which also serialises against any other in-process
+/// Keychain read — the crate's RAII guard restores the flag to *allowed* on
+/// drop rather than to its previous value, so two overlapping reads would
+/// otherwise unmask the panel this exists to suppress.
 ///
-/// Claude Code rewrites the credentials item on every OAuth rotation and
-/// resets its ACL / partition list, so any "Always Allow" grant the user
-/// gave TokenMonitor is dropped with the old item. When the fresh item
-/// would prompt, silent denial returns us to the caller, which falls
-/// through to the CLI probe in `rate_limits/mod.rs`. That path shells out
-/// to the `claude` binary itself — Claude Code is trusted for its own
-/// item, so no prompt.
+/// In practice this always fails with `errSecAuthFailed`: TokenMonitor is not
+/// in the item's ACL and cannot be, because Claude Code resets the ACL on
+/// every token rotation and this app's ad-hoc code identity changes on every
+/// build. It is kept only as a last resort in case a future Claude Code build
+/// stores its credentials somewhere `/usr/bin/security` cannot reach.
 #[cfg(target_os = "macos")]
 fn read_token_from_keychain() -> Result<String, String> {
+    use crate::platform::macos::keychain::with_ui_suppressed;
     use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
-    use security_framework::os::macos::keychain::SecKeychain;
 
-    // Held for the duration of the search; drop re-enables interaction.
-    let _ui_lock = SecKeychain::disable_user_interaction()
-        .map_err(|e| format!("Failed to disable Keychain UI: {e}"))?;
-
-    let results = ItemSearchOptions::new()
-        .class(ItemClass::generic_password())
-        .service("Claude Code-credentials")
-        .load_data(true)
-        .limit(1)
-        .skip_authenticated_items(true)
-        .search()
-        .map_err(|e| format!("Claude Code credentials not available in Keychain: {e}"))?;
+    let results = with_ui_suppressed(|| {
+        ItemSearchOptions::new()
+            .class(ItemClass::generic_password())
+            .service(CLAUDE_KEYCHAIN_SERVICE)
+            .load_data(true)
+            .limit(1)
+            .skip_authenticated_items(true)
+            .search()
+            .map_err(|e| format!("Claude Code credentials not available in Keychain: {e}"))
+    })??;
 
     let data = results
         .into_iter()
@@ -472,51 +311,20 @@ fn read_token_from_keychain() -> Result<String, String> {
     extract_access_token(&raw)
 }
 
-/// Interactive Keychain read used by the one-time setup flow.
+/// Backs the "Allow Keychain access" button that the rate-limit empty state
+/// still offers.
 ///
-/// Unlike [`read_token_from_keychain`], this deliberately does **not** set
-/// `skip_authenticated_items(true)`, so macOS will show the user-auth prompt
-/// when needed. This is the only path in the app that allows that prompt to
-/// appear — it's invoked from the explicit "Allow Keychain access" button in
-/// the welcome flow, never from background refreshes.
-///
-/// On success the credentials JSON is also copied into TokenMonitor's owned
-/// Keychain item ([`write_credentials_to_owned_keychain`]) so future
-/// background refreshes can read silently from our own item without depending
-/// on Claude Code's ACL surviving the next token rotation. The in-process
-/// cache is primed too so the very next API call succeeds without any
-/// Keychain round-trip.
+/// It no longer opens anything. The button existed to seed the owned mirror
+/// via an ACL panel, and both the mirror and the panel are gone: Claude
+/// Code's item is read through `/usr/bin/security`, which is already the
+/// item's trusted app, so there is nothing for the user to grant. This now
+/// just performs the ordinary silent read and reports whether a token came
+/// back, so the frontend's granted/denied contract still holds while nothing
+/// on the Claude credential path can raise a Keychain panel.
 #[cfg(target_os = "macos")]
 pub(super) fn prime_token_from_keychain_interactive() -> Result<(), String> {
-    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
-
-    let results = ItemSearchOptions::new()
-        .class(ItemClass::generic_password())
-        .service("Claude Code-credentials")
-        .load_data(true)
-        .limit(1)
-        .search()
-        .map_err(|e| format!("Keychain access denied or unavailable: {e}"))?;
-
-    let data = results
-        .into_iter()
-        .find_map(|r| match r {
-            SearchResult::Data(bytes) => Some(bytes),
-            _ => None,
-        })
-        .ok_or_else(|| "Claude Code credentials not found in Keychain".to_string())?;
-
-    let raw = String::from_utf8(data).map_err(|e| format!("Invalid UTF-8 from Keychain: {e}"))?;
-    let token = extract_access_token(&raw)?;
-
-    // Mirror the credentials into our owned item so we never have to ask
-    // Claude Code's Keychain again until this token actually expires. A
-    // failure here is non-fatal — we still got the token and can use it for
-    // this session.
-    if let Err(e) = write_credentials_to_owned_keychain(&raw) {
-        tracing::warn!(error = %e, "Failed to mirror credentials into owned Keychain item");
-    }
-
+    purge_legacy_owned_keychain_item();
+    let token = get_claude_oauth_token()?;
     store_access_token(&token);
     Ok(())
 }
@@ -574,23 +382,23 @@ fn read_token_from_silent_platform_source(credentials_error: String) -> Result<S
 /// Resolution order:
 /// 1. `CLAUDE_CODE_OAUTH_TOKEN` environment variable (JSON string) — never cached
 /// 2. In-process cache (set on previous successful read)
-/// 3. macOS only: TokenMonitor's owned Keychain item (mirrored from Claude
-///    Code's item the last time the user clicked "Allow Keychain access").
-///    This is the primary persistent source — it survives Claude Code's
-///    token rotations because Claude Code never writes here.
-/// 4. `~/.claude/.credentials.json`
-/// 5. macOS only: `/usr/bin/security find-generic-password` against Claude
+/// 3. `~/.claude/.credentials.json`
+/// 4. macOS only: `/usr/bin/security find-generic-password` against Claude
 ///    Code's item. Silent and rotation-proof, because Claude Code creates
 ///    that item with the same binary — see
 ///    [`read_raw_credentials_via_security_cli`].
-/// 6. macOS only: in-process Security.framework read of the same item
+/// 5. macOS only: in-process Security.framework read of the same item
 ///    (last resort; normally denied with `errSecAuthFailed` because
 ///    TokenMonitor is not in the item's ACL).
 ///
+/// Every step is silent: no step can raise a macOS Keychain panel. Steps 4
+/// and 5 both target Claude Code's own item, so nothing here depends on a
+/// user grant that Claude Code's next token rotation would wipe.
+///
 /// On a successful read the token is stored in the in-process cache. Callers
 /// that observe a 401 from the API should call
-/// [`invalidate_oauth_credentials_after_unauthorized`] so the next call
-/// re-reads from a fresh source instead of replaying the stale token.
+/// [`invalidate_access_token_cache`] so the next call re-reads from a fresh
+/// source instead of replaying the stale token.
 pub(crate) fn get_claude_oauth_token() -> Result<String, String> {
     // Environment variable override (all platforms). Cheap to read each call,
     // and we don't want to cache an env value that the user might change.
@@ -604,37 +412,16 @@ pub(crate) fn get_claude_oauth_token() -> Result<String, String> {
         return Ok(cached);
     }
 
-    // Owned Keychain item is the persistent source — it survives Claude Code
-    // rotations and only goes away when the token genuinely expires (we
-    // delete it on 401) or the user revokes via Claude Code logout.
+    // Opportunistic one-shot cleanup: machines that ran an older build still
+    // have the retired mirror item sitting in their login keychain.
     #[cfg(target_os = "macos")]
-    {
-        if let Ok(token) = read_token_from_owned_keychain() {
-            store_access_token(&token);
-            return Ok(token);
-        }
-    }
+    purge_legacy_owned_keychain_item();
 
     let token =
         read_token_from_credentials_file().or_else(read_token_from_silent_platform_source)?;
 
     store_access_token(&token);
     Ok(token)
-}
-
-/// Invalidate every cached OAuth credential after a confirmed 401 from the
-/// usage API. The in-process cache is dropped so the next read goes back to
-/// the source, and on macOS the owned Keychain item is deleted because it
-/// holds the same expired token as the cache. Without that delete the next
-/// read just resurrects the stale token from our own Keychain item and we
-/// loop on 401 forever.
-///
-/// macOS-only — the non-mac retry path calls
-/// [`invalidate_access_token_cache`] inline.
-#[cfg(target_os = "macos")]
-fn invalidate_oauth_credentials_after_unauthorized() {
-    invalidate_access_token_cache();
-    delete_owned_keychain_item();
 }
 
 // ── Claude API response types ──
@@ -651,6 +438,8 @@ const KNOWN_CLAUDE_WINDOWS: &[(&str, &str)] = &[
     ("seven_day", "Weekly (7 day)"),
     ("seven_day_sonnet", "Weekly Sonnet"),
     ("seven_day_opus", "Weekly Opus"),
+    ("seven_day_fable", "Weekly Fable"),
+    ("seven_day_overage_included", "Weekly Fable"),
     ("seven_day_oauth_apps", "Weekly OAuth Apps"),
     ("seven_day_cowork", "Weekly Cowork"),
 ];
@@ -718,6 +507,60 @@ fn claude_window_from_value(value: &Value) -> Option<(f64, Option<String>)> {
     Some((utilization, resets_at))
 }
 
+fn claude_scoped_weekly_window(usage: &Value) -> Option<RateLimitWindow> {
+    let limits = usage.get("limits")?.as_array()?;
+    let (_, utilization, limit) = limits
+        .iter()
+        .filter(|limit| {
+            matches!(
+                limit.get("kind").and_then(Value::as_str),
+                Some("weekly_scoped" | "seven_day_overage_included")
+            )
+        })
+        .filter_map(|limit| {
+            let utilization = limit
+                .get("percent")
+                .and_then(as_f64)
+                .or_else(|| limit.get("utilization").and_then(as_f64))?;
+            Some((
+                limit
+                    .get("is_active")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                utilization,
+                limit,
+            ))
+        })
+        .max_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        })?;
+    let model = limit
+        .pointer("/scope/model/display_name")
+        .and_then(Value::as_str)
+        .or_else(|| limit.pointer("/scope/model/id").and_then(Value::as_str))?;
+    let model_key = model
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_");
+    let resets_at = limit.get("resets_at").and_then(|value| match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => n
+            .as_i64()
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+            .map(|dt| dt.to_rfc3339()),
+        _ => None,
+    });
+
+    Some(RateLimitWindow::new(
+        format!("seven_day_{model_key}"),
+        format!("Weekly {model}"),
+        utilization,
+        resets_at,
+    ))
+}
+
 /// Build rate-limit windows from whatever meters Claude/Anthropic returns.
 ///
 /// Known fields keep stable display names; unknown window objects become
@@ -730,6 +573,7 @@ pub(super) fn claude_usage_windows(usage: &Value) -> Vec<RateLimitWindow> {
     let mut windows = Vec::new();
     let mut consumed = std::collections::HashSet::new();
     consumed.insert("extra_usage");
+    consumed.insert("limits");
 
     for (api_field, _) in KNOWN_CLAUDE_WINDOWS {
         consumed.insert(*api_field);
@@ -745,6 +589,15 @@ pub(super) fn claude_usage_windows(usage: &Value) -> Vec<RateLimitWindow> {
             utilization,
             resets_at,
         ));
+    }
+
+    if let Some(scoped) = claude_scoped_weekly_window(usage) {
+        if !windows
+            .iter()
+            .any(|window| window.window_id == scoped.window_id)
+        {
+            windows.push(scoped);
+        }
     }
 
     let mut extras: Vec<(&String, f64, Option<String>)> = obj
@@ -826,22 +679,22 @@ pub(super) async fn fetch_claude_rate_limits() -> Result<ProviderRateLimits, Rat
                         };
                     }
                     RefreshResult::Revoked(reason) => {
+                        // Claude Code has to sign in again; nothing we can
+                        // recover from here beyond dropping the dead token.
                         tracing::warn!(reason = %reason,
-                            "Claude OAuth: refresh token revoked, deleting owned mirror");
-                        invalidate_oauth_credentials_after_unauthorized();
+                            "Claude OAuth: refresh token revoked");
+                        invalidate_access_token_cache();
                     }
                     RefreshResult::Transient(reason) => {
-                        // Don't delete the mirror on transient refresh
-                        // failures — keep it for the next attempt.
                         tracing::warn!(reason = %reason,
-                            "Claude OAuth: refresh transient failure, retaining mirror");
+                            "Claude OAuth: refresh transient failure");
                         invalidate_access_token_cache();
                         return Err(unauthorized_err);
                     }
                     RefreshResult::NoCredentials => {
-                        // No refresh token to use — fall back to the legacy
-                        // invalidate-and-retry path (drops in-mem cache,
-                        // tries the silent Claude Code Keychain read).
+                        // No refresh token to use — drop the in-mem cache and
+                        // retry against the source in case Claude Code has
+                        // rotated the item underneath us.
                         invalidate_access_token_cache();
                     }
                 }
@@ -868,27 +721,13 @@ enum RefreshResult {
     /// from, and the new access token is in the in-process cache, ready for
     /// the next API attempt.
     Refreshed,
-    /// Anthropic rejected the refresh token. Caller should delete the
-    /// mirror and surface re-grant UI.
+    /// Anthropic rejected the refresh token — the user has to sign in
+    /// through Claude Code again.
     Revoked(String),
     /// Network / 5xx / parse error. Stored credentials are left intact.
     Transient(String),
-    /// No readable credentials with a refresh token. Caller should fall
-    /// back to the interactive grant path.
+    /// No readable credentials with a refresh token.
     NoCredentials,
-}
-
-/// Which store the credentials we are about to refresh came from. Anthropic
-/// rotates the refresh token on every refresh, so the rotated pair has to go
-/// back into *that* store or whoever else reads it is left holding a dead
-/// token.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CredentialSource {
-    /// Claude Code's own item — shared with Claude Code itself.
-    ClaudeCode,
-    /// TokenMonitor's private mirror.
-    OwnedMirror,
 }
 
 /// Test hook — exposed via `rate_limits::debug_force_refresh` so an IPC
@@ -904,49 +743,35 @@ pub(super) async fn debug_force_refresh() -> String {
     }
 }
 
-/// Pick the credentials to refresh, preferring Claude Code's own item.
+/// Exchange Claude Code's stored refresh token for a fresh pair and write the
+/// result straight back into Claude Code's own Keychain item.
 ///
-/// Claude Code's item is the live copy both sides read, so refreshing from it
-/// (and writing the rotated pair straight back) keeps the two in step. The
-/// owned mirror is only a fallback for installs where that item isn't
-/// readable — Claude Code on Linux/Windows, or a build that stores its
-/// credentials some other way.
-#[cfg(target_os = "macos")]
-fn read_refreshable_credentials() -> Option<(CredentialSource, String)> {
-    match read_raw_credentials_via_security_cli() {
-        Ok(raw) => return Some((CredentialSource::ClaudeCode, raw)),
-        Err(e) => {
-            tracing::debug!(error = %e, "OAuth refresh: Claude Code item unreadable")
-        }
-    }
-    match read_raw_credentials_from_owned_keychain() {
-        Ok(raw) => Some((CredentialSource::OwnedMirror, raw)),
-        Err(e) => {
-            tracing::debug!(error = %e, "OAuth refresh: no owned mirror to refresh");
-            None
-        }
-    }
-}
-
+/// Anthropic rotates the *refresh* token on every refresh, so the copy in the
+/// Keychain is dead the moment the grant succeeds. The write-back is what
+/// keeps Claude Code signed in, which is why a failure there is reported as a
+/// failed refresh rather than logged and swallowed. Every Keychain operation
+/// on this path goes through `/usr/bin/security`, so none of it can raise a
+/// panel.
 #[cfg(target_os = "macos")]
 async fn try_refresh_claude_oauth() -> RefreshResult {
     use super::oauth_refresh::{refresh_oauth_token, RefreshOutcome};
 
-    let Some((source, raw)) = read_refreshable_credentials() else {
-        return RefreshResult::NoCredentials;
+    let raw = match read_raw_credentials_via_security_cli() {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::debug!(error = %e, "OAuth refresh: Claude Code credentials unreadable");
+            return RefreshResult::NoCredentials;
+        }
     };
     let refresh_token = match extract_refresh_token(&raw) {
         Ok(t) => t,
         Err(e) => {
-            tracing::debug!(error = %e, ?source, "OAuth refresh: credentials missing refresh_token");
+            tracing::debug!(error = %e, "OAuth refresh: credentials missing refresh_token");
             return RefreshResult::NoCredentials;
         }
     };
 
-    tracing::info!(
-        ?source,
-        "Claude OAuth: attempting refresh-grant against Anthropic"
-    );
+    tracing::info!("Claude OAuth: attempting refresh-grant against Anthropic");
     match refresh_oauth_token(&refresh_token).await {
         RefreshOutcome::Refreshed(resp) => {
             let updated = match update_credentials_with_refresh(
@@ -959,26 +784,12 @@ async fn try_refresh_claude_oauth() -> RefreshResult {
                 Err(e) => return RefreshResult::Transient(format!("rewrite: {e}")),
             };
 
-            // Anthropic has already rotated the refresh token by this point,
-            // so `raw` is dead everywhere it is stored. Persisting `updated`
-            // back to Claude Code's item is what keeps Claude Code signed in
-            // — treat a failure here as loud, not cosmetic.
-            if source == CredentialSource::ClaudeCode {
-                if let Err(e) = write_credentials_to_claude_code_keychain(&updated) {
-                    tracing::error!(error = %e,
-                        "Claude OAuth: refresh succeeded but the rotated credentials could not be \
-                         written back to Claude Code's Keychain item — Claude Code may need to \
-                         sign in again");
-                    return RefreshResult::Transient(format!("claude keychain write: {e}"));
-                }
-            }
-
-            // Keep the mirror in step so it never serves a rotated-away token.
-            if let Err(e) = write_credentials_to_owned_keychain(&updated) {
-                if source == CredentialSource::OwnedMirror {
-                    return RefreshResult::Transient(format!("mirror write: {e}"));
-                }
-                tracing::warn!(error = %e, "OAuth refresh: mirror write failed (non-fatal)");
+            if let Err(e) = write_credentials_to_claude_code_keychain(&updated) {
+                tracing::error!(error = %e,
+                    "Claude OAuth: refresh succeeded but the rotated credentials could not be \
+                     written back to Claude Code's Keychain item — Claude Code may need to \
+                     sign in again");
+                return RefreshResult::Transient(format!("claude keychain write: {e}"));
             }
 
             invalidate_access_token_cache();
@@ -1126,6 +937,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
+    /// This file's own source with the test module stripped, so the
+    /// source-scanning guards below don't match their own string literals.
+    #[cfg(target_os = "macos")]
+    fn production_source() -> &'static str {
+        const MARKER: &str = "#[cfg(test)]\nmod tests {";
+        let source = include_str!("claude.rs");
+        source
+            .find(MARKER)
+            .map(|idx| &source[..idx])
+            .expect("test module marker not found — did the module header change?")
+    }
+
     fn credentials_json(token: &str) -> String {
         format!(
             r#"{{
@@ -1177,23 +1000,8 @@ mod tests {
         }
     }
 
-    /// A miss must come back as a plain `Err` — not a hang on a Keychain
-    /// panel and not a panic — because this runs inside the synchronous
-    /// refresh path.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn security_cli_read_reports_missing_item_as_error() {
-        let err = run_security_find_generic_password(
-            "com.tokenmonitor.test.definitely-absent-service",
-            Some("no-such-account"),
-        )
-        .unwrap_err();
-
-        assert!(
-            err.contains("security exited with"),
-            "unexpected error shape: {err}"
-        );
-    }
+    // Missing-item and round-trip behaviour of the `security` wrapper is
+    // covered in `platform::macos::keychain`, which owns those calls now.
 
     /// Claude Code stores its credentials with `security add-generic-password`,
     /// so reading them back through the same binary must succeed silently even
@@ -1267,6 +1075,90 @@ mod tests {
         assert_eq!(parsed["claudeAiOauth"]["expiresAt"], 1777084603000u64);
     }
 
+    /// Regression guard for the recurring "enter your keychain password"
+    /// panel.
+    ///
+    /// `SecKeychain::set_generic_password` is a find-then-modify when the item
+    /// already exists — a decrypt authorization plus a modify authorization
+    /// against the item's legacy ACL. Because this app is ad-hoc signed, its
+    /// code identity changes on every build and release, so that ACL check
+    /// fails and macOS shows a modal panel. It fired from the background
+    /// refresh loop with no user gesture. Nothing in this file may write the
+    /// Keychain in-process again: Claude Code's item is written through
+    /// `/usr/bin/security`, and no other item is ours to keep.
+    ///
+    /// Deletes are exempt — `purge_legacy_owned_keychain_item` uses the
+    /// unified `SecItemDelete`, which does not consult the legacy ACL.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_in_process_keychain_writes_remain() {
+        for forbidden in ["set_generic_password", "add_generic_password"] {
+            let hits = production_source()
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains(forbidden))
+                .filter(|(_, line)| !line.trim_start().starts_with("///"))
+                .map(|(i, line)| format!("  line {}: {}", i + 1, line.trim()))
+                .collect::<Vec<_>>();
+
+            assert!(
+                hits.is_empty(),
+                "in-process Keychain write reintroduced — this pops a modal password panel \
+                 from the background refresh loop. Use /usr/bin/security instead.\n{}",
+                hits.join("\n")
+            );
+        }
+    }
+
+    /// Every in-process Keychain *read* must go through
+    /// `platform::macos::keychain::with_ui_suppressed`, which both disables
+    /// the process-wide interaction flag and serialises against other readers.
+    /// Taking the flag ad hoc is not enough: the crate's guard restores it to
+    /// *allowed* on drop, so an overlapping read would unmask the ACL panel.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_process_keychain_reads_go_through_the_shared_guard() {
+        let source = production_source();
+
+        let searches = source
+            .match_indices("ItemSearchOptions::new()")
+            .map(|(idx, _)| source[..idx].lines().count())
+            .collect::<Vec<_>>();
+        let guards = source
+            .match_indices("with_ui_suppressed(|")
+            .map(|(idx, _)| source[..idx].lines().count())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !searches.is_empty(),
+            "expected at least one in-process Keychain search to still exist"
+        );
+        for line in &searches {
+            assert!(
+                guards.iter().any(|g| *g < *line && line - g < 12),
+                "Keychain search near line {line} is not inside a with_ui_suppressed() \
+                 closure (closures open at {guards:?})"
+            );
+        }
+
+        // Taking the raw flag here again would reintroduce the unserialised
+        // pattern the shared helper exists to prevent. Prose may still name
+        // it — only executable lines matter.
+        let raw_flag = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| line.contains("disable_user_interaction()"))
+            .map(|(i, line)| format!("  line {}: {}", i + 1, line.trim()))
+            .collect::<Vec<_>>();
+        assert!(
+            raw_flag.is_empty(),
+            "use platform::macos::keychain::with_ui_suppressed instead of taking \
+             the process-wide flag directly\n{}",
+            raw_flag.join("\n")
+        );
+    }
+
     /// Exercises the full 401 → refresh → write-back path against the live
     /// account. Anthropic rotates the refresh token, so this also proves the
     /// write-back landed: if it did not, Claude Code would be signed out.
@@ -1325,6 +1217,13 @@ mod tests {
         let usage = serde_json::json!({
             "five_hour": { "utilization": 12.5, "resets_at": "2026-07-16T20:00:00Z" },
             "seven_day": { "utilization": 40.0, "resets_at": "2026-07-20T00:00:00Z" },
+            "limits": [
+                { "kind": "weekly_scoped", "percent": 90.0, "is_active": false,
+                  "scope": { "model": { "display_name": "Opus" } } },
+                { "kind": "seven_day_overage_included", "percent": 60.0, "is_active": true,
+                  "resets_at": "2026-07-20T00:00:00Z",
+                  "scope": { "model": { "id": null, "display_name": "Fable" } } }
+            ],
             "extra_usage": {
                 "is_enabled": true,
                 "monthly_limit": 5000.0,
@@ -1333,11 +1232,14 @@ mod tests {
             }
         });
         let windows = claude_usage_windows(&usage);
-        assert_eq!(windows.len(), 2);
+        assert_eq!(windows.len(), 3);
         assert_eq!(windows[0].window_id, "five_hour");
         assert_eq!(windows[0].label, "Session (5hr)");
         assert_eq!(windows[1].window_id, "seven_day");
         assert_eq!(windows[1].label, "Weekly (7 day)");
+        assert_eq!(windows[2].window_id, "seven_day_fable");
+        assert_eq!(windows[2].label, "Weekly Fable");
+        assert_eq!(windows[2].utilization, 60.0);
     }
 
     #[test]
