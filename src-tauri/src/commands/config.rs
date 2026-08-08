@@ -273,26 +273,24 @@ pub enum KeychainAccessOutcome {
     AlreadyRequested,
 }
 
-/// Trigger the interactive Keychain prompt for the Claude OAuth token.
+/// Resolve the Claude OAuth token for the "Allow Keychain access" button.
 ///
-/// This is the **only** code path that allows the macOS Keychain UI to
-/// appear — every other read is silent (`skip_authenticated_items` +
-/// `disable_user_interaction`). On a successful read the credentials JSON is
-/// also mirrored into TokenMonitor's owned Keychain item, so subsequent
-/// background refreshes can read silently from our own item without depending
-/// on Claude Code's ACL surviving its next token rotation.
+/// Despite the name there is no prompt behind this any more. Claude Code
+/// stores its credentials with `security add-generic-password`, so
+/// `/usr/bin/security` — not TokenMonitor and not Claude Code — is the item's
+/// trusted app, and reading it back through that same binary is silent for
+/// everyone. This command just performs that read and reports whether a token
+/// came back.
 ///
 /// The frontend dedupes concurrent calls via `keychainRequestInFlight` and
 /// gates auto-firing behind the `keychainAccessRequested` setting; the
-/// backend is intentionally re-callable so the user can re-grant on demand
-/// (e.g. via a "Re-grant Keychain access" button) after a token expiry has
-/// invalidated the owned item.
+/// backend stays re-callable, which is now harmless.
 #[tauri::command]
 pub async fn request_claude_keychain_access() -> Result<KeychainAccessOutcome, String> {
     #[cfg(target_os = "macos")]
     {
-        // Run the synchronous Keychain call on a blocking thread so we don't
-        // pin the Tauri async runtime while macOS shows the auth panel.
+        // Still off the async runtime: the read shells out to a child process
+        // and the retired-mirror cleanup touches the Keychain synchronously.
         let outcome =
             tokio::task::spawn_blocking(crate::rate_limits::request_claude_keychain_access)
                 .await
