@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatCost, formatTimeAgo } from "../utils/format.js";
+  import { formatTimeAgo } from "../utils/format.js";
   import { footerFiveHourPct } from "../views/footer.js";
   import type { UsagePayload, RateLimitsPayload, UsageProvider, UsagePeriod } from "../types/index.js";
 
@@ -33,14 +33,10 @@
   });
 </script>
 
-{#if period === "5h"}
+{#if period === "5h" && fiveHourPct != null}
   <div class="ft">
     <div class="ft-l">
-      {#if fiveHourPct != null}
-        <span>{fiveHourPct}% used</span>
-      {:else}
-        <span>{formatCost(data.five_hour_cost)}</span>
-      {/if}
+      <span>{fiveHourPct}% used</span>
     </div>
   </div>
 {/if}

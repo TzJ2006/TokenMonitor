@@ -4763,6 +4763,7 @@ dependencies = [
  "objc2-foundation",
  "rayon",
  "reqwest 0.12.28",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "tauri",
