@@ -983,6 +983,7 @@ mod tests {
             h: 12,
             mk: "opus-4-6".into(),
             mn: "Opus 4.6".into(),
+            raw_model: None,
             input_tokens: 1,
             out: 2,
             c5: 0,
@@ -1472,6 +1473,25 @@ mod tests {
             12,
         );
         assert!(archived > 0, "archive should have written at least one row");
+        archive_mgr.import_source(
+            "device:remote-inc",
+            &[crate::usage::archive::ArchivedHourly {
+                d: today.to_string(),
+                h: 8,
+                mk: String::from("opus"),
+                mn: String::from("Opus"),
+                raw_model: None,
+                input_tokens: 10,
+                out: 10,
+                c5: 0,
+                c1: 0,
+                cr: 0,
+                ws: 0,
+                p: String::from("claude"),
+            }],
+            today,
+            12,
+        );
         state.parser.set_archive(archive_mgr);
 
         // Write a live JSONL with:
@@ -1501,14 +1521,14 @@ mod tests {
             .await
             .expect("included devices payload should exist when archive has data");
 
-        // Expected tokens: archive (1_000+1_000) + later live row (2_000+2_000)
-        //                  = input=3_000, output=3_000
+        // Expected tokens: legacy Opus (10+10) + archive (1_000+1_000)
+        //                  + later live row (2_000+2_000) = 3_010 each.
         // The archived-hour live row must be skipped via frontier.
         assert_eq!(
-            payload.input_tokens, 3_000,
+            payload.input_tokens, 3_010,
             "frontier should have de-duped the archived-hour live row"
         );
-        assert_eq!(payload.output_tokens, 3_000);
+        assert_eq!(payload.output_tokens, 3_010);
         assert!(payload.total_cost > 0.0);
         assert!(
             payload
@@ -1517,6 +1537,17 @@ mod tests {
                 .any(|m| m.model_key == "sonnet-4-6"),
             "sonnet-4-6 should appear in the model breakdown"
         );
+        assert!(
+            payload
+                .model_breakdown
+                .iter()
+                .any(|m| m.model_key == "opus-5"),
+            "legacy post-release Opus archive rows should appear as opus-5"
+        );
+        assert!(payload
+            .model_breakdown
+            .iter()
+            .all(|m| m.model_key != "opus"));
     }
 
     #[test]

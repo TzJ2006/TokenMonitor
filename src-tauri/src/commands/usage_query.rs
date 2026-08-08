@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 
-const USAGE_PAYLOAD_CACHE_VERSION: &str = "model-pricing-2026-06-13";
+const USAGE_PAYLOAD_CACHE_VERSION: &str = "model-pricing-2026-08-07-opus5";
 
 /// Spawn a background Cursor remote fetch when the cache is missing/expired.
 /// Deduped via `AppState::cursor_remote_fetch_inflight`. Always refreshes the

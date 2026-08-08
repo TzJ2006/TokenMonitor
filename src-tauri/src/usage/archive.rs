@@ -43,6 +43,9 @@ pub struct ArchivedHourly {
     pub mk: String,
     /// Model display name (e.g. "Sonnet 4.6")
     pub mn: String,
+    /// Exact model ID from the source log, retained for future re-normalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_model: Option<String>,
     /// Input tokens
     #[serde(rename = "in")]
     pub input_tokens: u64,
@@ -91,6 +94,12 @@ impl ArchivedHourly {
         self.ws = self.ws.max(other.ws);
         if self.mn.is_empty() && !other.mn.is_empty() {
             self.mn = other.mn.clone();
+        }
+        if self.raw_model.is_some()
+            && other.raw_model.is_some()
+            && self.raw_model != other.raw_model
+        {
+            self.raw_model = None;
         }
         before
             != (
@@ -280,6 +289,7 @@ impl ArchiveManager {
                 h: entry_hour,
                 mk: known.model_key,
                 mn: known.display_name,
+                raw_model: Some(entry.model.clone()),
                 input_tokens: 0,
                 out: 0,
                 c5: 0,
@@ -288,6 +298,12 @@ impl ArchiveManager {
                 ws: 0,
                 p: provider.to_string(),
             });
+
+            // ponytail: one raw ID per normalized hourly bucket; use a list if
+            // mixed aliases in one bucket ever need forensic fidelity.
+            if agg.raw_model.as_deref() != Some(entry.model.as_str()) {
+                agg.raw_model = None;
+            }
 
             agg.input_tokens += entry.input_tokens;
             agg.out += entry.output_tokens;
@@ -423,7 +439,7 @@ impl ArchiveManager {
                     Ok(l) if !l.trim().is_empty() => l,
                     _ => continue,
                 };
-                let record: ArchivedHourly = match serde_json::from_str(&line) {
+                let mut record: ArchivedHourly = match serde_json::from_str(&line) {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(
@@ -442,6 +458,24 @@ impl ArchiveManager {
                 // Filter by since date.
                 if since.is_some_and(|s| record_date < s) {
                     continue;
+                }
+
+                // Older builds collapsed major-only Claude 5 IDs. These dates
+                // are their release dates, after the matching generic Claude 3
+                // models were retired, so the missing v5 key is recoverable.
+                let repaired_key = match record.mk.as_str() {
+                    "sonnet" if record_date >= NaiveDate::from_ymd_opt(2026, 6, 30).unwrap() => {
+                        Some("sonnet-5")
+                    }
+                    "opus" if record_date >= NaiveDate::from_ymd_opt(2026, 7, 24).unwrap() => {
+                        Some("opus-5")
+                    }
+                    _ => None,
+                };
+                if record.raw_model.is_none() {
+                    if let Some(repaired_key) = repaired_key {
+                        record.mk = repaired_key.to_string();
+                    }
                 }
 
                 match buckets.get_mut(&record.bucket_key()) {
@@ -473,7 +507,7 @@ impl ArchiveManager {
 
             entries.push(ParsedEntry {
                 timestamp,
-                model: record.mk,
+                model: record.raw_model.unwrap_or(record.mk),
                 input_tokens: record.input_tokens,
                 output_tokens: record.out,
                 cache_creation_5m_tokens: record.c5,
@@ -952,6 +986,10 @@ mod tests {
         let loaded = mgr.load_archived("local:claude", None);
         assert_eq!(loaded.len(), 2);
 
+        let raw = mgr.read_raw("local:claude");
+        let opus = raw.iter().find(|record| record.mk == "opus-4-6").unwrap();
+        assert_eq!(opus.raw_model.as_deref(), Some("claude-opus-4-6-20260301"));
+
         // Hour 10 sonnet should have aggregated tokens.
         let h10 = loaded.iter().find(|e| e.timestamp.hour() == 10).unwrap();
         assert_eq!(h10.input_tokens, 3000); // 1000 + 2000
@@ -1083,6 +1121,7 @@ mod tests {
             h,
             mk: mk.to_string(),
             mn: mk.to_string(),
+            raw_model: None,
             input_tokens: input,
             out,
             c5: 0,
@@ -1096,6 +1135,32 @@ mod tests {
     /// A date far enough ahead that every test record counts as a completed hour.
     fn future_date() -> NaiveDate {
         NaiveDate::from_ymd_opt(2999, 1, 1).unwrap()
+    }
+
+    #[test]
+    fn load_archived_repairs_major_only_claude_5_keys() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        let records = vec![
+            arch("2026-06-29", 1, "sonnet", 1, 1),
+            arch("2026-06-30", 2, "sonnet", 1, 1),
+            arch("2026-07-23", 3, "opus", 1, 1),
+            arch("2026-07-24", 4, "opus", 1, 1),
+        ];
+        mgr.import_source("local:claude", &records, future_date(), 0);
+
+        let loaded = mgr.load_archived("local:claude", None);
+        let model_at_hour = |hour| {
+            loaded
+                .iter()
+                .find(|entry| entry.timestamp.hour() == hour)
+                .map(|entry| entry.model.as_str())
+        };
+
+        assert_eq!(model_at_hour(1), Some("sonnet"));
+        assert_eq!(model_at_hour(2), Some("sonnet-5"));
+        assert_eq!(model_at_hour(3), Some("opus"));
+        assert_eq!(model_at_hour(4), Some("opus-5"));
     }
 
     #[test]
