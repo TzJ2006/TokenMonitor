@@ -2,7 +2,13 @@
 
 Notable changes to TokenMonitor are recorded here. Entries are newest first.
 
-## Unreleased
+## v0.14.2
+
+- Claude rate limits now come from `claude -p "/usage"`, so they no longer disappear for an hour after Anthropic's abuse guard trips.
+- Fixed the refresh loop ignoring its own cooldown, which kept re-arming that hour-long ban.
+- Removed the macOS Keychain permission flow for Claude — the credentials file is read directly, with no prompt.
+
+## v0.14.1
 
 - Reorganized frontend window utilities, cross-layer tests, and native test resources.
 - Removed the obsolete standalone profiler, retired no-op commands and settings, and removed the unused notification integration.
