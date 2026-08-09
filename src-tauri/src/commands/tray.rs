@@ -95,38 +95,74 @@ pub struct StatusWidgetSummary {
     pub title: String,
 }
 
+/// Rate-limit providers in display order, mirroring the frontend's
+/// `RATE_LIMIT_PROVIDER_ORDER`. Used when the user has not narrowed the
+/// selection, so a newly supported provider shows up by default.
+const RATE_LIMIT_PROVIDER_ORDER: &[&str] = &["claude", "codex", "cursor"];
+
+/// Menu-bar title for a provider, matching `getUsageProviderTitle` on the
+/// frontend so the settings preview and the real tray agree.
+fn provider_title(provider: &str) -> Option<&'static str> {
+    match provider {
+        "claude" => Some("Claude Code"),
+        "codex" => Some("Codex"),
+        "cursor" => Some("Cursor IDE"),
+        _ => None,
+    }
+}
+
+fn utilization_for(utilization: TrayUtilization, provider: &str) -> Option<f64> {
+    match provider {
+        "claude" => utilization.claude,
+        "codex" => utilization.codex,
+        "cursor" => utilization.cursor,
+        _ => None,
+    }
+}
+
 fn format_tray_title(
     config: &TrayConfig,
     total_cost: f64,
-    claude_util: Option<f64>,
-    codex_util: Option<f64>,
+    utilization: TrayUtilization,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     // Percentages -- independent of bar_display.
     // Utilization values are already 0-100.
     if config.show_percentages {
-        if let (Some(c), Some(x)) = (claude_util, codex_util) {
-            let c_pct = c.round() as i64;
-            let x_pct = x.round() as i64;
+        // Follow the same provider selection the bars use. This was a
+        // hardcoded claude/codex pair, which silently dropped Cursor and
+        // ignored the user's provider choice entirely.
+        let providers: Vec<&str> = if config.bar_providers.is_empty() {
+            RATE_LIMIT_PROVIDER_ORDER.to_vec()
+        } else {
+            config.bar_providers.iter().map(String::as_str).collect()
+        };
+
+        let entries: Vec<(&str, i64)> = providers
+            .iter()
+            .filter_map(|provider| {
+                let title = provider_title(provider)?;
+                let util = utilization_for(utilization, provider)?;
+                Some((title, util.round() as i64))
+            })
+            .collect();
+
+        if !entries.is_empty() {
             if config.percentage_format == PercentageFormat::Compact {
-                parts.push(format!("{} \u{00b7} {}", c_pct, x_pct));
+                let joined = entries
+                    .iter()
+                    .map(|(_, pct)| pct.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" \u{00b7} ");
+                parts.push(joined);
             } else {
-                parts.push(format!("Claude Code {}%  Codex {}%", c_pct, x_pct));
-            }
-        } else if let Some(c) = claude_util {
-            let pct = c.round() as i64;
-            if config.percentage_format == PercentageFormat::Compact {
-                parts.push(format!("{}", pct));
-            } else {
-                parts.push(format!("Claude Code {}%", pct));
-            }
-        } else if let Some(x) = codex_util {
-            let pct = x.round() as i64;
-            if config.percentage_format == PercentageFormat::Compact {
-                parts.push(format!("{}", pct));
-            } else {
-                parts.push(format!("Codex {}%", pct));
+                let joined = entries
+                    .iter()
+                    .map(|(title, pct)| format!("{title} {pct}%"))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                parts.push(joined);
             }
         }
     }
@@ -376,7 +412,7 @@ fn apply_tray_presentation(
     utilization: TrayUtilization,
     update_available: bool,
 ) {
-    let title = format_tray_title(config, total_cost, utilization.claude, utilization.codex);
+    let title = format_tray_title(config, total_cost, utilization);
 
     if let Some(tray) = app.tray_by_id("main-tray") {
         // macOS: set_title() shows text beside the icon in the menu bar.
@@ -507,7 +543,7 @@ pub async fn get_status_widget_summary(
     let total_cost = current_daily_total_cost_if_allowed(&state);
 
     Ok(StatusWidgetSummary {
-        title: format_tray_title(&config, total_cost, utilization.claude, utilization.codex),
+        title: format_tray_title(&config, total_cost, utilization),
         config,
         total_cost,
         claude_util: utilization.claude,
@@ -561,19 +597,33 @@ mod tests {
         assert_eq!(next, None);
     }
 
+    fn utils(claude: Option<f64>, codex: Option<f64>, cursor: Option<f64>) -> TrayUtilization {
+        TrayUtilization {
+            claude,
+            codex,
+            cursor,
+        }
+    }
+
     #[test]
     fn format_tray_title_returns_empty_string_when_hidden() {
         let config = TrayConfig {
             show_cost: false,
             ..TrayConfig::default()
         };
-        assert_eq!(format_tray_title(&config, 12.34, None, None), "");
+        assert_eq!(
+            format_tray_title(&config, 12.34, utils(None, None, None)),
+            ""
+        );
     }
 
     #[test]
     fn format_tray_title_formats_cost_when_visible() {
         let config = TrayConfig::default(); // show_cost: true, cost_precision: "full"
-        assert_eq!(format_tray_title(&config, 12.345, None, None), "$12.35");
+        assert_eq!(
+            format_tray_title(&config, 12.345, utils(None, None, None)),
+            "$12.35"
+        );
     }
 
     #[test]
@@ -582,7 +632,10 @@ mod tests {
             cost_precision: CostPrecision::Whole,
             ..TrayConfig::default()
         };
-        assert_eq!(format_tray_title(&config, 12.345, None, None), "$12");
+        assert_eq!(
+            format_tray_title(&config, 12.345, utils(None, None, None)),
+            "$12"
+        );
     }
 
     #[test]
@@ -592,7 +645,7 @@ mod tests {
             ..TrayConfig::default()
         };
         assert_eq!(
-            format_tray_title(&config, 5.0, Some(72.0), Some(35.0)),
+            format_tray_title(&config, 5.0, utils(Some(72.0), Some(35.0), None)),
             "72 \u{00b7} 35  $5.00"
         );
     }
@@ -606,8 +659,65 @@ mod tests {
             ..TrayConfig::default()
         };
         assert_eq!(
-            format_tray_title(&config, 0.0, Some(72.0), Some(35.0)),
+            format_tray_title(&config, 0.0, utils(Some(72.0), Some(35.0), None)),
             "Claude Code 72%  Codex 35%"
+        );
+    }
+
+    /// Cursor used to be dropped on the floor here: the title was built from a
+    /// hardcoded claude/codex pair, so a third provider could never appear.
+    #[test]
+    fn format_tray_title_includes_every_provider() {
+        let config = TrayConfig {
+            show_percentages: true,
+            percentage_format: PercentageFormat::Verbose,
+            show_cost: false,
+            ..TrayConfig::default()
+        };
+        assert_eq!(
+            format_tray_title(&config, 0.0, utils(Some(72.0), Some(35.0), Some(9.0))),
+            "Claude Code 72%  Codex 35%  Cursor IDE 9%"
+        );
+
+        let compact = TrayConfig {
+            percentage_format: PercentageFormat::Compact,
+            ..config
+        };
+        assert_eq!(
+            format_tray_title(&compact, 0.0, utils(Some(72.0), Some(35.0), Some(9.0))),
+            "72 \u{00b7} 35 \u{00b7} 9"
+        );
+    }
+
+    /// Percentages follow the provider selection the bars use, so unticking a
+    /// provider in settings removes its number too.
+    #[test]
+    fn format_tray_title_honours_the_provider_selection() {
+        let config = TrayConfig {
+            show_percentages: true,
+            percentage_format: PercentageFormat::Verbose,
+            show_cost: false,
+            bar_providers: vec!["cursor".to_string(), "claude".to_string()],
+            ..TrayConfig::default()
+        };
+        assert_eq!(
+            format_tray_title(&config, 0.0, utils(Some(72.0), Some(35.0), Some(9.0))),
+            "Cursor IDE 9%  Claude Code 72%"
+        );
+    }
+
+    /// A provider with no data yet is skipped rather than rendered as 0%.
+    #[test]
+    fn format_tray_title_skips_providers_without_data() {
+        let config = TrayConfig {
+            show_percentages: true,
+            percentage_format: PercentageFormat::Verbose,
+            show_cost: false,
+            ..TrayConfig::default()
+        };
+        assert_eq!(
+            format_tray_title(&config, 0.0, utils(Some(72.0), None, Some(9.0))),
+            "Claude Code 72%  Cursor IDE 9%"
         );
     }
 
