@@ -60,14 +60,46 @@ fn read_token_from_credentials_path(cred_path: &Path) -> Result<String, String> 
 
 /// Read OAuth token from `~/.claude/.credentials.json`.
 ///
-/// Claude Code keeps this file current on every platform, so it is the single
-/// credential source now that the OAuth API is only a fallback behind the CLI
-/// probe. A plain file read in the Claude config directory the app already
-/// discloses — no Keychain, no prompt.
+/// A plain file read in the Claude config directory the app already discloses
+/// — no Keychain, no prompt. Present on Linux and Windows, and on Macs where
+/// Claude Code was configured to keep credentials on disk.
 fn read_token_from_credentials_file() -> Result<String, String> {
     let cred_path = crate::paths::claude_credentials_file()
         .ok_or_else(|| "Cannot determine Claude credentials file path".to_string())?;
     read_token_from_credentials_path(&cred_path)
+}
+
+/// Keychain item Claude Code stores its own OAuth credentials in.
+#[cfg(target_os = "macos")]
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Read OAuth token from Claude Code's own login-Keychain item.
+///
+/// The default on macOS is the Keychain, not the file — so without this step
+/// the OAuth fallback is dead on a stock Mac install.
+///
+/// The read goes through `/usr/bin/security` deliberately. Claude Code writes
+/// the item with that same binary, so its ACL trusts it and the read is silent
+/// for any process running as this user. Reading in-process through
+/// Security.framework instead fails with errSecAuthFailed (-25293) against
+/// that ACL, and the recovery path for that is the modal password panel.
+/// See [`crate::platform::macos::keychain`].
+#[cfg(target_os = "macos")]
+fn read_token_from_keychain() -> Result<String, String> {
+    use crate::platform::macos::keychain::find_generic_password;
+
+    // Claude Code sets the account to the login name, but has not always; fall
+    // back to a service-only lookup rather than missing an older item.
+    let account = std::env::var("USER").ok();
+    let raw = match account
+        .as_deref()
+        .map(|acct| find_generic_password(CLAUDE_KEYCHAIN_SERVICE, Some(acct)))
+    {
+        Some(Ok(raw)) => raw,
+        _ => find_generic_password(CLAUDE_KEYCHAIN_SERVICE, None)?,
+    };
+
+    extract_access_token(&raw)
 }
 
 /// Get Claude Code OAuth access token (cross-platform).
@@ -76,10 +108,11 @@ fn read_token_from_credentials_file() -> Result<String, String> {
 /// 1. `CLAUDE_CODE_OAUTH_TOKEN` environment variable (JSON string) — never cached
 /// 2. In-process cache (set on previous successful read)
 /// 3. `~/.claude/.credentials.json`
+/// 4. macOS only: Claude Code's `Claude Code-credentials` Keychain item
 ///
 /// On a successful read the token is stored in the in-process cache. Callers
 /// that observe a 401 from the API drop that cache so the next call re-reads
-/// the file instead of replaying the stale token.
+/// the credentials instead of replaying the stale token.
 pub(crate) fn get_claude_oauth_token() -> Result<String, String> {
     // Environment variable override (all platforms). Cheap to read each call,
     // and we don't want to cache an env value that the user might change.
@@ -93,9 +126,32 @@ pub(crate) fn get_claude_oauth_token() -> Result<String, String> {
         return Ok(cached);
     }
 
-    let token = read_token_from_credentials_file()?;
-    store_access_token(&token);
-    Ok(token)
+    let file_error = match read_token_from_credentials_file() {
+        Ok(token) => {
+            store_access_token(&token);
+            return Ok(token);
+        }
+        Err(error) => error,
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        match read_token_from_keychain() {
+            Ok(token) => {
+                store_access_token(&token);
+                Ok(token)
+            }
+            // Both sources failed: report both, since "no credentials file" on
+            // its own sends people looking for a file that is not supposed to
+            // exist on a Keychain-backed install.
+            Err(keychain_error) => Err(format!(
+                "{file_error}; Keychain unavailable ({keychain_error})"
+            )),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    Err(file_error)
 }
 
 // ── Claude API response types ──
@@ -112,6 +168,7 @@ const KNOWN_CLAUDE_WINDOWS: &[(&str, &str)] = &[
     ("seven_day", "Weekly (7 day)"),
     ("seven_day_sonnet", "Weekly Sonnet"),
     ("seven_day_opus", "Weekly Opus"),
+    ("seven_day_fable", "Weekly Fable"),
     ("seven_day_oauth_apps", "Weekly OAuth Apps"),
     ("seven_day_cowork", "Weekly Cowork"),
 ];
@@ -213,6 +270,12 @@ pub(super) fn claude_usage_windows(usage: &Value) -> Vec<RateLimitWindow> {
         .filter(|(key, _)| !consumed.contains(key.as_str()))
         .filter_map(|(key, value)| {
             let (utilization, resets_at) = claude_window_from_value(value)?;
+            // The payload carries placeholder pools under internal codenames
+            // (`nimbus_quill`, `amber_ladder`, …). Most are `null` and drop
+            // out above, but an unreleased one can arrive as a real object at
+            // 0% with no reset time — which rendered as a bar named after the
+            // codename. A live pool always says when it resets.
+            resets_at.as_ref()?;
             Some((key, utilization, resets_at))
         })
         .collect();
@@ -506,6 +569,25 @@ mod tests {
         assert_eq!(windows[1].utilization, 3.0);
     }
 
+    /// Anthropic ships unreleased pools under internal codenames. A `null`
+    /// entry drops out on its own, but a live-looking one at 0% with no reset
+    /// time used to render as a bar called "Nimbus Quill".
+    #[test]
+    fn drops_placeholder_pools_that_never_reset() {
+        let usage = serde_json::json!({
+            "five_hour": { "utilization": 4.0, "resets_at": "2026-08-09T06:19:59Z" },
+            "seven_day": { "utilization": 56.0, "resets_at": "2026-08-11T03:59:59Z" },
+            "seven_day_opus": null,
+            "tangelo": null,
+            "nimbus_quill": { "utilization": 0.0, "resets_at": null },
+        });
+        let ids: Vec<_> = claude_usage_windows(&usage)
+            .into_iter()
+            .map(|window| window.window_id)
+            .collect();
+        assert_eq!(ids, ["five_hour", "seven_day"]);
+    }
+
     #[test]
     fn extract_access_token_from_valid_json() {
         let json = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test","refreshToken":"rt"}}"#;
@@ -568,5 +650,66 @@ mod tests {
         let result = get_claude_oauth_token();
         invalidate_access_token_cache();
         assert_eq!(result.unwrap(), "sk-from-cache");
+    }
+
+    /// This module's source with the test block cut off, so the scan below
+    /// cannot match its own string literals.
+    #[cfg(target_os = "macos")]
+    fn production_source() -> &'static str {
+        const MARKER: &str = "#[cfg(test)]\nmod tests {";
+        let source = include_str!("claude.rs");
+        source
+            .find(MARKER)
+            .map(|idx| &source[..idx])
+            .expect("test module marker not found — did the module header change?")
+    }
+
+    /// Every Keychain touch here must go through `/usr/bin/security`.
+    ///
+    /// An in-process Security.framework call against Claude Code's item fails
+    /// with errSecAuthFailed and, on a write, pops the modal password panel
+    /// from a background thread. That shipped once; this keeps it from
+    /// shipping again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_access_never_uses_security_framework_in_process() {
+        for banned in [
+            "security_framework",
+            "SecKeychain",
+            "ItemSearchOptions",
+            "set_generic_password",
+            "delete_generic_password",
+        ] {
+            let offending: Vec<_> = production_source()
+                .lines()
+                .enumerate()
+                // Doc comments legitimately name these APIs when explaining
+                // why they are avoided.
+                .filter(|(_, line)| !line.trim_start().starts_with("//"))
+                .filter(|(_, line)| line.contains(banned))
+                .map(|(idx, line)| format!("line {}: {}", idx + 1, line.trim()))
+                .collect();
+            assert!(
+                offending.is_empty(),
+                "`{banned}` must not appear outside doc comments — route Keychain \
+                 access through platform::macos::keychain instead:\n{}",
+                offending.join("\n")
+            );
+        }
+    }
+
+    /// Live check that the OAuth fallback can actually resolve a token on a
+    /// stock macOS install, where Claude Code keeps credentials in the
+    /// Keychain and `~/.claude/.credentials.json` does not exist. Must not
+    /// prompt for a password.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a logged-in Claude Code on this machine"]
+    fn live_reads_claude_code_credentials_from_the_keychain() {
+        let token = read_token_from_keychain().expect("Keychain read failed");
+        assert!(
+            token.starts_with("sk-ant-"),
+            "unexpected token shape from the Keychain"
+        );
     }
 }
