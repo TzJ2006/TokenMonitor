@@ -80,24 +80,47 @@ fn resolve_claude_cli_path_uncached() -> Result<PathBuf, String> {
 
 // ── Output parsing ──
 
-/// Map a `/usage` row label onto a Claude window id. Unknown rows are dropped
-/// rather than guessed — a new pool surfacing here without a matching id would
-/// otherwise render as a bar with a meaningless name.
-fn window_id_for_label(label: &str) -> Option<&'static str> {
+/// Map a `/usage` row label onto a Claude window id. Rows that are neither a
+/// session nor a weekly pool are dropped rather than guessed.
+///
+/// The per-model suffix is derived from the parenthetical rather than matched
+/// against a fixed list: `Current week (Opus)` → `seven_day_opus`, so a newly
+/// launched model gets its own bar without a TokenMonitor release. Hard-coding
+/// the known models is what made `Current week (Fable)` collapse onto the plain
+/// `seven_day` id and collide with the all-models row.
+fn window_id_for_label(label: &str) -> Option<String> {
     let label = label.to_ascii_lowercase();
     if label.contains("session") {
-        return Some("five_hour");
+        return Some("five_hour".to_string());
     }
-    if label.contains("week") {
-        if label.contains("opus") {
-            return Some("seven_day_opus");
-        }
-        if label.contains("sonnet") {
-            return Some("seven_day_sonnet");
-        }
-        return Some("seven_day");
+    if !label.contains("week") {
+        return None;
     }
-    None
+
+    let qualifier = label
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(qualifier, _)| qualifier.trim())
+        .unwrap_or_default();
+    // "all models" is the aggregate pool, which the API calls plain `seven_day`.
+    if qualifier.is_empty() || qualifier == "all models" {
+        return Some("seven_day".to_string());
+    }
+    Some(format!("seven_day_{}", snake_case(qualifier)))
+}
+
+/// Lowercase a `/usage` qualifier into the API's field-name style, so CLI ids
+/// match the ones the OAuth payload uses (`OAuth apps` → `oauth_apps`).
+fn snake_case(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn month_from_abbrev(raw: &str) -> Option<u32> {
@@ -138,7 +161,11 @@ fn parse_clock(raw: &str) -> Option<(u32, u32)> {
     Some((hour24, minute))
 }
 
-/// Parse `Aug 5, 11:59pm (America/New_York)` into an absolute timestamp.
+/// Parse `Aug 9 at 2:20am (America/New_York)` into an absolute timestamp.
+///
+/// Claude Code used to separate the date and the clock with `, ` and now uses
+/// ` at `. Both are accepted so the parser keeps working against whichever
+/// wording the installed CLI emits.
 ///
 /// ponytail: the IANA zone in parentheses is ignored and the machine's local
 /// zone is used instead — resolving it properly would mean pulling in
@@ -147,7 +174,7 @@ fn parse_clock(raw: &str) -> Option<(u32, u32)> {
 /// offset. Add `chrono-tz` if that ever matters.
 fn parse_reset_time(raw: &str, now: DateTime<Local>) -> Option<DateTime<Local>> {
     let raw = raw.split(" (").next()?.trim();
-    let (date_part, clock_part) = raw.split_once(", ")?;
+    let (date_part, clock_part) = raw.split_once(" at ").or_else(|| raw.split_once(", "))?;
 
     let mut date_tokens = date_part.split_whitespace();
     let month = month_from_abbrev(date_tokens.next()?)?;
@@ -206,8 +233,8 @@ pub(super) fn parse_usage_output(output: &str, now: DateTime<Local>) -> Vec<Rate
             .map(|dt| dt.to_rfc3339());
 
         windows.push(RateLimitWindow::new(
-            window_id.to_string(),
-            claude_window_label(window_id),
+            window_id.clone(),
+            claude_window_label(&window_id),
             utilization,
             resets_at,
         ));
@@ -306,11 +333,16 @@ mod tests {
             .unwrap()
     }
 
+    /// Verbatim `claude -p "/usage"` output, captured 2026-08-08. Keep it a
+    /// real capture: the reset times silently became `None` for weeks because
+    /// this sample still carried the older `Aug 5, 11:59pm` wording that the
+    /// CLI had already stopped emitting.
     const SAMPLE: &str = "\
 You are currently using your subscription to power your Claude Code usage
 
-Current session: 28% used · resets Aug 5, 11:59pm (America/New_York)
-Current week (all models): 17% used · resets Aug 10, 11:59pm (America/New_York)
+Current session: 2% used · resets Aug 9 at 2:20am (America/New_York)
+Current week (all models): 55% used · resets Aug 11 at 12am (America/New_York)
+Current week (Fable): 67% used · resets Aug 10 at 11:59pm (America/New_York)
 
 What's contributing to your limits usage?
 Last 24h · 827 requests · 8 sessions
@@ -318,22 +350,30 @@ Last 24h · 827 requests · 8 sessions
 ";
 
     #[test]
-    fn parses_the_two_standard_usage_rows() {
+    fn parses_every_usage_row_with_its_reset_time() {
         let windows = parse_usage_output(SAMPLE, now());
 
-        assert_eq!(windows.len(), 2, "tip lines must not become windows");
+        assert_eq!(windows.len(), 3, "tip lines must not become windows");
         assert_eq!(windows[0].window_id, "five_hour");
         assert_eq!(windows[0].label, "Session (5hr)");
-        assert_eq!(windows[0].utilization, 28.0);
+        assert_eq!(windows[0].utilization, 2.0);
         assert!(windows[0]
             .resets_at
             .as_ref()
             .unwrap()
-            .starts_with("2026-08-05T23:59:00"));
+            .starts_with("2026-08-09T02:20:00"));
 
         assert_eq!(windows[1].window_id, "seven_day");
-        assert_eq!(windows[1].utilization, 17.0);
+        assert_eq!(windows[1].utilization, 55.0);
         assert!(windows[1]
+            .resets_at
+            .as_ref()
+            .unwrap()
+            .starts_with("2026-08-11T00:00:00"));
+
+        assert_eq!(windows[2].window_id, "seven_day_fable");
+        assert_eq!(windows[2].label, "Weekly Fable");
+        assert!(windows[2]
             .resets_at
             .as_ref()
             .unwrap()
@@ -341,9 +381,43 @@ Last 24h · 827 requests · 8 sessions
     }
 
     #[test]
+    fn every_row_carries_a_reset_time() {
+        for window in parse_usage_output(SAMPLE, now()) {
+            assert!(
+                window.resets_at.is_some(),
+                "{} lost its reset time — has the /usage wording changed again?",
+                window.window_id
+            );
+        }
+    }
+
+    #[test]
+    fn each_weekly_pool_gets_a_distinct_id() {
+        let windows = parse_usage_output(SAMPLE, now());
+        let ids: std::collections::HashSet<_> =
+            windows.iter().map(|w| w.window_id.as_str()).collect();
+        assert_eq!(ids.len(), windows.len(), "window ids collided: {ids:?}");
+    }
+
+    /// The pre-2026-08 wording. Users on an older Claude Code still emit it.
+    #[test]
+    fn parses_the_legacy_comma_separated_reset_time() {
+        let windows = parse_usage_output(
+            "Current session: 28% used · resets Aug 5, 11:59pm (America/New_York)",
+            now(),
+        );
+        assert_eq!(windows.len(), 1);
+        assert!(windows[0]
+            .resets_at
+            .as_ref()
+            .unwrap()
+            .starts_with("2026-08-05T23:59:00"));
+    }
+
+    #[test]
     fn parses_midnight_without_minutes() {
         let windows = parse_usage_output(
-            "Current session: 22% used · resets Aug 6, 12am (America/New_York)",
+            "Current session: 22% used · resets Aug 6 at 12am (America/New_York)",
             now(),
         );
         assert_eq!(windows.len(), 1);
@@ -356,12 +430,23 @@ Last 24h · 827 requests · 8 sessions
 
     #[test]
     fn maps_per_model_weekly_pools() {
-        let windows = parse_usage_output(
-            "Current week (Opus): 9% used · resets Aug 10, 11:59pm (America/New_York)",
-            now(),
-        );
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].window_id, "seven_day_opus");
+        for (qualifier, expected) in [
+            ("Opus", "seven_day_opus"),
+            ("Sonnet", "seven_day_sonnet"),
+            ("Fable", "seven_day_fable"),
+            // Not a model we ship a label for — the id is still derived, so
+            // the pool surfaces instead of colliding with `seven_day`.
+            ("OAuth apps", "seven_day_oauth_apps"),
+        ] {
+            let windows = parse_usage_output(
+                &format!(
+                    "Current week ({qualifier}): 9% used · resets Aug 10 at 11:59pm (America/New_York)"
+                ),
+                now(),
+            );
+            assert_eq!(windows.len(), 1, "{qualifier} row was dropped");
+            assert_eq!(windows[0].window_id, expected);
+        }
     }
 
     #[test]
@@ -371,7 +456,7 @@ Last 24h · 827 requests · 8 sessions
             .single()
             .unwrap();
         let windows = parse_usage_output(
-            "Current session: 5% used · resets Jan 1, 12am (America/New_York)",
+            "Current session: 5% used · resets Jan 1 at 12am (America/New_York)",
             december,
         );
         assert!(windows[0]
@@ -402,6 +487,22 @@ Last 24h · 827 requests · 8 sessions
             println!(
                 "{} = {}% resets {:?}",
                 window.window_id, window.utilization, window.resets_at
+            );
+        }
+
+        // Printing alone let a `/usage` wording change blank every reset time
+        // without failing anything. Assert the shape the UI actually needs.
+        let mut seen = std::collections::HashSet::new();
+        for window in &rate_limits.windows {
+            assert!(
+                window.resets_at.is_some(),
+                "{} has no reset time — the /usage wording likely changed",
+                window.window_id
+            );
+            assert!(
+                seen.insert(window.window_id.as_str()),
+                "duplicate window id {}",
+                window.window_id
             );
         }
     }
