@@ -116,6 +116,7 @@ describe("initializeRuntimeFromSettings", () => {
       config: expect.objectContaining({ showCost: true }),
       claudeUtil: null,
       codexUtil: null,
+      cursorUtil: null,
     });
     expect(get(activeProvider)).toBe("codex");
     expect(get(activePeriod)).toBe("month");
