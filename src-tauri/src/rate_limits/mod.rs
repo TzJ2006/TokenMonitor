@@ -39,6 +39,33 @@ pub(crate) fn command_in_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
+fn as_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn humanize_snake_case(field: &str) -> String {
+    field
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut out = first.to_uppercase().collect::<String>();
+                    out.push_str(&chars.as_str().to_lowercase());
+                    out
+                }
+                None => part.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Freshness window for statusline data. If the last CC prompt was within
 /// this duration, the statusline `used_percentage` is authoritative and we
 /// skip the OAuth/CLI probe entirely.
@@ -357,6 +384,12 @@ mod tests {
             0.0,
             None,
         )
+    }
+
+    #[test]
+    fn humanize_snake_case_title_cases_parts() {
+        assert_eq!(humanize_snake_case("bonus_pool"), "Bonus Pool");
+        assert_eq!(humanize_snake_case("five-hour"), "Five Hour");
     }
 
     #[test]

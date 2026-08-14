@@ -1,6 +1,7 @@
 mod commands;
 mod logging;
 mod models;
+mod ops;
 mod paths;
 mod platform;
 mod rate_limits;
@@ -436,15 +437,11 @@ pub fn run() {
             commands::config::open_app_data_settings,
             commands::statusline::install_statusline,
             commands::statusline::check_statusline,
-            commands::statusline::uninstall_statusline,
             commands::statusline::set_claude_plan_tier,
-            commands::statusline::read_latest_statusline_ping,
             commands::tray::set_tray_config,
             commands::tray::get_status_widget_summary,
             commands::config::clear_cache,
             commands::config::clear_payload_cache,
-            commands::config::clear_usage_view_cache,
-            commands::config::reposition_window,
             commands::config::set_window_size_and_align,
             commands::config::get_window_anchor_edge,
             commands::config::get_rate_limits,
@@ -460,7 +457,6 @@ pub fn run() {
             commands::ssh::init_ssh_hosts,
             commands::ssh::init_remote_device_include_flags,
             commands::ssh::add_ssh_host,
-            commands::ssh::remove_ssh_host,
             commands::ssh::toggle_ssh_host,
             commands::ssh::test_ssh_connection,
             commands::ssh::sync_ssh_host,
@@ -470,7 +466,6 @@ pub fn run() {
             commands::logging::log_frontend_message,
             commands::logging::set_log_level,
             commands::logging::get_log_level,
-            commands::logging::get_log_dir,
             commands::updater::updater_status,
             commands::updater::updater_check_now,
             commands::updater::updater_install,
@@ -484,7 +479,6 @@ pub fn run() {
             commands::config::quit_app,
             commands::config::start_cache_warmup,
             commands::config::cancel_cache_warmup,
-            commands::config::get_warmup_status,
             commands::usage_io::export_usage_data,
             commands::usage_io::import_usage_data,
             commands::usage_io::sync_remote_devices,
@@ -1030,7 +1024,14 @@ pub(crate) async fn cleanup_duplicate_devices(state: &AppState) {
         now.date_naive(),
         now.hour() as u8,
     ));
-    if !removed.is_empty() {
+    let folded_cursor = archive.fold_shared_cursor_into_local(now.date_naive(), now.hour() as u8);
+    if folded_cursor > 0 {
+        tracing::info!(
+            folded = folded_cursor,
+            "Folded account-scoped Cursor rows from device archives into local:cursor"
+        );
+    }
+    if !removed.is_empty() || folded_cursor > 0 {
         tracing::info!(
             count = removed.len(),
             "Cleaned up {} duplicate device source(s) from the archive",

@@ -1,7 +1,7 @@
 use super::period::*;
 use super::{
-    maybe_capture_query_debug, parse_usage_selection, set_last_usage_debug, AppState,
-    UsageDebugReport,
+    maybe_capture_query_debug, merge_usage_source, merge_usage_warning, parse_usage_selection,
+    set_last_usage_debug, AppState, UsageDebugReport,
 };
 use crate::models::*;
 #[cfg(test)]
@@ -19,7 +19,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 
-const USAGE_PAYLOAD_CACHE_VERSION: &str = "model-pricing-2026-08-07-opus5";
+// Tied to PRICING_VERSION so a rates bump invalidates persisted usage payloads.
+const USAGE_PAYLOAD_CACHE_VERSION: &str = crate::usage::pricing::PRICING_VERSION;
 
 /// Spawn a background Cursor remote fetch when the cache is missing/expired.
 /// Deduped via `AppState::cursor_remote_fetch_inflight`. Always refreshes the
@@ -123,10 +124,6 @@ fn pad_daily_buckets(payload: &mut UsagePayload, start: NaiveDate, end: NaiveDat
         .sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
 }
 
-fn usage_access_enabled(state: &AppState) -> bool {
-    state.usage_access_enabled.load(Ordering::SeqCst)
-}
-
 /// Filter a UsagePayload's chart_buckets to only include dates in [start, end).
 /// Recalculates total_cost, total_tokens, and model_breakdown from the retained buckets.
 fn filter_buckets_to_range(payload: &mut UsagePayload, start: NaiveDate, end: NaiveDate) {
@@ -194,7 +191,7 @@ fn parser_payload_for_period(
     let since_str = bounds.start.format("%Y%m%d").to_string();
 
     let mut payload = match period {
-        "5h" => parser.get_blocks(provider, &since_str),
+        "5h" => parser.get_time_range(provider, bounds.range_start, bounds.range_end),
         "day" => parser.get_hourly(provider, &since_str),
         "week" => {
             let mut p = parser.get_daily(provider, &since_str);
@@ -233,14 +230,8 @@ fn attach_local_stats(
     let loaded = parser.load_entries_cached(provider, Some(bounds.start));
     let mut entries: Vec<_> = loaded.entries.clone();
     let mut change_events: Vec<_> = loaded.change_events.clone();
-    change_events.retain(|event| {
-        let date = event.timestamp.date_naive();
-        date >= bounds.start && date < bounds.end
-    });
-    entries.retain(|entry| {
-        let date = entry.timestamp.date_naive();
-        date >= bounds.start && date < bounds.end
-    });
+    change_events.retain(|event| bounds.contains_timestamp(event.timestamp));
+    entries.retain(|entry| bounds.contains_timestamp(entry.timestamp));
 
     payload.change_stats =
         aggregate_change_stats(&change_events, payload.total_cost, payload.total_tokens);
@@ -264,18 +255,17 @@ fn attach_local_stats(
     );
 }
 
-fn final_usage_cache_key(provider: &str, period: &str, offset: i32, interval_secs: u64) -> String {
-    // Include the resolved start date so date-relative keys (e.g. "day:0" = today)
-    // don't serve stale disk-cached payloads after a date rollover.
-    let date_tag = resolve_period_bounds(period, offset)
+/// Shared by `usage-view:` and `full:` so both miss after midnight / 5h bucket roll.
+/// `interval_secs == 0` ("off") is date-only.
+fn usage_cache_tags_with_reset(
+    period: &str,
+    offset: i32,
+    interval_secs: u64,
+    five_hour_reset: Option<chrono::DateTime<chrono::Local>>,
+) -> String {
+    let date_tag = resolve_period_bounds_with_reset(period, offset, five_hour_reset)
         .map(|b| b.start.format("%Y%m%d").to_string())
         .unwrap_or_default();
-    // The 5h window rolls continuously with wall-clock time, so a key fixed to
-    // provider:period:offset:date would serve a frozen payload until the source
-    // logs change. Mix in a coarse time bucket sized to the user's refresh
-    // interval so the window recomputes once per interval. Other periods are
-    // day-granular and need no sub-day busting. interval_secs == 0 ("off")
-    // falls back to the date-only key — no periodic refresh is expected then.
     let bucket_tag = if period == "5h" && interval_secs > 0 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -285,7 +275,33 @@ fn final_usage_cache_key(provider: &str, period: &str, offset: i32, interval_sec
     } else {
         String::new()
     };
-    format!("usage-view:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{date_tag}{bucket_tag}")
+    format!("{date_tag}{bucket_tag}")
+}
+
+fn final_usage_cache_key_with_reset(
+    provider: &str,
+    period: &str,
+    offset: i32,
+    interval_secs: u64,
+    five_hour_reset: Option<chrono::DateTime<chrono::Local>>,
+) -> String {
+    format!(
+        "usage-view:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{}",
+        usage_cache_tags_with_reset(period, offset, interval_secs, five_hour_reset)
+    )
+}
+
+fn full_usage_cache_key_with_reset(
+    provider: &str,
+    period: &str,
+    offset: i32,
+    interval_secs: u64,
+    five_hour_reset: Option<chrono::DateTime<chrono::Local>>,
+) -> String {
+    format!(
+        "full:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{}",
+        usage_cache_tags_with_reset(period, offset, interval_secs, five_hour_reset)
+    )
 }
 
 async fn finalize_usage_payload(
@@ -358,8 +374,9 @@ fn get_provider_chart_data(
     provider: &str,
     period: &str,
     offset: i32,
+    five_hour_reset: Option<chrono::DateTime<chrono::Local>>,
 ) -> Result<UsagePayload, String> {
-    let bounds = resolve_period_bounds(period, offset)?;
+    let bounds = resolve_period_bounds_with_reset(period, offset, five_hour_reset)?;
     parser_payload_for_period(parser, provider, period, &bounds)
 }
 
@@ -369,17 +386,20 @@ pub(crate) fn get_provider_data(
     period: &str,
     offset: i32,
 ) -> Result<UsagePayload, String> {
-    let bounds = resolve_period_bounds(period, offset)?;
+    get_provider_data_for_interval(parser, provider, period, offset, 0, None)
+}
 
-    // Single cache layer: stores the complete payload including stats.
-    // Keyed by the resolved start date for the same reason as the outer
-    // `usage-view:` key (see final_usage_cache_key): `day:0` means a different
-    // date after midnight, and this cache's 120s TTL would otherwise keep
-    // serving yesterday's payload past the day boundary.
-    let cache_key = format!(
-        "full:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{}",
-        bounds.start.format("%Y%m%d"),
-    );
+fn get_provider_data_for_interval(
+    parser: &UsageParser,
+    provider: &str,
+    period: &str,
+    offset: i32,
+    interval_secs: u64,
+    five_hour_reset: Option<chrono::DateTime<chrono::Local>>,
+) -> Result<UsagePayload, String> {
+    let bounds = resolve_period_bounds_with_reset(period, offset, five_hour_reset)?;
+    let cache_key =
+        full_usage_cache_key_with_reset(provider, period, offset, interval_secs, five_hour_reset);
     if let Some(cached) = parser.check_cache(&cache_key) {
         return Ok(cached);
     }
@@ -387,27 +407,9 @@ pub(crate) fn get_provider_data(
     let mut payload = parser_payload_for_period(parser, provider, period, &bounds)?;
     attach_local_stats(parser, &mut payload, provider, &bounds);
 
-    // Store the complete payload so cache hits skip everything above.
     parser.store_cache(&cache_key, payload.clone());
 
     Ok(payload)
-}
-
-fn merge_usage_source(left: UsageSource, right: UsageSource) -> UsageSource {
-    if left == right {
-        left
-    } else {
-        UsageSource::Mixed
-    }
-}
-
-fn merge_usage_warning(left: Option<String>, right: Option<String>) -> Option<String> {
-    match (left, right) {
-        (None, None) => None,
-        (Some(warning), None) | (None, Some(warning)) => Some(warning),
-        (Some(left), Some(right)) if left == right => Some(left),
-        (Some(left), Some(right)) => Some(format!("{left}\n{right}")),
-    }
 }
 
 fn merge_payloads(mut c: UsagePayload, x: UsagePayload) -> UsagePayload {
@@ -520,15 +522,12 @@ pub(crate) fn load_change_events_for_period(
     period: &str,
     offset: i32,
 ) -> Vec<ParsedChangeEvent> {
-    let Some((start_date, end_date)) = compute_date_bounds(period, offset) else {
+    let Ok(bounds) = resolve_period_bounds(period, offset) else {
         return Vec::new();
     };
 
-    let (_entries, mut change_events, _reports) = parser.load_entries(provider, Some(start_date));
-    change_events.retain(|event| {
-        let date = event.timestamp.date_naive();
-        date >= start_date && date < end_date
-    });
+    let (_entries, mut change_events, _reports) = parser.load_entries(provider, Some(bounds.start));
+    change_events.retain(|event| bounds.contains_timestamp(event.timestamp));
     change_events
 }
 
@@ -538,7 +537,7 @@ pub async fn get_known_models(
     state: State<'_, AppState>,
 ) -> Result<Vec<KnownModel>, String> {
     parse_usage_selection(&provider)?;
-    if !usage_access_enabled(&state) {
+    if !state.usage_access_enabled() {
         return Ok(Vec::new());
     }
 
@@ -596,7 +595,7 @@ pub(crate) async fn get_usage_data_inner(
 ) -> Result<UsagePayload, String> {
     let _ipc_t0 = std::time::Instant::now();
     tracing::info!("[PROFILE] get_usage_data: provider={provider} period={period} offset={offset}");
-    if !usage_access_enabled(state) {
+    if !state.usage_access_enabled() {
         return Ok(UsagePayload {
             usage_warning: Some(String::from("Usage access has not been enabled yet.")),
             ..UsagePayload::default()
@@ -609,8 +608,20 @@ pub(crate) async fn get_usage_data_inner(
 
     let parser = &state.parser;
     let selection = parse_usage_selection(provider)?;
+    let five_hour_reset = if period == "5h" {
+        let cached = state.cached_rate_limits.read().await;
+        official_five_hour_reset(provider, cached.as_ref())
+    } else {
+        None
+    };
     let refresh_interval_secs = *state.refresh_interval.read().await;
-    let final_cache_key = final_usage_cache_key(provider, period, offset, refresh_interval_secs);
+    let final_cache_key = final_usage_cache_key_with_reset(
+        provider,
+        period,
+        offset,
+        refresh_interval_secs,
+        five_hour_reset,
+    );
     // The 5h key is time-bucketed (see final_usage_cache_key), so every refresh
     // interval mints a fresh key. The disk cache has no TTL, so persisting one
     // entry per bucket would bloat it without ever being re-read (cold starts
@@ -670,7 +681,14 @@ pub(crate) async fn get_usage_data_inner(
 
     let mut payload = match selection {
         UsageIntegrationSelection::Single(integration_id) => {
-            let mut payload = get_provider_data(parser, provider, period, offset)?;
+            let mut payload = get_provider_data_for_interval(
+                parser,
+                provider,
+                period,
+                offset,
+                refresh_interval_secs,
+                five_hour_reset,
+            )?;
             payload.provider_detected =
                 Some(integration_id.detect_roots().iter().any(|r| r.exists()));
             set_last_usage_debug(
@@ -692,13 +710,18 @@ pub(crate) async fn get_usage_data_inner(
             finalize_usage_payload(state, provider, period, offset, payload).await
         }
         UsageIntegrationSelection::All => {
-            let bounds = resolve_period_bounds(period, offset)?;
+            let bounds = resolve_period_bounds_with_reset(period, offset, five_hour_reset)?;
             let mut merged: Option<UsagePayload> = None;
             let mut queries = Vec::new();
 
             for integration_id in all_usage_integrations() {
-                let mut payload =
-                    get_provider_chart_data(parser, integration_id.as_str(), period, offset)?;
+                let mut payload = get_provider_chart_data(
+                    parser,
+                    integration_id.as_str(),
+                    period,
+                    offset,
+                    five_hour_reset,
+                )?;
                 if let Some(warning) = payload.usage_warning.take() {
                     payload.usage_warning =
                         Some(format!("{}: {warning}", integration_id.display_name()));
@@ -742,7 +765,9 @@ pub(crate) async fn get_usage_data_inner(
     // Check if cursor remote data needs async fetching. The cache is range-aware:
     // a fetch is only needed when it doesn't already cover this period's `since`.
     let cursor_included = selection.includes_cursor();
-    let cursor_since = resolve_period_bounds(period, offset).ok().map(|b| b.start);
+    let cursor_since = resolve_period_bounds_with_reset(period, offset, five_hour_reset)
+        .ok()
+        .map(|b| b.start);
     let needs_cursor_remote = cursor_included && parser.needs_cursor_remote_fetch(cursor_since);
     // A fetch that just failed sits in its retry cooldown: nothing will be
     // spawned now, but the remote data is still unsettled. Keep the payload
@@ -790,6 +815,28 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn usage_cache_tags(period: &str, offset: i32, interval_secs: u64) -> String {
+        usage_cache_tags_with_reset(period, offset, interval_secs, None)
+    }
+
+    fn final_usage_cache_key(
+        provider: &str,
+        period: &str,
+        offset: i32,
+        interval_secs: u64,
+    ) -> String {
+        final_usage_cache_key_with_reset(provider, period, offset, interval_secs, None)
+    }
+
+    fn full_usage_cache_key(
+        provider: &str,
+        period: &str,
+        offset: i32,
+        interval_secs: u64,
+    ) -> String {
+        full_usage_cache_key_with_reset(provider, period, offset, interval_secs, None)
+    }
 
     fn bucket(label: &str, sort_key: &str, total: f64) -> ChartBucket {
         ChartBucket {
@@ -1199,10 +1246,17 @@ mod tests {
         );
         let payload = get_provider_data(&parser, "codex", "5h", 0).unwrap();
 
-        assert_eq!(payload.chart_buckets.len(), 1);
+        assert_eq!(
+            payload
+                .chart_buckets
+                .iter()
+                .filter(|b| b.total > 0.0)
+                .count(),
+            1
+        );
         assert!(
             payload.active_block.is_some(),
-            "codex 5h should use block payloads"
+            "codex 5h should treat the current window as live"
         );
         assert!(
             payload.five_hour_cost > 0.0,
@@ -1213,6 +1267,31 @@ mod tests {
             payload.usage_warning.is_none(),
             "codex 5h should not have a warning when using local parser directly"
         );
+    }
+
+    #[test]
+    fn five_h_includes_cross_midnight_usage_inside_official_window() {
+        let claude_dir = TempDir::new().unwrap();
+        let now = Local::now();
+        let reset = now + chrono::Duration::hours(1);
+        let start = reset - chrono::Duration::hours(5);
+        let inside = start + chrono::Duration::minutes(10);
+        let outside = start - chrono::Duration::minutes(10);
+        let content = format!(
+            r#"{{"type":"assistant","timestamp":"{outside}","message":{{"model":"claude-sonnet-4-6-20260301","usage":{{"input_tokens":1000,"output_tokens":500}},"stop_reason":"end_turn"}}}}
+{{"type":"assistant","timestamp":"{inside}","message":{{"model":"claude-sonnet-4-6-20260301","usage":{{"input_tokens":2000,"output_tokens":1000}},"stop_reason":"end_turn"}}}}"#,
+            outside = outside.to_rfc3339(),
+            inside = inside.to_rfc3339(),
+        );
+        write_file(&claude_dir.path().join("session.jsonl"), &content);
+
+        let parser = UsageParser::with_claude_dir(claude_dir.path().to_path_buf());
+        let payload =
+            get_provider_data_for_interval(&parser, "claude", "5h", 0, 0, Some(reset)).unwrap();
+
+        assert_eq!(payload.input_tokens, 2000);
+        assert!(payload.total_cost > 0.0);
+        assert!((payload.five_hour_cost - payload.total_cost).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1291,13 +1370,69 @@ mod tests {
             !five_off.contains(":b"),
             "5h key must not bucket when refresh is off"
         );
+
+        // Inner `full:` keys must carry the same tags, or an outer miss after
+        // midnight / bucket roll would still hit a stale inner entry.
+        let tags_30 = usage_cache_tags("5h", 0, 30);
+        let full_30 = full_usage_cache_key("claude", "5h", 0, 30);
+        let full_300 = full_usage_cache_key("claude", "5h", 0, 300);
+        assert!(k30.ends_with(&tags_30) && full_30.ends_with(&tags_30));
+        assert_ne!(full_30, full_300);
+        let day_tags = usage_cache_tags("day", 0, 30);
+        assert!(!day_tags.contains(":b"));
+        assert!(full_usage_cache_key("claude", "day", 0, 0).ends_with(&day_tags));
+        assert!(day_30.ends_with(&day_tags));
+    }
+
+    #[test]
+    fn usage_payload_cache_version_follows_pricing_table() {
+        assert_eq!(
+            USAGE_PAYLOAD_CACHE_VERSION,
+            crate::usage::pricing::PRICING_VERSION
+        );
+        let key = final_usage_cache_key("all", "day", 0, 0);
+        assert!(
+            key.contains(USAGE_PAYLOAD_CACHE_VERSION),
+            "disk cache key must include pricing version, got {key}"
+        );
+    }
+
+    #[test]
+    fn inner_full_cache_misses_stale_date_and_5h_bucket() {
+        let dir = TempDir::new().unwrap();
+        let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
+        let stale = UsagePayload {
+            total_cost: 99.0,
+            ..UsagePayload::default()
+        };
+
+        // Pre-fix inner key (no date_tag): must not be served as "today".
+        parser.store_cache(
+            &format!("full:{USAGE_PAYLOAD_CACHE_VERSION}:claude:day:0"),
+            stale.clone(),
+        );
+        let day = get_provider_data(&parser, "claude", "day", 0).unwrap();
+        assert!(
+            !day.from_cache,
+            "full: key without date_tag must miss after a date rollover"
+        );
+        assert_ne!(day.total_cost, 99.0);
+
+        // Different 5h refresh bucket: must not reuse the frozen block.
+        parser.store_cache(&full_usage_cache_key("claude", "5h", 0, 30), stale);
+        let five = get_provider_data_for_interval(&parser, "claude", "5h", 0, 300, None).unwrap();
+        assert!(
+            !five.from_cache,
+            "full: key from a different 5h bucket must miss"
+        );
+        assert_ne!(five.total_cost, 99.0);
     }
 
     #[test]
     fn clearing_usage_view_cache_keeps_provider_cache_entries() {
         let dir = TempDir::new().unwrap();
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
-        let full_key = String::from("full:claude:day:0");
+        let full_key = full_usage_cache_key("claude", "day", 0, 0);
         let final_key = final_usage_cache_key("claude", "day", 0, 0);
 
         parser.store_cache(&full_key, UsagePayload::default());

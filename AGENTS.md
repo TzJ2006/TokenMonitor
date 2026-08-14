@@ -4,7 +4,7 @@ Local-first, cross-platform (macOS/Windows/Linux) system-tray app that monitors 
 Cursor token usage. Stack: Tauri v2 + Svelte 5 frontend (`src/`), Rust backend (`src-tauri/`). It parses JSONL
 session logs from disk, prices them in Rust, and shows spend + rate limits in a tray popover and an optional
 FloatBall overlay. Entry points: `src/main.ts` (main window), `src/float-ball.ts` (FloatBall, separate Vite
-entry), `src-tauri/src/main.rs` → `lib.rs` (backend). There is no root README; `docs/DEVELOPMENT.md` is the
+entry), `src-tauri/src/main.rs` → `lib.rs` (backend). Root `README.md` covers product overview and architecture; `docs/DEVELOPMENT.md` is the
 maintained dev guide. Current version: 0.14.x.
 
 ## Commands

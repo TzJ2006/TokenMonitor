@@ -4,8 +4,12 @@ import type { Settings } from "./settings.js";
 
 const mockLoad = vi.fn();
 const mockSetCurrency = vi.fn();
+const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/plugin-store", () => ({
   load: (...args: unknown[]) => mockLoad(...args),
+}));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => mockInvoke(...args),
 }));
 
 vi.mock("../utils/format.js", () => ({
@@ -39,6 +43,8 @@ beforeEach(() => {
   vi.resetModules();
   mockLoad.mockReset();
   mockSetCurrency.mockReset();
+  mockInvoke.mockReset();
+  mockInvoke.mockResolvedValue({});
 });
 
 afterEach(() => {
@@ -100,7 +106,6 @@ describe("loadSettings", () => {
         costPrecision: 'full',
       },
       glassEffect: false,
-      showModelChangeStats: false,
       floatBall: false,
       sshHosts: [],
       remoteDeviceIncludes: [],
@@ -164,7 +169,6 @@ describe("loadSettings", () => {
         costPrecision: 'full',
       },
       glassEffect: false,
-      showModelChangeStats: false,
       floatBall: false,
       sshHosts: [],
       remoteDeviceIncludes: [],
@@ -187,13 +191,6 @@ describe("loadSettings", () => {
     expect(get(settings)).toEqual(fallback);
     expect(mockSetCurrency).toHaveBeenCalledWith("USD");
     expect(warnSpy).toHaveBeenCalled();
-  });
-
-  it("defaults showModelChangeStats to false", async () => {
-    mockLoad.mockResolvedValueOnce(makePersistedStore({}));
-    const { loadSettings, settings } = await loadSettingsModule();
-    await loadSettings();
-    expect(get(settings).showModelChangeStats).toBe(false);
   });
 
   it("defaults showDockIcon to false", async () => {
@@ -357,6 +354,38 @@ describe("loadSettings migration", () => {
     });
     expect(loaded.headerTabs.claude.label).toHaveLength(MAX_HEADER_TAB_LABEL_LENGTH);
   });
+
+  it("migrates a plaintext cursorApiKey into the keyring and strips it from the store", async () => {
+    const store = makePersistedStore({
+      cursorApiKey: "key_legacy_plaintext",
+    });
+    mockLoad.mockResolvedValueOnce(store);
+
+    const { loadSettings, settings, updateSetting } = await loadSettingsModule();
+    const loaded = await loadSettings();
+
+    expect(mockInvoke).toHaveBeenCalledWith("set_cursor_auth_config", {
+      apiKey: "key_legacy_plaintext",
+    });
+    expect(loaded.cursorApiKey).toBe("");
+    expect(get(settings).cursorApiKey).toBe("");
+    const afterMigrate = store.set.mock.calls.find((call) => call[0] === "settings")?.[1] as
+      | Record<string, unknown>
+      | undefined;
+    expect(afterMigrate).toBeDefined();
+    expect(afterMigrate).not.toHaveProperty("cursorApiKey");
+
+    store.set.mockClear();
+    await updateSetting("cursorApiKey", "key_new_secret");
+    expect(store.set).not.toHaveBeenCalled();
+
+    await updateSetting("theme", "dark");
+    const afterTheme = store.set.mock.calls.find((call) => call[0] === "settings")?.[1] as
+      | Record<string, unknown>
+      | undefined;
+    expect(afterTheme?.theme).toBe("dark");
+    expect(afterTheme).not.toHaveProperty("cursorApiKey");
+  });
 });
 
 describe("header tab helpers", () => {
@@ -438,6 +467,7 @@ describe("updateSetting", () => {
         hiddenModels: ["haiku"],
       }),
     );
+    expect(store.set.mock.calls[0]?.[1]).not.toHaveProperty("cursorApiKey");
     await vi.waitFor(() => {
       expect(store.save).toHaveBeenCalledTimes(1);
     });

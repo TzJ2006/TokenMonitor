@@ -15,6 +15,7 @@
     fetchData,
     warmCache,
     warmAllPeriods,
+    usageRefreshError,
   } from "./lib/stores/usage.js";
   import {
     ALL_USAGE_PROVIDER_ID,
@@ -53,10 +54,8 @@
   import { createResizeOrchestrator, type ResizeOrchestrator } from "./lib/window/resizeOrchestrator.js";
   import { syncNativeWindowSurface } from "./lib/window/appearance.js";
   import {
-    captureResizeDebugSnapshot,
     formatDebugError,
     initResizeDebug,
-    isResizeDebugEnabled,
     logResizeDebug,
   } from "./lib/window/uiStability.js";
   import { setupAppEventListeners } from "./lib/appEventListeners.js";
@@ -93,6 +92,7 @@
   let data = $state($usageData);
   let loading = $state(false);
   let placeholderLoading = $state(false);
+  let refreshError = $state<string | null>(null);
   let showRefresh = $state(false);
   let rateLimits = $state<RateLimitsPayload | null>(null);
   let rateLimitsRequest = $state({
@@ -223,6 +223,7 @@
   $effect(() => {
     const unsub1 = usageData.subscribe((v) => (data = v));
     const unsub2 = isLoading.subscribe((v) => (loading = v));
+    const unsubRefreshErr = usageRefreshError.subscribe((v) => (refreshError = v));
     const unsubProvider = activeProvider.subscribe((v) => (provider = v));
     const unsubPeriod = activePeriod.subscribe((v) => (period = v));
     const unsubPL = isPlaceholderLoading.subscribe((v) => {
@@ -237,7 +238,7 @@
     });
     const unsub4 = rateLimitsData.subscribe((v) => (rateLimits = v));
     const unsub5 = rateLimitsRequestState.subscribe((v) => (rateLimitsRequest = v));
-    return () => { unsub1(); unsub2(); unsubProvider(); unsubPeriod(); unsubPL(); unsub3(); unsub4(); unsub5(); };
+    return () => { unsub1(); unsub2(); unsubRefreshErr(); unsubProvider(); unsubPeriod(); unsubPL(); unsub3(); unsub4(); unsub5(); };
   });
 
   // Apply/remove data-provider attribute reactively
@@ -510,26 +511,9 @@
       },
       currentMonitor: () => currentMonitor(),
       logDebug: logResizeDebug,
-      captureDebugSnapshot: (reason) =>
-        captureResizeDebugSnapshot(reason, popEl, {
-          maxWindowH: resizeOrch?.getMaxWindowH() ?? DEFAULT_MAX_WINDOW_HEIGHT,
-          scrollThresholdH: resizeOrch?.getScrollThresholdH() ?? DEFAULT_MAX_WINDOW_HEIGHT,
-          isScrollLocked: resizeOrch?.getIsScrollLocked() ?? false,
-        }),
       formatDebugError,
-      isDebugEnabled: isResizeDebugEnabled,
       onHeightApplied: persistWindowHeight,
     });
-
-    /** Local snapshot helper for event handlers that need debug snapshots. */
-    const captureSnapshot = (reason: string) =>
-      isResizeDebugEnabled()
-        ? captureResizeDebugSnapshot(reason, popEl, {
-            maxWindowH: resizeOrch?.getMaxWindowH() ?? DEFAULT_MAX_WINDOW_HEIGHT,
-            scrollThresholdH: resizeOrch?.getScrollThresholdH() ?? DEFAULT_MAX_WINDOW_HEIGHT,
-            isScrollLocked: resizeOrch?.getIsScrollLocked() ?? false,
-          })
-        : {};
 
     const applyMonitorMetricsToView = () => {
       const fixedH = resizeOrch?.getFixedWindowH() ?? 0;
@@ -544,7 +528,6 @@
           source,
           viewportWidth: Math.round(window.innerWidth),
           devicePixelRatio: window.devicePixelRatio,
-          ...captureSnapshot(`monitor-recalibration-start-${source}`),
         });
         await resizeOrch.refreshWindowMetrics();
         if (cancelled) return;
@@ -584,14 +567,13 @@
           viewportWidth,
           devicePixelRatio,
           viewportChanged,
-          ...captureSnapshot("browser-resize"),
         });
         if (viewportChanged) {
           scheduleWindowGeometryRecalibration("browser-resize");
         }
       },
       onFocus: () => {
-        logResizeDebug("window:focus", captureSnapshot("window-focus"));
+        logResizeDebug("window:focus", {});
         void syncNativeWindowSurface().catch((e) => logger.debug("appearance", `syncNativeWindowSurface failed: ${e}`));
         scheduleWindowGeometryRecalibration("window-focus", 0);
         syncSizeAndVerify("window-focus");
@@ -600,7 +582,7 @@
         if (period === "5h") fetchRateLimits(provider);
       },
       onBlur: () => {
-        logResizeDebug("window:blur", captureSnapshot("window-blur"));
+        logResizeDebug("window:blur", {});
         // Safety net: if the popover is dismissed without a mouseleave firing,
         // treat blur as "pointer gone" so a queued shrink still flushes.
         resizeOrch?.setMouseOverWindow(false);
@@ -623,7 +605,6 @@
         logResizeDebug("document:visibility-change", {
           hidden: document.hidden,
           visibilityState: document.visibilityState,
-          ...captureSnapshot("document-visibility-change"),
         });
       },
       onColorSchemeChange: (matchesLight) => {
@@ -641,14 +622,11 @@
         void Promise.allSettled(updates);
       },
     });
-    logResizeDebug("app:mount", captureSnapshot("mount"));
+    logResizeDebug("app:mount", {});
 
     const init = async () => {
-      const _t0 = performance.now();
-      console.log('[PROFILE] init:start');
       await resizeOrch!.refreshWindowMetrics();
       applyMonitorMetricsToView();
-      console.log(`[PROFILE] init:window-metrics = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       // Load persisted settings and apply theme + defaults (non-blocking)
       try {
@@ -664,7 +642,6 @@
         // Settings load failed — continue with defaults
         logResizeDebug("app:settings-load-failed", {});
       }
-      console.log(`[PROFILE] init:settings+bootstrap = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       // Restore the window to its last-known height before the chart renders.
       // In fixed-height mode, don't restore persisted height — content will
@@ -687,13 +664,11 @@
           }
         }
       }
-      console.log(`[PROFILE] init:window-restore = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       if (get(settings).hasSeenWelcome) {
         await loadInitialData();
         if (cancelled) return;
       }
-      console.log(`[PROFILE] init:loadInitialData = ${(performance.now() - _t0).toFixed(1)}ms`);
       if (isWindows()) {
         try {
           const edge = await invoke<string>("get_window_anchor_edge");
@@ -703,7 +678,6 @@
 
       void refreshStatuslineProbe();
       appReady = true;
-      console.log(`[PROFILE] init:appReady = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       if (popEl) {
         observer = new ResizeObserver((entries) => {
@@ -712,7 +686,6 @@
               width: entry.contentRect.width,
               height: entry.contentRect.height,
             })),
-            ...captureSnapshot("resize-observer"),
           });
           resizeOrch?.resizeToContent("resize-observer");
         });
@@ -745,7 +718,6 @@
         await tick();
         resizeOrch?.markInitialContentReady();
       }
-      console.log(`[PROFILE] init:TOTAL = ${(performance.now() - _t0).toFixed(1)}ms`);
 
       unlisten = await listen("data-updated", () => {
         logResizeDebug("app:data-updated-event", {
@@ -770,7 +742,6 @@
           width: payload.width,
           height: payload.height,
           widthChanged,
-          ...captureSnapshot("tauri-window-resized"),
         });
         if (widthChanged) {
           scheduleWindowGeometryRecalibration("tauri-window-resized");
@@ -875,6 +846,23 @@
                 >&times;</button>
               </div>
               <div class="usage-warning-text">{data.usage_warning}</div>
+            </div>
+          {/if}
+          {#if refreshError}
+            <div class="usage-warning">
+              <div class="usage-warning-header">
+                <div class="usage-warning-title">Refresh failed</div>
+                <button
+                  class="usage-warning-dismiss"
+                  onclick={() => usageRefreshError.set(null)}
+                  aria-label="Dismiss refresh error"
+                >&times;</button>
+              </div>
+              <div class="usage-warning-text">{refreshError}</div>
+              <button
+                class="usage-warning-retry"
+                onclick={() => fetchData(provider, period, offset, { silent: true })}
+              >Retry</button>
             </div>
           {/if}
           <div class="hr"></div>
@@ -1092,7 +1080,6 @@
     padding: 24px 0;
   }
   .rate-limit-empty,
-  .rate-limit-permission,
   .rate-limit-stale-banner {
     display: flex;
     flex-direction: column;
@@ -1127,20 +1114,12 @@
     color: var(--t3);
     padding-left: 12px;
   }
-  .rate-limit-permission {
-    gap: 7px;
-  }
   .rate-limit-empty-title {
     font: 500 11px/1 'Inter', sans-serif;
     color: var(--t1);
   }
   .rate-limit-empty-text {
     font: 400 9px/1.4 'Inter', sans-serif;
-    color: var(--t3);
-  }
-  .rate-limit-note {
-    margin: 6px 14px 0;
-    font: 400 9px/1.35 'Inter', sans-serif;
     color: var(--t3);
   }
   .usage-warning {
@@ -1187,6 +1166,19 @@
     font: 400 8.5px/1.35 'Inter', sans-serif;
     color: var(--t2);
   }
+  .usage-warning-retry {
+    margin-top: 6px;
+    padding: 3px 8px;
+    border: 1px solid color-mix(in srgb, #d88d31 40%, transparent);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--t1);
+    font: 500 9px/1 'Inter', sans-serif;
+    cursor: pointer;
+  }
+  .usage-warning-retry:hover {
+    background: var(--surface-hover);
+  }
   .rate-limit-cta {
     margin-top: 10px;
     align-self: flex-start;
@@ -1200,8 +1192,7 @@
     transition: filter var(--t-fast) ease;
   }
   .rate-limit-cta:hover:not(:disabled) { filter: brightness(1.08); }
-  .rate-limit-cta:disabled,
-  .rate-limit-secondary:disabled {
+  .rate-limit-cta:disabled {
     cursor: default;
     opacity: .55;
   }
@@ -1244,29 +1235,6 @@
     width: 16px; height: 16px;
     color: var(--accent, var(--t1));
     opacity: 0.85;
-  }
-  .rate-limit-actions {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    margin-top: 7px;
-  }
-  .rate-limit-actions .rate-limit-cta {
-    margin-top: 0;
-  }
-  .rate-limit-secondary {
-    padding: 6px 8px;
-    border: 1px solid var(--border-subtle);
-    border-radius: 6px;
-    background: transparent;
-    color: var(--t2);
-    font: 500 10px/1 'Inter', sans-serif;
-    cursor: pointer;
-    transition: background var(--t-fast) ease, color var(--t-fast) ease;
-  }
-  .rate-limit-secondary:hover:not(:disabled) {
-    background: var(--surface-hover);
-    color: var(--t1);
   }
   .refresh-bar {
     position: absolute;

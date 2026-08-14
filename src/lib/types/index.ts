@@ -4,7 +4,7 @@ export type UsageProvider = string;
 export type RateLimitProviderId = string;
 export type UsagePeriod = "5h" | "day" | "week" | "month" | "year";
 export type DefaultPeriod = Exclude<UsagePeriod, "year">;
-export type UsageSource = "ccusage" | "parser" | "mixed";
+export type UsageSource = "parser" | "mixed";
 
 export interface HeaderTabConfig {
   label: string;
@@ -140,12 +140,6 @@ export type AccordionToggleDetail = {
   durationMs: number;
   expanding: boolean;
   scope: "main" | "subagents" | "devices";
-};
-
-export type ChartDetailToggleDetail = {
-  durationMs: number;
-  fromHeight: number;
-  toHeight: number;
 };
 
 export interface CalendarDay {

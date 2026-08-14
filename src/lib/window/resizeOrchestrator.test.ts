@@ -82,9 +82,7 @@ function createTestOrchestrator(options?: {
     onScrollLockChange: () => {},
     currentMonitor: async () => null,
     logDebug: () => {},
-    captureDebugSnapshot: () => ({}),
     formatDebugError: () => ({ message: "test" }),
-    isDebugEnabled: () => false,
   });
 }
 

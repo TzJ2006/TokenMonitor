@@ -135,7 +135,7 @@ Below the metrics row, select a time period:
 
 | Period | What it shows |
 |--------|--------------|
-| **5h** | Current 5-hour billing window — cost, burn rate, and projected spend |
+| **5h** | Claude's official 5-hour rate-limit window — cost, burn rate, and projected spend |
 | **day** | Today's usage. Use < > arrows to browse previous days |
 | **week** | This week's daily breakdown. Navigate to past weeks |
 | **month** | This month's daily breakdown. Navigate to past months |
@@ -171,7 +171,7 @@ Models are sorted by cost (highest first). You can hide specific models from the
 
 The **footer** at the bottom of the popover shows live session information:
 
-- **Active block cost** — How much you've spent in the current 5-hour billing window
+- **Active block cost** — How much you've spent in the official 5-hour rate-limit window
 - **Burn rate** — Estimated cost per hour based on recent activity
 - **Projected cost** — Where you'll end up if the current pace continues to the end of the 5-hour window
 
@@ -389,7 +389,7 @@ If none are available, the rate limit panels are simply hidden. Rate limits must
 - **Quick glance**: Keep the tray cost display enabled for at-a-glance spend monitoring
 - **Navigate history**: Use < > arrows heavily — understanding past patterns helps budget future usage
 - **Model awareness**: Check the model breakdown regularly. Switching to a cheaper model for simple tasks can significantly reduce costs
-- **5h window**: The 5-hour view maps to Claude's billing windows. Use it to pace yourself within rate limit cycles
+- **5h window**: The 5h tab is Claude's official 5-hour rate-limit window. Use it to pace yourself within rate limit cycles
 - **FloatBall**: Enable FloatBall when you want persistent cost visibility while coding in other windows
 - **Remote devices**: If you use Claude Code on multiple machines, SSH sync lets you see total spend in one place
 - **Cursor spend limits**: If you use Cursor with a spend limit, TokenMonitor shows both plan usage and spend limit utilization

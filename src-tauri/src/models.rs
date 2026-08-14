@@ -16,7 +16,7 @@ pub enum UsageSource {
 pub struct UsagePayload {
     pub total_cost: f64,
     pub total_tokens: u64,
-    /// 5H: number of activity blocks (split by 30-min gaps); others: buckets with nonzero cost
+    /// 5h: hourly buckets with cost; others: buckets with nonzero cost
     pub session_count: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -26,9 +26,9 @@ pub struct UsagePayload {
     pub web_search_requests: u64,
     pub chart_buckets: Vec<ChartBucket>,
     pub model_breakdown: Vec<ModelSummary>,
-    /// 5H period only — current session burn rate and projection
+    /// 5h period only — burn rate and projection for the official window
     pub active_block: Option<ActiveBlock>,
-    /// 5H period only — cost of the active (or total) block
+    /// 5h period only — cost inside the official (or rolling) 5h window
     pub five_hour_cost: f64,
     pub last_updated: String,
     pub from_cache: bool,

@@ -6,10 +6,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use super::http::rate_limit_error_from_response;
-use super::RateLimitFetchError;
-
-const ANTHROPIC_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const ANTHROPIC_ACCOUNT_URL: &str = "https://api.anthropic.com/api/oauth/account";
+use super::{as_f64, humanize_snake_case, RateLimitFetchError};
 
 /// In-process cache of the Claude OAuth access token.
 ///
@@ -192,33 +189,6 @@ pub(super) fn claude_window_label(window_id: &str) -> String {
         .unwrap_or_else(|| humanize_snake_case(window_id))
 }
 
-fn humanize_snake_case(field: &str) -> String {
-    field
-        .split(['_', '-'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => {
-                    let mut out = first.to_uppercase().collect::<String>();
-                    out.push_str(&chars.as_str().to_lowercase());
-                    out
-                }
-                None => part.to_string(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn as_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
-}
-
 fn claude_window_from_value(value: &Value) -> Option<(f64, Option<String>)> {
     // OAuth usage uses `utilization`; statusline uses `used_percentage`.
     let utilization = value
@@ -359,13 +329,13 @@ async fn try_fetch_claude_rate_limits() -> FetchAttempt {
 
     // Fetch usage + account in parallel
     let usage_fut = client
-        .get(ANTHROPIC_USAGE_URL)
+        .get(crate::ops::anthropic_usage_url())
         .bearer_auth(&token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .send();
 
     let account_fut = client
-        .get(ANTHROPIC_ACCOUNT_URL)
+        .get(crate::ops::anthropic_account_url())
         .bearer_auth(&token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .send();

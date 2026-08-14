@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { get, writable } from "svelte/store";
 import { load } from "@tauri-apps/plugin-store";
 import {
@@ -41,7 +42,6 @@ export interface Settings {
   brandTheming: boolean;
   trayConfig: TrayConfig;
   glassEffect: boolean;
-  showModelChangeStats: boolean;
   floatBall: boolean;
   sshHosts: SshHostConfig[];
   remoteDeviceIncludes: RemoteDeviceIncludeConfig[];
@@ -52,7 +52,11 @@ export interface Settings {
    * cosmetic toggle — kept so users can hide the rate-limit row entirely.
    */
   rateLimitsEnabled: boolean;
-  /** Optional Cursor Admin/Analytics API key. Stored locally and never logged. */
+  /**
+   * Optional Cursor Admin/Analytics API key. In-memory UI field only —
+   * persisted via OS keyring (`set_cursor_auth_config`), never written to
+   * `settings.json`, and never logged.
+   */
   cursorApiKey: string;
   /** Legacy: set once the user has handled the Keychain access prompt. */
   keychainAccessRequested: boolean;
@@ -149,7 +153,6 @@ const DEFAULTS: Settings = {
     costPrecision: 'full',
   },
   glassEffect: false,
-  showModelChangeStats: false,
   floatBall: false,
   sshHosts: [],
   remoteDeviceIncludes: [],
@@ -412,7 +415,6 @@ export function normalizeSettings(saved?: Partial<Settings> | null): Settings {
     brandTheming: normalizeBoolean(saved?.brandTheming, DEFAULTS.brandTheming),
     trayConfig: normalizeTrayConfig(saved?.trayConfig),
     glassEffect: normalizeBoolean(saved?.glassEffect, DEFAULTS.glassEffect),
-    showModelChangeStats: normalizeBoolean(saved?.showModelChangeStats, DEFAULTS.showModelChangeStats),
     floatBall: normalizeBoolean(saved?.floatBall, DEFAULTS.floatBall),
     sshHosts: normalizeSshHosts(saved?.sshHosts),
     remoteDeviceIncludes: normalizeRemoteDeviceIncludes(saved?.remoteDeviceIncludes),
@@ -551,6 +553,27 @@ export async function loadSettings(): Promise<Settings> {
       }
     }
 
+    // ponytail: keyring is the encryption. Legacy plaintext copies in
+    // settings.json are migrated once, then stripped. Do not strip on
+    // migrate failure — next launch retries, and bootstrap can still
+    // forward the in-memory value.
+    const plaintextCursorKey = merged.cursorApiKey;
+    const hadCursorApiKeyField =
+      saved != null && typeof saved === "object" && "cursorApiKey" in saved;
+    if (plaintextCursorKey) {
+      try {
+        await invoke("set_cursor_auth_config", { apiKey: plaintextCursorKey });
+        merged.cursorApiKey = "";
+        await persistSettings(merged);
+        logger.info("settings", "Migrated Cursor API key from settings.json into keyring");
+      } catch (error) {
+        console.warn("Failed to migrate Cursor API key into keyring:", error);
+      }
+    } else if (hadCursorApiKeyField) {
+      merged.cursorApiKey = "";
+      await persistSettings(merged);
+    }
+
     settings.set(merged);
     setCurrency(merged.currency);
     return merged;
@@ -568,7 +591,9 @@ async function persistSettings(next: Settings): Promise<void> {
   if (!storeInstance) return;
 
   try {
-    await storeInstance.set("settings", next);
+    // ponytail: keyring is the encryption; never write the secret to plugin-store.
+    const { cursorApiKey: _secret, ...rest } = next;
+    await storeInstance.set("settings", rest);
     await storeInstance.save();
   } catch (error) {
     console.warn("Failed to persist settings:", error);
@@ -617,7 +642,9 @@ export async function updateSetting<K extends keyof Settings>(
     setCurrency(updated.currency);
   }
 
-  await persistSettings(updated);
+  if (key !== "cursorApiKey") {
+    await persistSettings(updated);
+  }
 }
 
 export function applyTheme(theme: Settings["theme"]) {

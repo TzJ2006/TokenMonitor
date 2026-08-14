@@ -81,6 +81,7 @@ pub fn get_work_area(hwnd: HWND) -> Option<RECT> {
 // Removed apply_float_ball_region and FloatBallRegionDirection since
 // region clipping causes DWM artifacts on Windows 11 for layered windows.
 
+#[cfg(test)]
 fn aligned_window_origin(
     work: RECT,
     current_rect: RECT,
@@ -229,44 +230,6 @@ pub fn activate_window(window: &WebviewWindow) {
     let hwnd = HWND(hwnd_raw.0 as *mut _);
     unsafe {
         let _ = SetForegroundWindow(hwnd);
-    }
-}
-
-/// Align window to the work area using the last detected anchor corner.
-/// Used after every window resize.
-pub fn align_to_work_area(window: &WebviewWindow) {
-    let Ok(hwnd_raw) = window.hwnd() else { return };
-    let hwnd = HWND(hwnd_raw.0 as *mut _);
-
-    let Some(work) = get_work_area(hwnd) else {
-        return;
-    };
-
-    let mut win_rect = RECT::default();
-    unsafe {
-        if GetWindowRect(hwnd, &mut win_rect).is_err() {
-            return;
-        }
-    }
-
-    let win_h = win_rect.bottom - win_rect.top;
-    let win_w = win_rect.right - win_rect.left;
-
-    let (target_x, clamped_y) =
-        aligned_window_origin(work, win_rect, win_w, win_h, current_anchor());
-
-    if target_x != win_rect.left || clamped_y != win_rect.top {
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                target_x,
-                clamped_y,
-                0,
-                0,
-                SWP_NOZORDER | SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
-            );
-        }
     }
 }
 
