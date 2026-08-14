@@ -1318,15 +1318,17 @@ mod tests {
     #[test]
     fn load_entries_populates_entries_cache_for_subsequent_cached_calls() {
         let dir = TempDir::new().unwrap();
-        let now = Local::now();
-        let ts = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let today = Local::now().date_naive();
+        // Anchor the fixture to the day being queried rather than to `now`:
+        // a `now - 1h` timestamp falls on the previous day between 00:00 and
+        // 01:00 local time, and the `since = today` filter would drop it.
+        let ts = local_timestamp(today, 10);
         let content = format!(
             r#"{{"type":"assistant","timestamp":"{ts}","message":{{"model":"claude-sonnet-4-6-20260301","usage":{{"input_tokens":2000,"output_tokens":800}},"stop_reason":"end_turn"}}}}"#,
         );
         write_file(&dir.path().join("session.jsonl"), &content);
 
         let parser = UsageParser::with_claude_dir(dir.path().to_path_buf());
-        let today = now.date_naive();
 
         // First call via load_entries (as get_hourly does internally)
         let (entries, _, _) = parser.load_entries("claude", Some(today));
