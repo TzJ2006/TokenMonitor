@@ -545,6 +545,14 @@ fn segment_map_to_model_summaries(map: &HashMap<String, SegmentAgg>) -> Vec<Mode
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CACHE_TTL_SECS: u64 = 120;
+/// How long a failed Cursor remote fetch suppresses further fetch attempts.
+///
+/// A failed fetch stores no entries, so without this marker
+/// [`UsageParser::needs_cursor_remote_fetch`] stays `true` forever and every
+/// UI/tray refresh respawns the same failing fetch — a tight retry loop. Held
+/// at the cache TTL so a persistently failing endpoint is retried at most once
+/// per refresh interval, exactly like an expired cache.
+const CURSOR_REMOTE_FAILURE_COOLDOWN_SECS: u64 = CACHE_TTL_SECS;
 const MAX_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_FILE_CACHE_ENTRIES: usize = 4096;
 
@@ -557,6 +565,10 @@ pub struct UsageParser {
     archive: Mutex<Option<super::archive::ArchiveManager>>,
     entries_cache: Mutex<HashMap<String, (Instant, Arc<LoadedEntries>)>>,
     cursor_remote_cache: Mutex<Option<CachedCursorRemote>>,
+    /// When the last background Cursor remote fetch failed. Gates
+    /// `needs_cursor_remote_fetch` for `CURSOR_REMOTE_FAILURE_COOLDOWN_SECS`
+    /// so a failing fetch cannot be respawned on every refresh.
+    cursor_remote_failure_at: Mutex<Option<Instant>>,
     /// Earliest entry date per provider string, cached so `has_entries_before`
     /// answers in O(1) instead of re-scanning every session file per query.
     /// Invalidated on source change (`invalidate_if_changed`) and `clear_cache`.
@@ -707,6 +719,7 @@ impl UsageParser {
             archive: Mutex::new(None),
             entries_cache: Mutex::new(HashMap::new()),
             cursor_remote_cache: Mutex::new(None),
+            cursor_remote_failure_at: Mutex::new(None),
             earliest_date_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -746,6 +759,38 @@ impl UsageParser {
                 covered_since,
             });
         }
+        drop(guard);
+        // The endpoint answered, so any earlier failure cooldown is obsolete —
+        // even when a wider concurrent fetch won the `replace` race.
+        self.clear_cursor_remote_failure();
+    }
+
+    /// Record that a background Cursor remote fetch failed (API error, bad
+    /// payload, or a panicked task).
+    ///
+    /// A failure stores no entries, so `needs_cursor_remote_fetch` would stay
+    /// `true` and the next refresh would respawn the same doomed fetch. This
+    /// marker suppresses retries for `CURSOR_REMOTE_FAILURE_COOLDOWN_SECS`,
+    /// cleared as soon as a fetch succeeds (or the cache is cleared).
+    pub(crate) fn note_cursor_remote_failure(&self) {
+        if let Ok(mut guard) = self.cursor_remote_failure_at.lock() {
+            *guard = Some(Instant::now());
+        }
+    }
+
+    fn clear_cursor_remote_failure(&self) {
+        if let Ok(mut guard) = self.cursor_remote_failure_at.lock() {
+            *guard = None;
+        }
+    }
+
+    /// True while a recent fetch failure still suppresses retries.
+    pub(crate) fn cursor_remote_failure_cooldown_active(&self) -> bool {
+        self.cursor_remote_failure_at
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .is_some_and(|at| at.elapsed().as_secs() < CURSOR_REMOTE_FAILURE_COOLDOWN_SECS)
     }
 
     /// Non-consuming read of the cursor remote cache for a requested `since`.
@@ -782,6 +827,16 @@ impl UsageParser {
         if let Some(cache) = guard.as_mut() {
             if let Some(aged) = Instant::now().checked_sub(age) {
                 cache.stored_at = aged;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_cursor_remote_failure_for_test(&self, age: std::time::Duration) {
+        let mut guard = self.cursor_remote_failure_at.lock().unwrap();
+        if let Some(at) = guard.as_mut() {
+            if let Some(aged) = Instant::now().checked_sub(age) {
+                *at = aged;
             }
         }
     }
@@ -854,6 +909,9 @@ impl UsageParser {
     pub fn clear_cache(&self) {
         self.clear_payload_cache();
         set_cursor_warning(None);
+        // An explicit cache clear is the user's escape hatch (e.g. after fixing
+        // Cursor auth) — let the next query retry immediately.
+        self.clear_cursor_remote_failure();
         if let Ok(mut c) = self.file_cache.lock() {
             c.clear();
         }
@@ -1554,9 +1612,16 @@ impl UsageParser {
     /// Returns `true` when Cursor remote auth is configured and the cache does
     /// not already cover the requested `since` range — indicating a background
     /// fetch should be spawned (adaptive widening: only fetch the part we lack).
+    ///
+    /// Returns `false` during the cooldown that follows a failed fetch: a
+    /// failure caches nothing, so without the cooldown every refresh triggered
+    /// by the previous failure would spawn the next one.
     pub(crate) fn needs_cursor_remote_fetch(&self, req_since: Option<NaiveDate>) -> bool {
         use super::cursor_parser::resolve_cursor_auth;
         if resolve_cursor_auth().is_none() {
+            return false;
+        }
+        if self.cursor_remote_failure_cooldown_active() {
             return false;
         }
         let guard = self.cursor_remote_cache.lock().unwrap();
@@ -4754,5 +4819,74 @@ mod cursor_remote_cache_tests {
         parser.store_cursor_remote(vec![make_cursor_entry(jun1)], Some(jun1));
         // Year view still served fully from the retained wide cache.
         assert_eq!(parser.cursor_remote_for(Some(jan1)).unwrap().len(), 2);
+    }
+
+    /// A failed fetch caches nothing, so before the cooldown existed every
+    /// `data-updated` refresh re-entered spawn → fetch → fail → emit, ~4x/s.
+    /// Simulate that refresh storm: only the gate decides, and it must let
+    /// exactly one attempt through per cooldown window.
+    #[test]
+    fn failing_fetch_is_retried_at_most_once_per_refresh_interval() {
+        let parser = UsageParser::new();
+        let mut attempts = 0;
+
+        let run_refresh_storm = |attempts: &mut usize| {
+            for _ in 0..100 {
+                if !parser.cursor_remote_failure_cooldown_active() {
+                    *attempts += 1;
+                    // Every attempt fails, exactly as in the observed loop.
+                    parser.note_cursor_remote_failure();
+                }
+            }
+        };
+
+        run_refresh_storm(&mut attempts);
+        assert_eq!(attempts, 1, "100 refreshes must yield a single fetch");
+
+        // Still inside the window: no further attempts.
+        parser.age_cursor_remote_failure_for_test(std::time::Duration::from_secs(
+            CURSOR_REMOTE_FAILURE_COOLDOWN_SECS - 1,
+        ));
+        run_refresh_storm(&mut attempts);
+        assert_eq!(attempts, 1, "cooldown must suppress retries until it lapses");
+
+        // Next interval: exactly one more attempt, not a burst.
+        parser.age_cursor_remote_failure_for_test(std::time::Duration::from_secs(
+            CURSOR_REMOTE_FAILURE_COOLDOWN_SECS + 1,
+        ));
+        run_refresh_storm(&mut attempts);
+        assert_eq!(attempts, 2, "one retry per interval, not one per refresh");
+    }
+
+    #[test]
+    fn failure_cooldown_blocks_needs_fetch_and_clears_on_success() {
+        let parser = UsageParser::new();
+        let jun1 = date(2026, 6, 1);
+
+        parser.note_cursor_remote_failure();
+        assert!(parser.cursor_remote_failure_cooldown_active());
+        // The gate every spawn site (usage query + tray) goes through.
+        assert!(!parser.needs_cursor_remote_fetch(Some(jun1)));
+
+        // A successful fetch proves the endpoint works — drop the cooldown.
+        parser.store_cursor_remote(vec![make_cursor_entry(jun1)], Some(jun1));
+        assert!(!parser.cursor_remote_failure_cooldown_active());
+    }
+
+    #[test]
+    fn failure_cooldown_expires_and_clear_cache_resets_it() {
+        let parser = UsageParser::new();
+
+        parser.note_cursor_remote_failure();
+        parser.age_cursor_remote_failure_for_test(std::time::Duration::from_secs(
+            CURSOR_REMOTE_FAILURE_COOLDOWN_SECS + 1,
+        ));
+        assert!(!parser.cursor_remote_failure_cooldown_active());
+
+        // Explicit cache clear is the user's escape hatch from the cooldown.
+        parser.note_cursor_remote_failure();
+        assert!(parser.cursor_remote_failure_cooldown_active());
+        parser.clear_cache();
+        assert!(!parser.cursor_remote_failure_cooldown_active());
     }
 }
