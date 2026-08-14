@@ -6,6 +6,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::SystemTime;
 
+use super::{as_f64, humanize_snake_case};
+
 const CODEX_FILE_STALE_SECS: u64 = 600;
 
 /// Non-window keys that appear alongside meters in Codex rate-limit payloads.
@@ -199,14 +201,6 @@ fn codex_value_to_window(id: &str, value: &Value) -> Option<RateLimitWindow> {
     ))
 }
 
-fn as_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
-}
-
 pub(super) fn codex_window_label(id: &str, minutes: u64) -> String {
     match (id, minutes) {
         ("primary", 300) => "Session (5hr)".to_string(),
@@ -219,25 +213,6 @@ pub(super) fn codex_window_label(id: &str, minutes: u64) -> String {
             format_window_duration(minutes)
         ),
     }
-}
-
-fn humanize_snake_case(field: &str) -> String {
-    field
-        .split(['_', '-'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => {
-                    let mut out = first.to_uppercase().collect::<String>();
-                    out.push_str(&chars.as_str().to_lowercase());
-                    out
-                }
-                None => part.to_string(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn format_window_duration(minutes: u64) -> String {

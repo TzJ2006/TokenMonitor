@@ -7,7 +7,7 @@ use crate::stats::change::{ChangeEventKind, FileCategory};
 use crate::usage::integrations::{
     provider_matches_model, UsageIntegrationId, UsageIntegrationSelection,
 };
-use chrono::{DateTime, Local, NaiveDate, Timelike};
+use chrono::{DateTime, Duration, Local, NaiveDate, Timelike};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -415,6 +415,13 @@ pub(crate) fn format_hour(h: u32) -> String {
     }
 }
 
+fn truncate_hour(ts: DateTime<Local>) -> DateTime<Local> {
+    ts.with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(ts)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared aggregation utility — build segments map for a bucket
 // ─────────────────────────────────────────────────────────────────────────────
@@ -493,14 +500,19 @@ fn merge_archived_and_live_entries(
         let hour = entry_archive_hour(&entry);
         if frontier.covers(hour.0, hour.1) {
             let model_key = crate::models::normalized_model_key(&entry.model);
-            if let Some(archived_keys) = archived_keys_by_hour.get(&hour) {
-                if archived_keys.contains("unknown")
-                    && model_key != "unknown"
-                    && !archived_keys.contains(&model_key)
-                {
-                    replacement_hours.insert(hour);
-                    live_to_add.push(entry);
+            match archived_keys_by_hour.get(&hour) {
+                Some(archived_keys) => {
+                    if archived_keys.contains("unknown")
+                        && model_key != "unknown"
+                        && !archived_keys.contains(&model_key)
+                    {
+                        replacement_hours.insert(hour);
+                        live_to_add.push(entry);
+                    }
                 }
+                // Frontier can span empty hours between archived rows; keep
+                // later-arriving live data for hours that have no archive rows.
+                None => live_to_add.push(entry),
             }
         } else {
             live_to_add.push(entry);
@@ -2147,8 +2159,132 @@ impl UsageParser {
         }
     }
 
+    // ── Aggregation: official 5h window (or any [start, end) instant range) ──
+
+    pub fn get_time_range(
+        &self,
+        provider: &str,
+        start: DateTime<Local>,
+        end: DateTime<Local>,
+    ) -> UsagePayload {
+        let loaded = self.load_entries_cached(provider, Some(start.date_naive()));
+        let entries: Vec<&ParsedEntry> = loaded
+            .entries
+            .iter()
+            .filter(|entry| entry.timestamp >= start && entry.timestamp < end)
+            .collect();
+        self.set_last_query_debug(UsageQueryDebugReport {
+            provider: provider.to_string(),
+            aggregation: String::from("time_range"),
+            since: start.to_rfc3339(),
+            cache_key: format!(
+                "range:{}:{}:{}",
+                provider,
+                start.to_rfc3339(),
+                end.to_rfc3339()
+            ),
+            from_cache: false,
+            entry_count: entries.len(),
+            sources: loaded.reports.clone(),
+        });
+
+        let mut hour_map: HashMap<DateTime<Local>, Vec<&ParsedEntry>> = HashMap::new();
+        for entry in &entries {
+            hour_map
+                .entry(truncate_hour(entry.timestamp))
+                .or_default()
+                .push(*entry);
+        }
+
+        let mut chart_buckets: Vec<ChartBucket> = Vec::new();
+        let mut total_cost = 0.0f64;
+        let mut total_tokens = 0u64;
+        let mut total_input = 0u64;
+        let mut total_output = 0u64;
+        let mut global_model_map: HashMap<String, SegmentAgg> = HashMap::new();
+
+        let mut hour = truncate_hour(start);
+        while hour < end {
+            let hour_entries = hour_map.get(&hour).map(|v| v.as_slice()).unwrap_or(&[]);
+            let seg_map = build_segment_map(hour_entries);
+            let bucket_cost: f64 = seg_map.values().map(|agg| agg.cost).sum();
+            let bucket_tokens: u64 = seg_map.values().map(|agg| agg.tokens).sum();
+
+            total_cost += bucket_cost;
+            total_tokens += bucket_tokens;
+            for e in hour_entries.iter() {
+                total_input += e.input_tokens;
+                total_output += e.output_tokens;
+            }
+            for (key, agg) in &seg_map {
+                let gm = global_model_map.entry(key.clone()).or_insert(SegmentAgg {
+                    display_name: agg.display_name.clone(),
+                    cost: 0.0,
+                    tokens: 0,
+                    pricing_available: true,
+                });
+                gm.cost += agg.cost;
+                gm.tokens += agg.tokens;
+                gm.pricing_available &= agg.pricing_available;
+            }
+
+            chart_buckets.push(ChartBucket {
+                label: format_hour(hour.hour()),
+                sort_key: hour.format("%Y-%m-%dT%H:00:00%z").to_string(),
+                total: bucket_cost,
+                segments: segment_map_to_vec(seg_map),
+            });
+            hour += Duration::hours(1);
+        }
+
+        let now = Local::now();
+        let elapsed_hours = (now - start).num_milliseconds().max(1) as f64 / 3_600_000.0;
+        // Rolling fallback ends at resolve-time `now` (exclusive), so the live
+        // check needs a small grace for the aggregation that follows.
+        let active_block = if now >= start && now < end + Duration::seconds(2) {
+            let burn_rate_per_hour = total_cost / elapsed_hours;
+            Some(ActiveBlock {
+                cost: total_cost,
+                burn_rate_per_hour,
+                projected_cost: burn_rate_per_hour * 5.0,
+                is_active: true,
+            })
+        } else {
+            None
+        };
+
+        UsagePayload {
+            total_cost,
+            total_tokens,
+            session_count: chart_buckets.iter().filter(|b| b.total > 0.0).count() as u32,
+            input_tokens: total_input,
+            output_tokens: total_output,
+            cache_read_tokens: 0,
+            cache_write_5m_tokens: 0,
+            cache_write_1h_tokens: 0,
+            web_search_requests: 0,
+            chart_buckets,
+            model_breakdown: segment_map_to_model_summaries(&global_model_map),
+            active_block,
+            five_hour_cost: total_cost,
+            last_updated: now.to_rfc3339(),
+            from_cache: false,
+            usage_source: UsageSource::Parser,
+            usage_warning: Self::provider_usage_warning(provider),
+            period_label: String::new(),
+            has_earlier_data: false,
+            change_stats: None,
+            subagent_stats: None,
+            device_breakdown: None,
+            device_chart_buckets: None,
+            provider_detected: None,
+            cursor_loading: false,
+        }
+    }
+
     // ── Aggregation: blocks ──
 
+    #[cfg(test)]
     pub fn get_blocks(&self, provider: &str, since: &str) -> UsagePayload {
         let cache_key = format!("blocks:{}:{}", provider, since);
         let since_date = parse_since_date(since);
@@ -2349,6 +2485,36 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].model, "claude-fable-5");
+    }
+
+    #[test]
+    fn live_data_kept_for_frontier_hours_with_no_archive_rows() {
+        let archived = vec![test_entry("claude-sonnet-4-6", 10)];
+        let live = vec![
+            test_entry("claude-sonnet-4-6", 10),
+            test_entry("claude-sonnet-4-6", 11),
+            test_entry("claude-sonnet-4-6", 13),
+        ];
+        let frontier = crate::usage::archive::ArchiveFrontier {
+            date: archived[0].timestamp.date_naive(),
+            hour: 12,
+        };
+
+        let mut merged = Vec::new();
+        merge_archived_and_live_entries(&mut merged, archived, live, Some(frontier));
+
+        let hours: Vec<u32> = merged.iter().map(|e| e.timestamp.hour()).collect();
+        assert!(hours.contains(&10), "archived hour 10 should remain");
+        assert!(
+            hours.contains(&11),
+            "empty hour 11 under the frontier must keep later-arriving live data"
+        );
+        assert!(hours.contains(&13), "hours past the frontier stay live");
+        assert_eq!(
+            merged.iter().filter(|e| e.timestamp.hour() == 10).count(),
+            1,
+            "hour 10 live must be dropped because archive has rows"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2875,6 +3041,28 @@ mod tests {
         );
         assert_eq!(entries[1].output_tokens, 100);
         assert_eq!(entries[1].cache_read_tokens, 20);
+    }
+
+    #[test]
+    fn parse_codex_reasoning_follows_total_tokens() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("workspace");
+        fs::create_dir_all(&session_dir).unwrap();
+        let content = r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}
+{"type":"event_msg","timestamp":"2026-03-15T12:00:00+00:00","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"reasoning_output_tokens":5,"total_tokens":110}}}}
+{"type":"event_msg","timestamp":"2026-03-15T12:00:01+00:00","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"reasoning_output_tokens":5,"total_tokens":115}}}}"#;
+        write_file(&session_dir.join("session.jsonl"), content);
+
+        let entries = read_codex_entries(dir.path(), parse_since_date("20260301"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].output_tokens, 10,
+            "A: total=input+output, do not add reasoning"
+        );
+        assert_eq!(
+            entries[1].output_tokens, 15,
+            "B: total=input+output+reasoning, add"
+        );
     }
 
     #[test]
@@ -3563,6 +3751,28 @@ mod tests {
         assert!(payload.active_block.is_none());
         assert!((payload.five_hour_cost - payload.total_cost).abs() < f64::EPSILON);
         assert!(payload.total_cost > 0.0);
+    }
+
+    #[test]
+    fn time_range_keeps_cross_midnight_entries_inside_window() {
+        let now = Local::now();
+        let reset = now + chrono::Duration::hours(2);
+        let start = reset - chrono::Duration::hours(5);
+        let inside = start + chrono::Duration::minutes(30);
+        let outside = start - chrono::Duration::minutes(1);
+        let content = format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":1000,"output_tokens":500}}}}}}
+{{"type":"assistant","timestamp":"{}","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":2000,"output_tokens":1000}}}}}}"#,
+            outside.to_rfc3339(),
+            inside.to_rfc3339(),
+        );
+        let (_dir, parser) = make_parser_with_claude_data(&content);
+        let payload = parser.get_time_range("claude", start, reset);
+
+        assert_eq!(payload.session_count, 1);
+        assert!(payload.total_cost > 0.0);
+        assert!((payload.five_hour_cost - payload.total_cost).abs() < f64::EPSILON);
+        assert!(payload.active_block.is_some());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -4848,7 +5058,10 @@ mod cursor_remote_cache_tests {
             CURSOR_REMOTE_FAILURE_COOLDOWN_SECS - 1,
         ));
         run_refresh_storm(&mut attempts);
-        assert_eq!(attempts, 1, "cooldown must suppress retries until it lapses");
+        assert_eq!(
+            attempts, 1,
+            "cooldown must suppress retries until it lapses"
+        );
 
         // Next interval: exactly one more attempt, not a burst.
         parser.age_cursor_remote_failure_for_test(std::time::Duration::from_secs(

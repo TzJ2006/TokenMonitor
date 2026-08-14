@@ -28,9 +28,7 @@ export interface ResizeOrchestratorDeps {
     scaleFactor: number;
   } | null>;
   logDebug: (event: string, data: Record<string, unknown>) => void;
-  captureDebugSnapshot: (reason: string) => Record<string, unknown>;
   formatDebugError: (error: unknown) => { message: string };
-  isDebugEnabled: () => boolean;
   /** Reported whenever a setSize request succeeds; lets callers persist the last applied height. */
   onHeightApplied?: (height: number) => void;
 }
@@ -101,18 +99,11 @@ export function createResizeOrchestrator(
   let fixedWindowH = 0;
   // ── Internal helpers ──
 
-  function captureDebugSnapshot(reason: string): Record<string, unknown> {
-    return deps.isDebugEnabled()
-      ? deps.captureDebugSnapshot(reason)
-      : {};
-  }
-
   function clearPendingResize(): void {
     deps.logDebug("resize:clear-pending", {
       hadTimer: Boolean(resizeTimer),
       hadRaf: resizeRaf !== 0,
       hadObserverRaf: observerResizeRaf !== 0,
-      ...captureDebugSnapshot("clear-pending"),
     });
     if (resizeTimer) {
       clearTimeout(resizeTimer);
@@ -192,7 +183,6 @@ export function createResizeOrchestrator(
         nextHeight,
         scrollThresholdH,
         effectiveMaxWindowH: getEffectiveWindowMaxHeight(),
-        ...captureDebugSnapshot(`scroll-lock-${source}`),
       },
     );
   }
@@ -260,7 +250,6 @@ export function createResizeOrchestrator(
           source: request.source,
           nextHeight: request.height,
           appliedHeight: lastWindowH,
-          ...captureDebugSnapshot(`set-size-resolved-${request.source}`),
         });
         deps.onHeightApplied?.(lastWindowH > 0 ? lastWindowH : request.height);
       })
@@ -269,7 +258,6 @@ export function createResizeOrchestrator(
           source: request.source,
           nextHeight: request.height,
           error: deps.formatDebugError(error),
-          ...captureDebugSnapshot(`set-size-rejected-${request.source}`),
         });
         if (!pendingWindowHeightRequest && typeof window !== "undefined") {
           lastWindowH = window.innerHeight;
@@ -315,7 +303,6 @@ export function createResizeOrchestrator(
       effectiveMaxWindowH,
       scrollLocked: isScrollLocked,
       deltaFromLast: nextHeight - lastWindowH,
-      ...captureDebugSnapshot(`force-apply-${source}`),
     });
 
     deferredShrinkHeight = null;
@@ -349,7 +336,6 @@ export function createResizeOrchestrator(
       deltaFromLast: nextHeight - lastWindowH,
       deltaAbs: Math.abs(nextHeight - lastWindowH),
       hysteresisPx: RESIZE_HYSTERESIS_PX,
-      ...captureDebugSnapshot(`apply-${source}`),
     });
     if (disposition === "skip") return;
     if (!initialContentReady && disposition === "shrink") {
@@ -409,7 +395,6 @@ export function createResizeOrchestrator(
       effectiveMaxWindowH:
         measurement?.effectiveMaxWindowH ?? getEffectiveWindowMaxHeight(),
       scrollLocked: measurement?.scrollLocked ?? isScrollLocked,
-      ...captureDebugSnapshot(`sync-${source}`),
     });
     if (!measurement) return null;
     applyWindowHeight(measurement.nextHeight, source);
@@ -438,7 +423,6 @@ export function createResizeOrchestrator(
     deps.logDebug("resize:schedule-settled", {
       source,
       delay,
-      ...captureDebugSnapshot(`schedule-${source}`),
     });
     clearPendingResize();
     resizeTimer = setTimeout(() => {
@@ -448,7 +432,6 @@ export function createResizeOrchestrator(
           resizeRaf = 0;
           deps.logDebug("resize:settled-fire", {
             source,
-            ...captureDebugSnapshot(`settled-fire-${source}`),
           });
           syncSizeAndVerify(`${source}:settled`);
         });
@@ -499,7 +482,6 @@ export function createResizeOrchestrator(
       effectiveMaxWindowH,
       scrollLocked: isScrollLocked,
       disposition,
-      ...captureDebugSnapshot(`animate-${source}`),
     });
 
     if (disposition === "skip" || durationMs <= 0) {
@@ -615,7 +597,6 @@ export function createResizeOrchestrator(
     if (isWindowHeightAnimating) {
       deps.logDebug("resize:observer-skipped-animation", {
         source,
-        ...captureDebugSnapshot(`observer-skipped-${source}`),
       });
       return;
     }
@@ -644,7 +625,6 @@ export function createResizeOrchestrator(
         deltaFromLast,
         deltaAbs: deltaFromLast == null ? null : Math.abs(deltaFromLast),
         hysteresisPx: RESIZE_HYSTERESIS_PX,
-        ...captureDebugSnapshot(`resize-to-content-${scheduledSource}`),
       });
       if (!measurement) return;
       applyMeasuredHeight(measurement, `${scheduledSource}:observer`);

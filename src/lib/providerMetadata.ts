@@ -1,3 +1,4 @@
+import ops from "../../src-tauri/src/ops.json";
 import {
   ALL_USAGE_PROVIDER_ID,
   type HeaderTabs,
@@ -50,12 +51,7 @@ const USAGE_INTEGRATION_DEFINITIONS: UsageProviderDefinition[] = [
     title: "Claude Code",
     logoKind: "claude",
     brandColor: [196, 112, 75],
-    planTierCosts: {
-      Pro: 20,
-      "Max 5x": 100,
-      "Max 20x": 200,
-      Free: 0,
-    },
+    planTierCosts: ops.plan_tier_costs_usd.claude,
     supportsRateLimits: true,
     rateLimits: {
       cacheFile: "rate-limits-claude.json",
@@ -77,11 +73,7 @@ const USAGE_INTEGRATION_DEFINITIONS: UsageProviderDefinition[] = [
     title: "Codex",
     logoKind: "codex",
     brandColor: [74, 123, 157],
-    planTierCosts: {
-      Plus: 20,
-      Pro: 200,
-      Free: 0,
-    },
+    planTierCosts: ops.plan_tier_costs_usd.codex,
     supportsRateLimits: true,
     rateLimits: {
       cacheFile: "rate-limits-codex.json",
