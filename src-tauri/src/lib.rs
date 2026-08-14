@@ -606,6 +606,40 @@ async fn fast_statusline_poll(app: tauri::AppHandle) {
     }
 }
 
+/// Seconds past local midnight that every scheduled refresh is aligned to.
+/// One second rather than zero so the tick that re-dates the UI is
+/// unambiguously *on* the new day, never a hair before it.
+const REFRESH_ALIGN_OFFSET_SECS: i64 = 1;
+
+const SECS_PER_DAY: i64 = 86_400;
+
+/// How long to sleep so the next wake lands on the next aligned refresh tick:
+/// `local midnight + 1s + k * interval`.
+///
+/// Anchoring the phase to local midnight instead of to process start is what
+/// makes a refresh always land at 00:00:01 local. Every "current period" view
+/// (`offset = 0` = today) is date-relative, so without a tick right after
+/// midnight a window left open across the boundary keeps showing the previous
+/// day. Ticks that would overshoot the next midnight are clamped back to it,
+/// which also covers intervals that don't divide the day evenly.
+fn secs_until_next_refresh(now: chrono::DateTime<chrono::Local>, interval_secs: u64) -> f64 {
+    let interval = (interval_secs.max(1) as i64).min(SECS_PER_DAY);
+    let secs_of_day = now.num_seconds_from_midnight() as i64;
+    let elapsed = secs_of_day - REFRESH_ALIGN_OFFSET_SECS;
+
+    let next_secs_of_day = if elapsed < 0 {
+        // Between midnight and the day's first tick.
+        REFRESH_ALIGN_OFFSET_SECS
+    } else {
+        REFRESH_ALIGN_OFFSET_SECS + (elapsed / interval + 1) * interval
+    }
+    // Never step over the next midnight tick.
+    .min(SECS_PER_DAY + REFRESH_ALIGN_OFFSET_SECS);
+
+    let subsec = f64::from(now.nanosecond().min(999_999_999)) / 1e9;
+    ((next_secs_of_day - secs_of_day) as f64 - subsec).max(0.001)
+}
+
 async fn background_loop(app: tauri::AppHandle) {
     tokio::time::sleep(Duration::from_secs(1)).await;
     tracing::info!("Background refresh loop started");
@@ -663,6 +697,10 @@ async fn background_loop(app: tauri::AppHandle) {
     // changed — we emit `data-updated` to nudge the UI to re-fetch. Starts at 0
     // so the first cycle always emits once shortly after launch.
     let mut last_five_hour_bucket: u64 = 0;
+    // Local date this loop last woke up on. Ticks are aligned to 00:00:01, so
+    // the first tick of a new day sees this change and forces a refresh even
+    // when no source log moved.
+    let mut last_tick_date = chrono::Local::now().date_naive();
 
     loop {
         let interval_secs = {
@@ -680,7 +718,19 @@ async fn background_loop(app: tauri::AppHandle) {
             continue;
         }
 
-        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        tokio::time::sleep(Duration::from_secs_f64(secs_until_next_refresh(
+            chrono::Local::now(),
+            interval_secs,
+        )))
+        .await;
+
+        let today = chrono::Local::now().date_naive();
+        let day_rolled = today != last_tick_date;
+        if day_rolled {
+            tracing::info!("Local date rolled over to {today}, forcing a refresh");
+            last_tick_date = today;
+        }
+
         update_counter += 1;
         ssh_sync_counter += 1;
         rate_limit_counter += 1;
@@ -799,7 +849,11 @@ async fn background_loop(app: tauri::AppHandle) {
             // the disk entries too so the next fetch recomputes from fresh logs.
             state.clear_payload_disk_cache().await;
             let _ = app.emit("data-updated", update_counter);
-        } else if five_hour_bucket_rolled && usage_access_enabled {
+        } else if day_rolled || (five_hour_bucket_rolled && usage_access_enabled) {
+            // `day_rolled` is unconditional: every date-relative label and
+            // period the UI renders is now wrong, whether or not any log moved,
+            // and a short clamped sleep into midnight may leave the 5h bucket
+            // unchanged so that check alone can't be relied on here.
             let _ = app.emit("data-updated", update_counter);
         }
     }
@@ -1034,4 +1088,96 @@ async fn sync_ssh_hosts(state: &AppState) -> bool {
     }
 
     any_synced
+}
+
+#[cfg(test)]
+mod refresh_schedule_tests {
+    use super::{secs_until_next_refresh, REFRESH_ALIGN_OFFSET_SECS, SECS_PER_DAY};
+    use chrono::{Local, TimeZone};
+
+    /// Local wall-clock instant. Panics on the DST gaps some zones have at
+    /// 00:00 — none of the times used below fall in one.
+    fn at(hour: u32, min: u32, sec: u32, milli: u32) -> chrono::DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 8, 11, hour, min, sec)
+            .single()
+            .expect("unambiguous local time")
+            + chrono::Duration::milliseconds(i64::from(milli))
+    }
+
+    /// Seconds-of-day the sleep computed at `now` will wake up on.
+    fn wake_secs_of_day(now: chrono::DateTime<Local>, interval: u64) -> f64 {
+        use chrono::Timelike;
+        f64::from(now.num_seconds_from_midnight())
+            + f64::from(now.nanosecond()) / 1e9
+            + secs_until_next_refresh(now, interval)
+    }
+
+    #[test]
+    fn ticks_land_on_the_aligned_second() {
+        for interval in [30_u64, 60, 120, 300, 600, 3600] {
+            for (h, m, s, ms) in [
+                (0, 0, 0, 0),
+                (7, 13, 44, 512),
+                (12, 0, 0, 0),
+                (23, 30, 0, 0),
+            ] {
+                let wake = wake_secs_of_day(at(h, m, s, ms), interval);
+                let offset_into_minute =
+                    (wake - REFRESH_ALIGN_OFFSET_SECS as f64) % interval as f64;
+                assert!(
+                    offset_into_minute.abs() < 1e-6,
+                    "interval={interval} at {h}:{m}:{s}.{ms} woke at {wake}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn always_stops_at_one_second_past_midnight() {
+        // Whatever the interval and however close to midnight, the next wake
+        // never steps over 00:00:01 — that is the tick that re-dates the UI.
+        for interval in [30_u64, 45, 60, 90, 120, 300, 3600] {
+            for (h, m, s) in [(23, 59, 59), (23, 59, 30), (23, 30, 0), (23, 0, 1)] {
+                let wake = wake_secs_of_day(at(h, m, s, 0), interval);
+                assert!(
+                    wake <= (SECS_PER_DAY + REFRESH_ALIGN_OFFSET_SECS) as f64 + 1e-6,
+                    "interval={interval} at {h}:{m}:{s} woke at {wake}",
+                );
+            }
+        }
+        // 23:59:30 with a 90s interval would overshoot to 00:01:01 unclamped.
+        let wake = wake_secs_of_day(at(23, 59, 30, 0), 90);
+        assert!((wake - (SECS_PER_DAY + REFRESH_ALIGN_OFFSET_SECS) as f64).abs() < 1e-6);
+    }
+
+    #[test]
+    fn first_tick_of_the_day_is_one_second_after_midnight() {
+        assert!((secs_until_next_refresh(at(0, 0, 0, 0), 300) - 1.0).abs() < 1e-6);
+        assert!((secs_until_next_refresh(at(0, 0, 0, 400), 300) - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn subsecond_drift_is_trimmed_not_accumulated() {
+        // Woken 250 ms late: the next sleep is short by that much so the
+        // schedule snaps back onto the aligned second instead of drifting.
+        let sleep = secs_until_next_refresh(at(10, 0, 1, 250), 30);
+        assert!((sleep - 29.75).abs() < 1e-6, "sleep={sleep}");
+    }
+
+    #[test]
+    fn never_returns_a_zero_sleep() {
+        // A zero would spin the loop; every path keeps a floor.
+        for interval in [0_u64, 1, 30] {
+            for (h, m, s, ms) in [(0, 0, 1, 0), (23, 59, 59, 999), (12, 0, 1, 0)] {
+                assert!(secs_until_next_refresh(at(h, m, s, ms), interval) > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn interval_longer_than_a_day_still_ticks_daily() {
+        let wake = wake_secs_of_day(at(12, 0, 0, 0), SECS_PER_DAY as u64 * 3);
+        assert!((wake - (SECS_PER_DAY + REFRESH_ALIGN_OFFSET_SECS) as f64).abs() < 1e-6);
+    }
 }
