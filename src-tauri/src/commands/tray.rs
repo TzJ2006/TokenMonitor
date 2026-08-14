@@ -405,7 +405,38 @@ fn tray_status_item_is_dark<R: Runtime>(tray: &tauri::tray::TrayIcon<R>) -> bool
     .unwrap_or_else(crate::tray::render::is_menu_bar_dark)
 }
 
+/// Push the current title/icon onto the tray icon.
+///
+/// Every caller is async and therefore runs on a tokio worker, but the handle
+/// `tray_by_id` hands back owns the platform status item and is reference
+/// counted non-atomically (`Rc`) behind Tauri's `Send` wrapper. Cloning and
+/// dropping it off the main thread races the main thread's own clones, and a
+/// lost decrement drops the last reference on the worker — which tears the
+/// NSStatusItem down from a non-main thread and trips an AppKit assertion
+/// (`EXC_BREAKPOINT` inside `-[NSStatusBar removeStatusItem:]`). So hop to the
+/// main thread before touching the handle at all.
 fn apply_tray_presentation(
+    app: &tauri::AppHandle,
+    config: &TrayConfig,
+    total_cost: f64,
+    utilization: TrayUtilization,
+    update_available: bool,
+) {
+    let app_handle = app.clone();
+    let config = config.clone();
+    let _ = app.run_on_main_thread(move || {
+        apply_tray_presentation_on_main_thread(
+            &app_handle,
+            &config,
+            total_cost,
+            utilization,
+            update_available,
+        );
+    });
+}
+
+/// Main-thread half of [`apply_tray_presentation`]. Never call directly.
+fn apply_tray_presentation_on_main_thread(
     app: &tauri::AppHandle,
     config: &TrayConfig,
     total_cost: f64,
