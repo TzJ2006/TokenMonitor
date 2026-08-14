@@ -64,7 +64,7 @@ Grab the installer for your platform from the [latest release](https://github.co
 
 ### Usage Monitoring
 
-- Current-session spend, burn rate, and 5-hour context
+- Official 5-hour rate-limit window spend, burn rate, and context
 - Period views for `5h`, `day`, `week`, `month`, and `year`
 - Historical navigation with offset-based browsing
 - Claude-only, Codex-only, Cursor-only, and merged provider views
@@ -300,13 +300,12 @@ src/
     │   ├── float-ball/            # Overlay component, interactions, and move queue
     │   ├── Footer.svelte          # Active session, burn rate
     │   ├── PermissionDisclosure.svelte # Privacy/permission surface display
+    │   ├── PermissionsOnboarding.svelte # First-launch onboarding wizard
     │   ├── settings/              # Settings panel and focused subpanels
-    │   ├── SubagentList.svelte    # Agent/subagent cost breakdown
     │   ├── UpdateBanner.svelte    # In-app update banner
-    │   ├── UsageBars.svelte       # Rate limit utilization bars
-    │   └── WelcomeCard.svelte     # First-launch onboarding card
+    │   └── UsageBars.svelte       # Rate limit utilization bars
     ├── permissions/
-    │   ├── keychain.ts            # macOS Keychain access flow
+    │   ├── statusline.ts          # Claude Code statusline install/check
     │   └── surfaces.ts            # Permission surface definitions
     ├── tray/
     │   ├── sync.ts                # Frontend-to-native tray state syncing

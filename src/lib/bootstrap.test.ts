@@ -50,7 +50,6 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
       costPrecision: 'full',
     },
     glassEffect: true,
-    showModelChangeStats: false,
     floatBall: false,
     sshHosts: [],
     remoteDeviceIncludes: [],

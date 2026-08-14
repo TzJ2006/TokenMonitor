@@ -4780,7 +4780,6 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "url",
- "webkit2gtk",
  "windows 0.58.0",
 ]
 

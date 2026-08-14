@@ -71,6 +71,12 @@ impl ArchivedHourly {
         (self.d.clone(), self.h, self.mk.clone(), self.p.clone())
     }
 
+    /// Cursor usage is account-scoped (same cloud bill on every machine), not
+    /// per-device. Rows tagged `p = "cursor"` must live under `local:cursor`.
+    fn is_shared_cursor(&self) -> bool {
+        self.p == "cursor"
+    }
+
     /// Merge another record of the SAME bucket into this one by taking the
     /// field-wise maximum of every token count. This is the dedup rule that
     /// makes import idempotent: re-importing identical data is a no-op
@@ -331,31 +337,48 @@ impl ArchiveManager {
             return 0;
         }
 
-        // Append to monthly files.
+        // Append to monthly files. Query merge drops live entries for every
+        // hour the frontier covers, so only hours that actually landed may
+        // advance it — and never past a month whose append failed.
         let mut count = 0;
+        let mut written_months: HashSet<&str> = HashSet::new();
+        let mut earliest_failed: Option<&str> = None;
         for (month_key, records) in &by_month {
             let file_path = source_dir.join(format!("{month_key}.jsonl"));
             let mut lines = String::new();
+            let mut n = 0;
             for record in records {
                 match serde_json::to_string(record) {
                     Ok(line) => {
                         lines.push_str(&line);
                         lines.push('\n');
-                        count += 1;
+                        n += 1;
                     }
                     Err(e) => {
                         tracing::warn!("Failed to serialize archive record: {e}");
                     }
                 }
             }
-            if let Err(e) = append_to_file(&file_path, lines.as_bytes()) {
-                tracing::warn!("Failed to append to archive {file_path:?}: {e}");
+            match append_to_file(&file_path, lines.as_bytes()) {
+                Ok(()) => {
+                    count += n;
+                    written_months.insert(month_key.as_str());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to append to archive {file_path:?}: {e}");
+                    if earliest_failed.is_none_or(|f| month_key.as_str() < f) {
+                        earliest_failed = Some(month_key.as_str());
+                    }
+                }
             }
         }
 
-        // Update frontier to the max (date, hour) we just archived.
         let new_frontier = aggregates
             .keys()
+            .filter(|(d, _, _)| {
+                let month = d.get(..7).unwrap_or(d);
+                written_months.contains(month) && earliest_failed.is_none_or(|f| month < f)
+            })
             .filter_map(|(d, h, _)| {
                 NaiveDate::parse_from_str(d, "%Y-%m-%d")
                     .ok()
@@ -457,6 +480,12 @@ impl ArchiveManager {
 
                 // Filter by since date.
                 if since.is_some_and(|s| record_date < s) {
+                    continue;
+                }
+
+                // Cursor is account-scoped. Older peer imports parked those rows
+                // on `device:*`; skip them so they don't double-count `local:cursor`.
+                if source_key.starts_with("device:") && record.is_shared_cursor() {
                     continue;
                 }
 
@@ -627,6 +656,9 @@ impl ArchiveManager {
     /// latest COMPLETED imported hour (strictly before `current_hour` on
     /// `current_date`) so imported history becomes visible at query time without
     /// freezing the live current hour. Re-importing the same data is a no-op.
+    ///
+    /// Cursor rows targeting a `device:*` source are folded into `local:cursor`
+    /// instead: Cursor usage is account-scoped and must not be summed per machine.
     pub fn import_source(
         &self,
         source_key: &str,
@@ -639,9 +671,34 @@ impl ArchiveManager {
             ..Default::default()
         };
 
+        let device_source = source_key.starts_with("device:");
+
+        // Cursor rows on a device source are the same account bill as local.
+        // Fold them into `local:cursor` (field-wise max) instead of storing a
+        // second copy that would sum with this machine's Cursor archive.
+        let redirected: Vec<ArchivedHourly>;
+        let records = if device_source {
+            let (cursor, rest): (Vec<_>, Vec<_>) = records
+                .iter()
+                .cloned()
+                .partition(ArchivedHourly::is_shared_cursor);
+            if !cursor.is_empty() {
+                self.import_source("local:cursor", &cursor, current_date, current_hour);
+            }
+            redirected = rest;
+            redirected.as_slice()
+        } else {
+            records
+        };
+
         // Existing buckets (also collapses any accidental duplicate lines).
         let mut buckets: HashMap<(String, u8, String, String), ArchivedHourly> = HashMap::new();
+        let mut existing_cursor: Vec<ArchivedHourly> = Vec::new();
         for r in self.read_raw(source_key) {
+            if device_source && r.is_shared_cursor() {
+                existing_cursor.push(r);
+                continue;
+            }
             match buckets.get_mut(&r.bucket_key()) {
                 Some(existing) => {
                     existing.merge_max_from(&r);
@@ -650,6 +707,9 @@ impl ArchiveManager {
                     buckets.insert(r.bucket_key(), r);
                 }
             }
+        }
+        if !existing_cursor.is_empty() {
+            self.import_source("local:cursor", &existing_cursor, current_date, current_hour);
         }
         let existing_keys: HashSet<(String, u8, String, String)> =
             buckets.keys().cloned().collect();
@@ -741,6 +801,49 @@ impl ArchiveManager {
             state.set_frontier(source_key, frontier);
             self.save_state(&state);
         }
+    }
+
+    /// Move account-scoped Cursor rows off `device:*` sources into `local:cursor`
+    /// (field-wise max) and drop them from the device archive. Older peer imports
+    /// remapped `local:cursor` onto each machine, so the same Cursor bill was
+    /// counted once locally and again per synced device.
+    ///
+    /// Returns how many Cursor records were folded. Idempotent.
+    pub fn fold_shared_cursor_into_local(
+        &self,
+        current_date: NaiveDate,
+        current_hour: u8,
+    ) -> usize {
+        let mut folded = 0;
+        for source_key in self.list_sources() {
+            if !source_key.starts_with("device:") {
+                continue;
+            }
+            let records = self.read_raw(&source_key);
+            let cursor: Vec<ArchivedHourly> = records
+                .iter()
+                .filter(|r| r.is_shared_cursor())
+                .cloned()
+                .collect();
+            if cursor.is_empty() {
+                continue;
+            }
+            folded += cursor.len();
+            self.import_source("local:cursor", &cursor, current_date, current_hour);
+            let rest: Vec<ArchivedHourly> = records
+                .into_iter()
+                .filter(|r| !r.is_shared_cursor())
+                .collect();
+            if rest.is_empty() {
+                self.remove_source(&source_key);
+            } else {
+                // ponytail: rewrite_source does not delete month files that
+                // vanish from the set; load_archived skips leftover p=cursor
+                // lines in those files.
+                self.rewrite_source(&source_key, rest.iter());
+            }
+        }
+        folded
     }
 
     /// Permanently remove a source: delete its archive directory and drop its
@@ -1018,6 +1121,33 @@ mod tests {
         let count =
             mgr.archive_completed_hours(&entries, "local:claude", "claude", current_date, 14);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn does_not_advance_frontier_when_append_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        let source_dir = mgr.source_dir("local:claude");
+        fs::create_dir_all(&source_dir).unwrap();
+        // Monthly path is a directory so append_to_file cannot open it.
+        fs::create_dir_all(source_dir.join("2026-04.jsonl")).unwrap();
+
+        let entries = vec![make_entry(
+            "2026-04-11",
+            10,
+            "claude-sonnet-4-6-20260301",
+            1000,
+            500,
+        )];
+        let current_date = NaiveDate::from_ymd_opt(2026, 4, 11).unwrap();
+        let count =
+            mgr.archive_completed_hours(&entries, "local:claude", "claude", current_date, 14);
+
+        assert_eq!(count, 0);
+        assert!(
+            mgr.frontier("local:claude").is_none(),
+            "frontier must not advance when the hour was not written"
+        );
     }
 
     #[test]
@@ -1516,5 +1646,99 @@ mod tests {
             "canonical should hold both hours after merge"
         );
         assert!(canonical.iter().any(|r| r.h == 10 && r.out == 80));
+    }
+
+    fn plant_device_jsonl(app_data: &Path, alias: &str, rec: &ArchivedHourly) {
+        let dir = app_data.join("usage-archive").join("devices").join(alias);
+        fs::create_dir_all(&dir).unwrap();
+        let month = rec.d.get(..7).unwrap_or(&rec.d);
+        let line = serde_json::to_string(rec).unwrap();
+        fs::write(dir.join(format!("{month}.jsonl")), format!("{line}\n")).unwrap();
+    }
+
+    #[test]
+    fn import_folds_device_cursor_into_local() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        let fd = future_date();
+
+        let mut cursor = arch("2026-04-10", 9, "grok-4.6", 2000, 600);
+        cursor.p = "cursor".to_string();
+        let claude = arch("2026-04-10", 9, "sonnet-4-6", 100, 50);
+
+        mgr.import_source("device:peer-mac", &[cursor.clone(), claude.clone()], fd, 0);
+
+        let local_cursor = mgr.read_raw("local:cursor");
+        assert_eq!(local_cursor.len(), 1);
+        assert_eq!(local_cursor[0].input_tokens, 2000);
+        assert_eq!(local_cursor[0].p, "cursor");
+
+        let device = mgr.load_archived("device:peer-mac", None);
+        assert_eq!(device.len(), 1, "device must not surface the Cursor row");
+        assert_eq!(device[0].input_tokens, 100);
+
+        let device_raw = mgr.read_raw("device:peer-mac");
+        assert!(device_raw.iter().all(|r| r.p != "cursor"));
+    }
+
+    #[test]
+    fn load_archived_skips_legacy_device_cursor_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+
+        let mut cursor = arch("2026-04-10", 9, "grok-4.6", 2000, 600);
+        cursor.p = "cursor".to_string();
+        plant_device_jsonl(tmp.path(), "old-peer", &cursor);
+
+        let loaded = mgr.load_archived("device:old-peer", None);
+        assert!(
+            loaded.is_empty(),
+            "legacy device Cursor rows must not enter query totals"
+        );
+        assert_eq!(mgr.read_raw("device:old-peer").len(), 1);
+    }
+
+    #[test]
+    fn fold_shared_cursor_merges_into_local_and_drops_cursor_only_device() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ArchiveManager::new(tmp.path());
+        let fd = future_date();
+
+        let mut local = arch("2026-04-10", 9, "grok-4.6", 1000, 300);
+        local.p = "cursor".to_string();
+        mgr.import_source("local:cursor", &[local], fd, 0);
+
+        let mut peer_same_hour = arch("2026-04-10", 9, "grok-4.6", 2000, 600);
+        peer_same_hour.p = "cursor".to_string();
+        let mut peer_extra_hour = arch("2026-04-10", 10, "grok-4.6", 50, 10);
+        peer_extra_hour.p = "cursor".to_string();
+        let dir = tmp
+            .path()
+            .join("usage-archive")
+            .join("devices")
+            .join("peer-only-cursor");
+        fs::create_dir_all(&dir).unwrap();
+        let line1 = serde_json::to_string(&peer_same_hour).unwrap();
+        let line2 = serde_json::to_string(&peer_extra_hour).unwrap();
+        fs::write(dir.join("2026-04.jsonl"), format!("{line1}\n{line2}\n")).unwrap();
+
+        let folded = mgr.fold_shared_cursor_into_local(fd, 0);
+        assert_eq!(folded, 2);
+        assert!(
+            !mgr.list_sources()
+                .contains(&"device:peer-only-cursor".to_string()),
+            "a device that only held shared Cursor rows should disappear"
+        );
+
+        let local_cursor = mgr.read_raw("local:cursor");
+        assert_eq!(local_cursor.len(), 2);
+        let hour9 = local_cursor.iter().find(|r| r.h == 9).unwrap();
+        assert_eq!(
+            hour9.input_tokens, 2000,
+            "same-hour Cursor buckets merge by field-wise max, not sum"
+        );
+        assert!(local_cursor
+            .iter()
+            .any(|r| r.h == 10 && r.input_tokens == 50));
     }
 }

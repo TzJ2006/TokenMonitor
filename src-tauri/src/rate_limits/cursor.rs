@@ -6,9 +6,6 @@ use serde_json::Value;
 use super::http::rate_limit_error_from_response;
 use super::RateLimitFetchError;
 
-const CURSOR_USAGE_URL: &str =
-    "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
-
 /// Known Cursor plan-usage percent fields, in dashboard display order.
 ///
 /// Cursor currently exposes two pools (docs: "First-party models" and "API").
@@ -246,7 +243,10 @@ pub(super) async fn fetch_cursor_rate_limits() -> Result<ProviderRateLimits, Rat
 
     let client = reqwest::Client::new();
     let response = client
-        .post(CURSOR_USAGE_URL)
+        .post(format!(
+            "{}/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+            crate::ops::cursor_ide_api_base()
+        ))
         .header("Content-Type", "application/json")
         .header("Connect-Protocol-Version", "1")
         .bearer_auth(&token)

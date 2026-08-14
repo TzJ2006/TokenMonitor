@@ -798,13 +798,16 @@ fn is_own_source(source_key: &str, ssh_aliases: &HashSet<String>) -> bool {
     }
 }
 
-/// Remap a peer file's source into THIS archive: a peer's own `local:*` becomes
-/// a `device:<peerSlug>` source (so it stays attributed to that machine and its
-/// totals sum rather than colliding with our local); a peer's `device:*` (a
-/// machine IT syncs) is kept as-is and merges with ours if shared. Returns None
-/// for anything unrecognized.
+/// Remap a peer file's source into THIS archive.
+///
+/// Claude/Codex `local:*` becomes `device:<peerSlug>` so that machine's CLI
+/// logs sum with ours. Cursor is account-scoped (same cloud usage on every
+/// device), so a peer's `local:cursor` merges into our `local:cursor` instead
+/// of becoming a second copy. A peer's `device:*` (a machine it syncs) is kept
+/// as-is. Returns None for anything unrecognized.
 fn remap_peer_source(source_key: &str, peer_slug: &str) -> Option<String> {
     match source_key.split_once(':') {
+        Some(("local", "cursor")) => Some(String::from("local:cursor")),
         Some(("local", _)) => Some(format!("device:{peer_slug}")),
         Some(("device", _)) => Some(source_key.to_string()),
         _ => None,
@@ -915,7 +918,6 @@ fn merge_peer_files(
             let Some(target) = remap_peer_source(&source_key, slug) else {
                 continue;
             };
-            // remap_peer_source only yields device:* keys; re-validate defensively.
             if !is_valid_source_key(&target) {
                 continue;
             }
@@ -1641,8 +1643,9 @@ mod tests {
 
     #[test]
     fn peer_source_remaps_local_to_device() {
-        // A peer's own local:* becomes device:<peerSlug>; a device the peer syncs
-        // stays as-is (merges with ours if shared); anything else is dropped.
+        // Claude/Codex local:* becomes device:<peerSlug>; Cursor stays local
+        // (account-scoped); a device the peer syncs stays as-is; anything else
+        // is dropped.
         assert_eq!(
             remap_peer_source("local:claude", "PeerMac").as_deref(),
             Some("device:PeerMac")
@@ -1650,6 +1653,10 @@ mod tests {
         assert_eq!(
             remap_peer_source("local:codex", "PeerMac").as_deref(),
             Some("device:PeerMac")
+        );
+        assert_eq!(
+            remap_peer_source("local:cursor", "PeerMac").as_deref(),
+            Some("local:cursor")
         );
         assert_eq!(
             remap_peer_source("device:DukeServer", "PeerMac").as_deref(),
