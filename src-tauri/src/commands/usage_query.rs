@@ -24,6 +24,10 @@ const USAGE_PAYLOAD_CACHE_VERSION: &str = "model-pricing-2026-08-07-opus5";
 /// Spawn a background Cursor remote fetch when the cache is missing/expired.
 /// Deduped via `AppState::cursor_remote_fetch_inflight`. Always refreshes the
 /// tray title when the fetch finishes so the menu bar does not stay at `$0`.
+///
+/// A failed fetch records a cooldown on the parser (see
+/// `UsageParser::note_cursor_remote_failure`) so a persistently failing remote
+/// is retried at most once per refresh interval instead of on every refresh.
 pub(crate) fn spawn_cursor_remote_fetch_if_needed(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -70,10 +74,16 @@ pub(crate) fn spawn_cursor_remote_fetch_if_needed(
             }
             Ok(Err(e)) => {
                 tracing::warn!("[cursor-async] Cursor remote fetch failed: {e}");
-                let _ = app_handle.emit("data-updated", 0u64);
+                // Mark the failure so `needs_cursor_remote_fetch` goes quiet for
+                // a cooldown window, and do NOT emit `data-updated`: a failure
+                // produced no new data, and the emit made the frontend refetch
+                // usage → spawn the same failing fetch again, several times a
+                // second (same hazard as the tray path noted below).
+                parser_arc.note_cursor_remote_failure();
             }
             Err(e) => {
                 tracing::warn!("[cursor-async] Cursor remote task panicked: {e}");
+                parser_arc.note_cursor_remote_failure();
             }
         }
         inflight.store(false, Ordering::SeqCst);
@@ -726,7 +736,13 @@ pub(crate) async fn get_usage_data_inner(
     let cursor_included = selection.includes_cursor();
     let cursor_since = resolve_period_bounds(period, offset).ok().map(|b| b.start);
     let needs_cursor_remote = cursor_included && parser.needs_cursor_remote_fetch(cursor_since);
-    if needs_cursor_remote {
+    // A fetch that just failed sits in its retry cooldown: nothing will be
+    // spawned now, but the remote data is still unsettled. Keep the payload
+    // marked incomplete so the TTL-less disk cache below can't preserve a
+    // cursor-less payload past the outage.
+    let cursor_remote_unsettled =
+        needs_cursor_remote || (cursor_included && parser.cursor_remote_failure_cooldown_active());
+    if cursor_remote_unsettled {
         payload.cursor_loading = true;
     }
 
