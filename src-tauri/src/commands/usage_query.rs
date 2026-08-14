@@ -359,13 +359,21 @@ pub(crate) fn get_provider_data(
     period: &str,
     offset: i32,
 ) -> Result<UsagePayload, String> {
+    let bounds = resolve_period_bounds(period, offset)?;
+
     // Single cache layer: stores the complete payload including stats.
-    let cache_key = format!("full:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}");
+    // Keyed by the resolved start date for the same reason as the outer
+    // `usage-view:` key (see final_usage_cache_key): `day:0` means a different
+    // date after midnight, and this cache's 120s TTL would otherwise keep
+    // serving yesterday's payload past the day boundary.
+    let cache_key = format!(
+        "full:{USAGE_PAYLOAD_CACHE_VERSION}:{provider}:{period}:{offset}:{}",
+        bounds.start.format("%Y%m%d"),
+    );
     if let Some(cached) = parser.check_cache(&cache_key) {
         return Ok(cached);
     }
 
-    let bounds = resolve_period_bounds(period, offset)?;
     let mut payload = parser_payload_for_period(parser, provider, period, &bounds)?;
     attach_local_stats(parser, &mut payload, provider, &bounds);
 
