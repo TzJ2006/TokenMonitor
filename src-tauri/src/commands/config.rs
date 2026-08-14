@@ -503,39 +503,6 @@ pub async fn clear_payload_cache(state: State<'_, AppState>) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub async fn clear_usage_view_cache(state: State<'_, AppState>) -> Result<(), String> {
-    state.parser.clear_payload_cache_prefix("usage-view:");
-    if let Some(ref disk_cache) = *state.payload_disk_cache.read().await {
-        disk_cache.clear_prefix("usage-view:");
-    }
-    Ok(())
-}
-
-/// Reposition window so its bottom edge aligns with the work area bottom (taskbar top).
-/// Called from the frontend after every window resize.
-#[tauri::command]
-pub async fn reposition_window(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::Manager;
-    if let Some(window) = app.get_webview_window("main") {
-        #[cfg(target_os = "windows")]
-        {
-            crate::platform::windows::window::align_to_work_area(&window);
-        }
-        #[cfg(target_os = "macos")]
-        {
-            crate::platform::clamp_window_to_work_area(&window);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // Re-anchor top-right (drift-gated) rather than merely clamping, so a
-            // WM-driven reposition toward another window doesn't stick.
-            crate::platform::linux::reanchor_top_right_if_drifted(&window);
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command]
 pub async fn set_window_size_and_align(
     app: tauri::AppHandle,
     width: f64,
@@ -712,9 +679,4 @@ pub async fn start_cache_warmup(
 pub fn cancel_cache_warmup() -> Result<(), String> {
     crate::usage::cache_warmup::cancel_warmup();
     Ok(())
-}
-
-#[tauri::command]
-pub fn get_warmup_status() -> bool {
-    crate::usage::cache_warmup::is_warmup_running()
 }

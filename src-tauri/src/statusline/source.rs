@@ -51,9 +51,7 @@ pub struct NamedStatuslineWindow {
 /// server-side rate-limit windows CC bundled with the statusline event.
 ///
 /// `transcript_path`, `model_id`, and `cwd` aren't consumed by the rate-limit
-/// pipeline yet, but they're plumbed through because the IPC
-/// `read_latest_statusline_ping` surfaces them to the onboarding UI for the
-/// "we just saw your prompt" confirmation.
+/// pipeline yet.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LatestActiveSession {

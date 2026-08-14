@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 
 static EXCHANGE_RATES: OnceLock<RwLock<HashMap<String, f64>>> = OnceLock::new();
 
-const API_URL: &str = "https://api.frankfurter.dev/v1/latest?from=USD&to=EUR,GBP,JPY,CNY";
-
 const CACHE_FILENAME: &str = "exchange-rates-cache.json";
 const CACHE_TTL_SECS: u64 = 24 * 60 * 60; // 24 hours
 
@@ -51,7 +49,7 @@ pub fn load_cached(app_data_dir: &Path) -> Option<HashMap<String, f64>> {
 }
 
 pub async fn fetch_and_cache(app_data_dir: &Path) -> Result<HashMap<String, f64>, String> {
-    let body = reqwest::get(API_URL)
+    let body = reqwest::get(crate::ops::frankfurter_latest_url())
         .await
         .map_err(|e| format!("Exchange rate HTTP fetch failed: {e}"))?
         .text()

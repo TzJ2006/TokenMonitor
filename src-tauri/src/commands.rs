@@ -20,7 +20,7 @@ use crate::usage::payload_disk_cache::PayloadDiskCache;
 use crate::usage::ssh_remote::{SshCacheManager, SshHostConfig};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
@@ -94,6 +94,10 @@ impl AppState {
         }
     }
 
+    pub(crate) fn usage_access_enabled(&self) -> bool {
+        self.usage_access_enabled.load(Ordering::SeqCst)
+    }
+
     /// Drop the persistent payload disk cache for every usage view.
     ///
     /// The disk cache has no TTL: once a per-view payload is written it is
@@ -150,4 +154,21 @@ pub(crate) fn maybe_capture_query_debug(
 pub(crate) fn parse_usage_selection(provider: &str) -> Result<UsageIntegrationSelection, String> {
     UsageIntegrationSelection::parse(provider)
         .ok_or_else(|| format!("Unknown usage integration: {provider}"))
+}
+
+pub(crate) fn merge_usage_source(left: UsageSource, right: UsageSource) -> UsageSource {
+    if left == right {
+        left
+    } else {
+        UsageSource::Mixed
+    }
+}
+
+pub(crate) fn merge_usage_warning(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (Some(left), Some(right)) if left == right => Some(left),
+        (Some(left), Some(right)) => Some(format!("{left}\n{right}")),
+    }
 }

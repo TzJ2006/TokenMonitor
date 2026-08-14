@@ -24,26 +24,8 @@ export function formatBallCost(cost: number): string {
   return `$${Math.round(cost)}`;
 }
 
-export function formatPoint(point: { x: number; y: number } | null): string {
-  return point ? `(${point.x}, ${point.y})` : "n/a";
-}
-
-export function formatMonitor(
-  monitor: {
-    position: { x: number; y: number };
-    size: { width: number; height: number };
-  } | null,
-): string {
-  if (!monitor) return "none";
-  return `pos=${formatPoint(monitor.position)} size=${monitor.size.width}x${monitor.size.height}`;
-}
-
 export function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-export function formatInteraction(interactionId: string | null | undefined): string {
-  return `interaction=${interactionId ?? "n/a"}`;
 }
 
 // ── Expand direction resolution ────────────────────────────────────────

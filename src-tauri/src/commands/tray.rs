@@ -120,11 +120,7 @@ fn utilization_for(utilization: TrayUtilization, provider: &str) -> Option<f64> 
     }
 }
 
-fn format_tray_title(
-    config: &TrayConfig,
-    total_cost: f64,
-    utilization: TrayUtilization,
-) -> String {
+fn format_tray_title(config: &TrayConfig, total_cost: f64, utilization: TrayUtilization) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     // Percentages -- independent of bar_display.
@@ -269,12 +265,6 @@ fn current_daily_total_cost(state: &AppState) -> f64 {
         .sum()
 }
 
-fn usage_access_enabled(state: &AppState) -> bool {
-    state
-        .usage_access_enabled
-        .load(std::sync::atomic::Ordering::SeqCst)
-}
-
 /// Decide which daily cost the tray should show, and what to remember next.
 ///
 /// While a Cursor remote refetch is needed, never paint an undercount: keep the
@@ -311,8 +301,8 @@ fn current_daily_total_cost_if_allowed(state: &AppState) -> f64 {
         .and_then(|guard| *guard);
     let today = Local::now().date_naive();
     let (display, next_last) = resolve_tray_daily_cost_display(
-        usage_access_enabled(state),
-        if usage_access_enabled(state) {
+        state.usage_access_enabled(),
+        if state.usage_access_enabled() {
             current_daily_total_cost(state)
         } else {
             0.0
@@ -327,7 +317,7 @@ fn current_daily_total_cost_if_allowed(state: &AppState) -> f64 {
 }
 
 fn ensure_tray_cursor_remote_fresh(app: &tauri::AppHandle, state: &AppState) {
-    if !usage_access_enabled(state) {
+    if !state.usage_access_enabled() {
         return;
     }
     let today = Local::now().date_naive();
