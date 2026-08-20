@@ -35,17 +35,18 @@ struct Ttls {
     litellm_cache: u64,
 }
 
+// `plan_tier_costs_usd` is deliberately absent here: the frontend imports it
+// straight from `ops.json` (`src/lib/providerMetadata.ts`) and no Rust code
+// reads it. Serde ignores the unknown key; the test below guards its shape.
 #[derive(Debug, Deserialize)]
 struct OpsFile {
     claude_plan_budgets: HashMap<String, PlanBudget>,
-    plan_tier_costs_usd: HashMap<String, HashMap<String, f64>>,
     urls: Urls,
     ttls_secs: Ttls,
 }
 
 struct Ops {
     claude_plan_budgets: HashMap<String, PlanBudget>,
-    plan_tier_costs_usd: HashMap<String, HashMap<String, f64>>,
     urls: Urls,
     litellm_cache_ttl_secs: u64,
 }
@@ -57,7 +58,6 @@ fn ops() -> &'static Ops {
         let raw: OpsFile = serde_json::from_str(OPS_JSON).expect("ops.json must be valid JSON");
         Ops {
             claude_plan_budgets: raw.claude_plan_budgets,
-            plan_tier_costs_usd: raw.plan_tier_costs_usd,
             urls: raw.urls,
             litellm_cache_ttl_secs: raw.ttls_secs.litellm_cache,
         }
@@ -120,14 +120,17 @@ mod tests {
     }
 
     #[test]
-    fn loads_plan_tier_costs_and_urls() {
-        let claude_pro = ops()
-            .plan_tier_costs_usd
-            .get("claude")
-            .and_then(|m| m.get("Pro"))
-            .copied();
-        assert_eq!(claude_pro, Some(20.0));
+    fn loads_urls_and_ttls() {
         assert!(anthropic_usage_url().starts_with("https://api.anthropic.com/"));
         assert_eq!(litellm_cache_ttl_secs(), 7 * 24 * 60 * 60);
+    }
+
+    /// Only the frontend reads `plan_tier_costs_usd`, so guard the key here —
+    /// a rename or a dropped tier would otherwise surface as a UI-only break.
+    #[test]
+    fn ops_json_keeps_plan_tier_costs_for_the_frontend() {
+        let raw: serde_json::Value = serde_json::from_str(OPS_JSON).unwrap();
+        assert_eq!(raw["plan_tier_costs_usd"]["claude"]["Pro"], 20.0);
+        assert_eq!(raw["plan_tier_costs_usd"]["codex"]["Plus"], 20.0);
     }
 }
