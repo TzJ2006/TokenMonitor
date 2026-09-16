@@ -88,3 +88,14 @@ CLAUDE.md
 .devcompanion/*
 !.devcompanion/tests/
 # <<< AI Dev Companion
+
+# ai-companion (local tooling, not part of this project)
+.companion/
+.devcompanion/
+.agents/skills/cc*/
+.claude/skills/cc*/
+.claude/settings.json
+.cursor/hooks.json
+.codex/hooks.json
+ideas/
+docs/ecl/
