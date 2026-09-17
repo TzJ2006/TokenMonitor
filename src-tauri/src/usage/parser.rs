@@ -4056,9 +4056,10 @@ mod tests {
         let (entries, change_events, _reports) = parser.load_claude_entries_with_debug(None);
 
         assert_eq!(entries.len(), 1);
+        // Usage entries keep Main on a tie; change events still prefer Subagent.
         assert_eq!(
             entries[0].agent_scope,
-            crate::stats::subagent::AgentScope::Subagent
+            crate::stats::subagent::AgentScope::Main
         );
         assert_eq!(change_events.len(), 1);
         assert_eq!(
@@ -4351,7 +4352,7 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn claude_dedupe_collapses_root_and_sidechain_and_prefers_subagent_scope() {
+    fn claude_dedupe_collapses_root_and_sidechain_and_prefers_main_scope() {
         let dir = TempDir::new().unwrap();
         // Root and sidechain with same message.id and requestId
         let root = r#"{"type":"assistant","timestamp":"2026-03-15T12:00:00+00:00","sessionId":"sess-1","requestId":"req-1","message":{"id":"msg-1","model":"claude-opus-4-6","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50}}}"#;
@@ -4365,13 +4366,15 @@ diff --git a/src/main.rs b/src/main.rs
             1,
             "root and sidechain mirrors should collapse"
         );
+        // Output tie → Main wins (see `prefer_main_when_output_tied`).
         assert_eq!(
             entries[0].agent_scope,
-            crate::stats::subagent::AgentScope::Subagent
+            crate::stats::subagent::AgentScope::Main
         );
         assert!(
-            entries[0].session_key.contains("agt-1"),
-            "subagent mirror should keep the sidechain session_key"
+            entries[0].session_key.contains("main"),
+            "main mirror should keep the root session_key, got: {}",
+            entries[0].session_key
         );
     }
 
