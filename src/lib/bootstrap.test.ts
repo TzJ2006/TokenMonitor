@@ -66,6 +66,8 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
     usageAccessEnabled: true,
     autoExportEnabled: false,
     autoExportFolder: null,
+    weekStart: "mon",
+    rollingPeriods: false,
     ...overrides,
   };
 }
@@ -107,6 +109,7 @@ describe("initializeRuntimeFromSettings", () => {
     expect(invokeFn).toHaveBeenCalledWith("set_dock_icon_visible", { visible: false });
     expect(syncNativeWindowSurfaceFn).toHaveBeenCalledWith();
     expect(invokeFn).toHaveBeenCalledWith("set_refresh_interval", { interval: 300 });
+    expect(invokeFn).toHaveBeenCalledWith("set_period_config", { weekStart: "mon", rolling: false });
     expect(invokeFn).toHaveBeenCalledWith("set_usage_access_enabled", { enabled: true });
     expect(invokeFn).toHaveBeenCalledWith("set_cursor_auth_config", {
       apiKey: "",

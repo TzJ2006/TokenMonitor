@@ -125,6 +125,8 @@ describe("loadSettings", () => {
       usageAccessEnabled: true,
       autoExportEnabled: false,
       autoExportFolder: null,
+      weekStart: "mon",
+      rollingPeriods: false,
     });
     expect(get(settings)).toEqual(loaded);
     expect(mockSetCurrency).toHaveBeenCalledWith("EUR");
@@ -187,6 +189,8 @@ describe("loadSettings", () => {
       usageAccessEnabled: true,
       autoExportEnabled: false,
       autoExportFolder: null,
+      weekStart: "mon",
+      rollingPeriods: false,
     });
     expect(get(settings)).toEqual(fallback);
     expect(mockSetCurrency).toHaveBeenCalledWith("USD");
