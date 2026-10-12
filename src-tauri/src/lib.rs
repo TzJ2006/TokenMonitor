@@ -8,6 +8,7 @@ mod plan_budget;
 mod platform;
 mod rate_limits;
 mod refresh;
+mod reset_watch;
 mod secrets;
 mod single_instance;
 mod stats;
@@ -495,6 +496,8 @@ pub fn run() {
             commands::calendar::get_monthly_usage,
             commands::usage_query::get_known_models,
             plan_budget::get_plan_budget,
+            plan_budget::get_meter_reading_at,
+            reset_watch::get_codex_reset_watch,
             commands::config::get_last_usage_debug,
             commands::config::set_dock_icon_visible,
             commands::config::suppress_next_auto_hide,
@@ -749,6 +752,7 @@ pub(crate) async fn archive_ssh_device_usage(state: &AppState) {
                     unique_hash: None,
                     session_key: format!("ssh:{alias}"),
                     agent_scope: crate::stats::subagent::AgentScope::Main,
+                    session_meta: None,
                 })
             })
             .collect();
