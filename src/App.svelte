@@ -875,7 +875,7 @@
   >
       {#if !showSettings}<UpdateBanner />{/if}
       {#if showSplash}
-        <SplashScreen ready={appReady} onComplete={() => { showSplash = false; tick().then(() => syncSizeAndVerify("splash-complete")); }} />
+        <SplashScreen ready={appReady} quick={$settings.hasSeenWelcome} onComplete={() => { showSplash = false; tick().then(() => syncSizeAndVerify("splash-complete")); }} />
       {:else if showPermissionsOnboarding}
         <PermissionsOnboarding
           onFinish={handleOnboardingFinish}

@@ -5,7 +5,7 @@ Cursor IDE, and Kimi Code token usage. Stack: Tauri v2 + Svelte 5 frontend (`src
 session logs from disk, prices them in Rust, and shows spend + rate limits in a tray popover and an optional
 FloatBall overlay. Entry points: `src/main.ts` (main window), `src/float-ball.ts` (FloatBall, separate Vite
 entry), `src-tauri/src/main.rs` → `lib.rs` (backend). Root `README.md` covers the product overview, the three-step build, and the unsigned-macOS note; `docs/DEVELOPMENT.md` is the
-maintained dev guide; `CHANGELOG.md` at the repository root is the release history. Current version: 0.17.x.
+maintained dev guide; `CHANGELOG.md` at the repository root is the release history. Current version: 0.18.x.
 
 ## Commands
 
@@ -76,21 +76,24 @@ official 5h reset window from cached rate limits, or a rolling five hours when n
 are persisted to the usage archive so history survives log deletion. Models missing from the static pricing
 table (`usage/pricing.rs`, bump `PRICING_VERSION` when editing) resolve via LiteLLM/OpenRouter with 24h TTL.
 
-Refresh: `refresh.rs` owns all periodic work. Each refresh (launch, then every aligned interval tick) runs its
-I/O first (Cursor today, rate-limit probes one provider at a time), then one sample (the only log sweep and
-cache invalidation; it stats the files written within a week, and every file hourly, after user actions and
-after a popover show; an append drops only the views it can reach), computes the tray cost and open view
-behind the `AppState.compute` FIFO gate (one heavy CPU job at a time), and publishes once; only it and the
-Cursor widening fetch (`usage_query.rs`) emit `data-updated`. Archive/export, plan budgets (one job per
-provider, skipped while its logs, meter readings and prices are unchanged, for up to an hour) and the hourly
-price check then run in evenly spaced slots; SSH syncs detached every 10th cycle (a host whose host key
-fails is held back 1 h, doubling to a day). Background results appear at the next refresh; user actions call
-`refresh::request_refresh`. Interval Off refreshes only at launch, 00:00:01, user actions, and popover focus
-once the last sample is ≥ 30 s old. There is no statusline poll (it is read at each refresh) and no automatic
-startup warmup. WebView2 keeps painting a hidden window, so every popover show/hide calls
-`emit_popover_visibility` (`lib.rs`); while hidden the page (`lib/visibility.ts`) pauses CSS animations, the
-footer/bar timers and rate-limit retries, and refetches on `data-updated` at most every 5 min (the rest wait
-for the next show).
+Refresh: `refresh.rs` owns all periodic work. The launch publishes the local logs first (no I/O), then runs a
+full refresh at once. Each refresh after it (then every aligned interval tick) runs its I/O first (Cursor
+today, rate-limit probes one provider at a time), then one sample (the only log sweep and cache invalidation;
+it stats the files written within a week, and every file hourly, after user actions and after a popover show;
+an append drops only the views it can reach), computes the tray cost and open view behind the
+`AppState.compute` FIFO gate (one heavy CPU job at a time), and publishes once; only it and the Cursor
+widening fetch (`usage_query.rs`) emit `data-updated`. Archive/export, plan budgets (one job per provider,
+skipped while its logs, meter readings and prices are unchanged, for up to an hour) and the hourly price check
+then run in evenly spaced slots; SSH syncs detached every 10th cycle (a host whose host key fails is held back
+1 h, doubling to a day). Background results appear at the next refresh; user actions call
+`refresh::request_refresh`. Interval Off refreshes only at launch, 00:00:01 and user actions; at any interval,
+a popover show or focus refreshes a sample ≥ 30 s old, and price/exchange tables that arrive ask for a
+refresh. The Claude and Codex CLI probes back off while idle: each one whose meters did not move doubles their
+5 min floor, up to 30 min; local log activity, a look, a user action or a window reset restores it. There is
+no statusline poll (it is read at each refresh) and no automatic startup warmup. WebView2 keeps painting a
+hidden window, so every popover show/hide calls `emit_popover_visibility` (`lib.rs`); while hidden the page
+(`lib/visibility.ts`) pauses CSS animations, the footer/bar timers and rate-limit retries, and refetches on
+`data-updated` at most every 5 min (the rest wait for the next show).
 
 Platform notes (verified in code): tray cost text uses `set_title()` beside the icon on macOS; on
 Windows/Linux `set_title` is a noop and the cost goes in the tooltip (`commands/tray.rs`). On macOS the tray

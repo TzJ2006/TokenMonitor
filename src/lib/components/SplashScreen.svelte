@@ -2,7 +2,10 @@
   import { onMount } from 'svelte';
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 
-  let { ready = false, onComplete }: { ready?: boolean; onComplete: () => void } = $props();
+  // `quick`: a returning user, who has seen the animation. The splash then
+  // leaves as soon as the data is ready, and is never shown if it is ready
+  // before the first look.
+  let { ready = false, quick = false, onComplete }: { ready?: boolean; quick?: boolean; onComplete: () => void } = $props();
   let minTimePassed = $state(false);
   let exiting = $state(false);
   let started = $state(false);
@@ -64,7 +67,11 @@
 
   // Dismiss when animation minimum is met AND app data is loaded
   $effect(() => {
-    if (ready && minTimePassed && !exiting) {
+    if (exiting || !ready) return;
+    if (quick && !started) {
+      exiting = true;
+      onComplete();
+    } else if (quick || minTimePassed) {
       exiting = true;
       setTimeout(() => onComplete(), 500);
     }

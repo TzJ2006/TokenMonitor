@@ -85,11 +85,17 @@ filetime = "0.2"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 
-# Keep fast rebuilds and full debugging for our code. Dependency backtraces
-# retain file/line information without their bulky type/variable debug data.
-# The test profile inherits these settings; release builds are unchanged.
+# Keep full debugging for our code. Dependency backtraces retain file/line
+# information without their bulky type/variable debug data. The log parsing
+# (serde code generated into this crate, plus serde_json, chrono and rayon)
+# runs ~6x slower unoptimized, which made `tauri dev` slow to load usage:
+# opt-level 1 here brings it near release speed for a few seconds more per
+# rebuild, and the dependencies, built once, get full optimization. The test
+# profile inherits these settings; release builds are unchanged.
 [profile.dev]
 incremental = true
+opt-level = 1
 
 [profile.dev.package."*"]
 debug = "line-tables-only"
+opt-level = 3

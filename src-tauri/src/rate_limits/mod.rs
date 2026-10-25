@@ -158,6 +158,53 @@ pub(crate) fn reset_cursor_refetch_floor() {
     CURSOR_REFETCH_SECS.store(CURSOR_MIN_REFETCH_SECS as u64, Ordering::Relaxed);
 }
 
+/// Claude's and Codex's probe floors in use, for the probes that spawn their
+/// CLI: the base floor, doubled by each probe whose meters had not moved (see
+/// `cursor_idle_backoff`). Their meters move only with use, here or elsewhere,
+/// so an idle machine spawns ever fewer of them. Back to the base on local
+/// activity, a look or a user action ([`reset_idle_probe_floors`]), and when a
+/// cached window has reset.
+static CLAUDE_REFETCH_SECS: AtomicU64 = AtomicU64::new(CLAUDE_MIN_REFETCH_SECS as u64);
+static CODEX_REFETCH_SECS: AtomicU64 = AtomicU64::new(CODEX_MIN_REFETCH_SECS as u64);
+
+/// The user is looking or acting, or Claude Code or Codex logged here: probe
+/// their meters on the base floor again.
+pub(crate) fn reset_idle_probe_floors() {
+    CLAUDE_REFETCH_SECS.store(CLAUDE_MIN_REFETCH_SECS as u64, Ordering::Relaxed);
+    CODEX_REFETCH_SECS.store(CODEX_MIN_REFETCH_SECS as u64, Ordering::Relaxed);
+}
+
+/// The floor in `slot` for a provider cached as `cached`; the base once a
+/// cached window has reset, which a probe would show at zero.
+fn idle_floor(
+    slot: &AtomicU64,
+    base: i64,
+    cached: Option<&ProviderRateLimits>,
+    now: DateTime<Utc>,
+) -> i64 {
+    if cached.is_some_and(|rl| codex::has_reset(&rl.windows, now)) {
+        slot.store(base as u64, Ordering::Relaxed);
+    }
+    slot.load(Ordering::Relaxed) as i64
+}
+
+/// Space out the next probe after `fresh`, taken on `floor`: doubled when its
+/// meters match `cached`, the base when they moved or the probe failed.
+fn note_probe(
+    slot: &AtomicU64,
+    floor: i64,
+    base: i64,
+    fresh: &ProviderRateLimits,
+    cached: Option<&ProviderRateLimits>,
+) {
+    let next = if fresh.error.is_some() || fresh.windows.is_empty() {
+        base as u64
+    } else {
+        cursor_idle_backoff(floor as u64, base as u64, !same_meters(fresh, cached))
+    };
+    slot.store(next, Ordering::Relaxed);
+}
+
 /// Whether a reading shows the same meters as `cached`.
 fn same_meters(fresh: &ProviderRateLimits, cached: Option<&ProviderRateLimits>) -> bool {
     let meters =
@@ -567,13 +614,15 @@ pub async fn fetch_selected_rate_limits_until(
             }
 
             // Shared throttle for the remaining paths: a 5-minute floor keeps us
-            // from spawning a CLI (or spending API budget) every 2.5 min.
-            if is_fresh(
-                cached_claude.as_ref(),
+            // from spawning a CLI (or spending API budget) every 2.5 min, and
+            // stretches while the meters stand still.
+            let floor = idle_floor(
+                &CLAUDE_REFETCH_SECS,
                 CLAUDE_MIN_REFETCH_SECS,
+                cached_claude.as_ref(),
                 now,
-                retry_errors,
-            ) {
+            );
+            if is_fresh(cached_claude.as_ref(), floor, now, retry_errors) {
                 return cached_claude;
             }
 
@@ -589,7 +638,15 @@ pub async fn fetch_selected_rate_limits_until(
                 return Some(reading);
             }
 
-            Some(probe_claude_rich(cached_claude.as_ref(), now).await)
+            let rich = probe_claude_rich(cached_claude.as_ref(), now).await;
+            note_probe(
+                &CLAUDE_REFETCH_SECS,
+                floor,
+                CLAUDE_MIN_REFETCH_SECS,
+                &rich,
+                cached_claude.as_ref(),
+            );
+            Some(rich)
         }
         .await;
         let result = if selection.includes_claude() {
@@ -608,7 +665,13 @@ pub async fn fetch_selected_rate_limits_until(
         }
 
         let now = Utc::now();
-        if is_fresh(cached_codex.as_ref(), CODEX_MIN_REFETCH_SECS, now, retry_errors) {
+        let floor = idle_floor(
+            &CODEX_REFETCH_SECS,
+            CODEX_MIN_REFETCH_SECS,
+            cached_codex.as_ref(),
+            now,
+        );
+        if is_fresh(cached_codex.as_ref(), floor, now, retry_errors) {
             return cached_codex;
         }
 
@@ -636,9 +699,19 @@ pub async fn fetch_selected_rate_limits_until(
 
         mark_attempt(slot, Instant::now());
         match fetch_codex_rate_limits_via_cli().await {
-            Ok(rate_limits) => Some(rate_limits),
+            Ok(rate_limits) => {
+                note_probe(
+                    &CODEX_REFETCH_SECS,
+                    floor,
+                    CODEX_MIN_REFETCH_SECS,
+                    &rate_limits,
+                    cached_codex.as_ref(),
+                );
+                Some(rate_limits)
+            }
             Err(cli_err) => {
                 tracing::debug!(error = %cli_err.message, "Codex app-server probe failed, falling back to file");
+                CODEX_REFETCH_SECS.store(CODEX_MIN_REFETCH_SECS as u64, Ordering::Relaxed);
                 match tokio::task::spawn_blocking(move || extract_codex_rate_limits(&codex_dir))
                     .await
                 {
@@ -802,6 +875,55 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-09-23T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn an_idle_probe_floor_doubles_while_the_meters_stand_still() {
+        let slot = AtomicU64::new(300);
+        let base = 300;
+        let reading = |used| {
+            limits(
+                vec![window("five_hour", used, Some("2026-09-23T15:00:00Z"))],
+                "2026-09-23T11:00:00Z",
+            )
+        };
+        let cached = reading(10.0);
+
+        note_probe(&slot, 300, base, &reading(10.0), Some(&cached));
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            600,
+            "unchanged meters: doubled"
+        );
+        note_probe(&slot, 1200, base, &reading(10.0), Some(&cached));
+        note_probe(&slot, 2400, base, &reading(10.0), Some(&cached));
+        assert_eq!(slot.load(Ordering::Relaxed), 1800, "up to half an hour");
+
+        note_probe(&slot, 1800, base, &reading(11.0), Some(&cached));
+        assert_eq!(slot.load(Ordering::Relaxed), 300, "moved meters: the base");
+
+        slot.store(1800, Ordering::Relaxed);
+        let mut failed = reading(10.0);
+        failed.error = Some("boom".to_string());
+        note_probe(&slot, 1800, base, &failed, Some(&cached));
+        assert_eq!(slot.load(Ordering::Relaxed), 300, "a failure: the base");
+    }
+
+    #[test]
+    fn a_reset_window_ends_the_idle_back_off() {
+        let slot = AtomicU64::new(1800);
+        let now = overlay_now();
+        let open = limits(
+            vec![window("five_hour", 10.0, Some("2026-09-23T15:00:00Z"))],
+            "2026-09-23T11:00:00Z",
+        );
+        assert_eq!(idle_floor(&slot, 300, Some(&open), now), 1800);
+        let reset = limits(
+            vec![window("five_hour", 10.0, Some("2026-09-23T11:30:00Z"))],
+            "2026-09-23T11:00:00Z",
+        );
+        assert_eq!(idle_floor(&slot, 300, Some(&reset), now), 300);
+        assert_eq!(slot.load(Ordering::Relaxed), 300);
     }
 
     #[test]

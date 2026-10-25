@@ -44,8 +44,8 @@ const MAX_WAIT: Duration = Duration::from_secs(300);
 const SLOT_GUARD: Duration = Duration::from_secs(1);
 /// While the interval is Off, a cycle's slot jobs run within this long of it.
 const OFF_SLOT_WINDOW: Duration = Duration::from_secs(60);
-/// While the interval is Off, a look at the popover refreshes a sample at
-/// least this old.
+/// A look at the popover refreshes a sample at least this old, whatever the
+/// interval: what the user opens is never older than this.
 const FOCUS_REFRESH_AGE: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
 /// A sample sweeps every file this often, in a new day, at a user's request
 /// and after the popover was shown; the others stat only the files written
@@ -94,6 +94,9 @@ pub(crate) struct RefreshState {
     /// the hold that set it). A manual sync or a passing test of the host, or
     /// any SSH config change, lifts the hold.
     pub(crate) ssh_holds: Mutex<SshHolds>,
+    /// The Claude and Codex log versions the last rate-limit step saw: a
+    /// change since is local use, which ends the probes' idle back-off.
+    pub(crate) probe_log_versions: Mutex<Option<(u64, u64)>>,
     /// When the price tables' TTLs were last checked.
     pub(crate) last_pricing_check: Mutex<Option<Instant>>,
     /// A price-table fetch is running.
@@ -110,9 +113,10 @@ pub(crate) struct RefreshState {
 
 /// Ask the loop for a cycle now; it realigns to its ticks afterwards.
 pub(crate) fn request_refresh(state: &AppState) {
-    // A user action: whatever it shows should include Cursor's latest, and
-    // every log.
+    // A user action: whatever it shows should include Cursor's latest, every
+    // log, and meters on their base floor.
     wake_cursor(state);
+    crate::rate_limits::reset_idle_probe_floors();
     state.refresh.full_sweep.store(true, Ordering::SeqCst);
     state.refresh.requested.store(true, Ordering::SeqCst);
     state.refresh.wake.notify_one();
@@ -120,10 +124,13 @@ pub(crate) fn request_refresh(state: &AppState) {
 
 /// The popover is shown: the next cycle brings Cursor's latest and sweeps
 /// every log, so a resumed old session, which appends to a file the other
-/// samples skip, shows up within a refresh of a look.
+/// samples skip, shows up within a refresh of a look. A sample older than
+/// [`FOCUS_REFRESH_AGE`] is refreshed now rather than at the next tick.
 pub(crate) fn popover_shown(state: &AppState) {
     wake_cursor(state);
+    crate::rate_limits::reset_idle_probe_floors();
     state.refresh.full_sweep.store(true, Ordering::SeqCst);
+    refresh_if_looked_at(state);
 }
 
 /// Cursor may be in use (the user is looking, acting, or the IDE wrote its
@@ -163,20 +170,17 @@ pub async fn refresh_ready(state: tauri::State<'_, AppState>) -> Result<(), Stri
     Ok(())
 }
 
-/// The popover gained focus. While the interval is Off nothing refreshes on
-/// its own, so a look at data at least [`FOCUS_REFRESH_AGE`] old refreshes
-/// it, unless a cycle already running will; with an interval set, the ticks
-/// keep it fresh.
+/// The popover gained focus: a look at data at least [`FOCUS_REFRESH_AGE`]
+/// old refreshes it, unless a cycle already running will. Between ticks of a
+/// long interval (or with it Off) the user would otherwise open stale data.
 #[tauri::command]
 pub async fn refresh_on_focus(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    refresh_if_looked_at(&state).await;
+    refresh_if_looked_at(&state);
     Ok(())
 }
 
-async fn refresh_if_looked_at(state: &AppState) {
-    if *state.refresh_interval.read().await != 0
-        || state.refresh.cycle_running.load(Ordering::SeqCst)
-    {
+fn refresh_if_looked_at(state: &AppState) {
+    if state.refresh.cycle_running.load(Ordering::SeqCst) {
         return;
     }
     let last_sample = state.refresh.last_sample.lock().ok().and_then(|last| *last);
@@ -227,22 +231,26 @@ pub(crate) enum Step {
 
 /// The steps of a cycle, in order. The I/O comes before the sample, so all
 /// that is computed after it sees the new Cursor data and 5h reset, and
-/// nothing invalidates between the sample and the publish. The first cycle's
-/// cleanup takes the compute gate only after the I/O, which then runs beside
-/// whatever holds the gate at launch.
+/// nothing invalidates between the sample and the publish. The first cycle
+/// has no I/O: the rate-limit probes spawn CLIs and may take their whole
+/// budget, and the launch should not show the previous session's numbers
+/// until they end. It publishes the local logs at once, and the loop runs a
+/// full cycle right after it.
 pub(crate) fn cycle_steps(first: bool) -> Vec<Step> {
-    let mut steps = Vec::with_capacity(7);
-    steps.extend([Step::CursorToday, Step::RateLimits]);
+    let mut steps = Vec::with_capacity(6);
     if first {
         steps.push(Step::Cleanup);
+    } else {
+        steps.extend([Step::CursorToday, Step::RateLimits]);
     }
     steps.extend([Step::Sample, Step::Tray, Step::ActiveView, Step::Publish]);
     steps
 }
 
-/// The refresh loop: cycle 0 at launch, then a cycle at every aligned tick
-/// (local midnight + 1 s + k * interval, or only 00:00:01 while the interval
-/// is Off) and whenever a user action requests one.
+/// The refresh loop: cycle 0 at launch (the local logs only), a full cycle
+/// right after it, then a cycle at every aligned tick (local midnight + 1 s +
+/// k * interval, or only 00:00:01 while the interval is Off) and whenever a
+/// user action requests one.
 pub(crate) async fn run(app: AppHandle) {
     let state = app.state::<AppState>();
     // Only the sample revalidates the session-file listings; queries between
@@ -263,10 +271,13 @@ pub(crate) async fn run(app: AppHandle) {
     }
     tracing::info!("Refresh loop started");
 
-    let mut plan_from = Moment::now().later(TICK_GUARD);
     // A cycle serves every request made before it starts.
     state.refresh.requested.store(false, Ordering::SeqCst);
-    let generation = run_cycle(Some(&app), &state, true).await;
+    run_cycle(Some(&app), &state, true).await;
+    // Then the launch's I/O: Cursor's remote data and the rate limits.
+    let mut plan_from = Moment::now().later(TICK_GUARD);
+    state.refresh.requested.store(false, Ordering::SeqCst);
+    let generation = run_cycle(Some(&app), &state, false).await;
     run_slots(&app, &state, plan_from, generation).await;
 
     let mut cycles_since_ssh: u64 = 0;
@@ -460,6 +471,7 @@ async fn refresh_rate_limits(state: &AppState) {
     let deadline = Instant::now() + probe_budget(interval);
     let _io = state.rate_limits_io.lock().await;
     crate::statusline::source::maybe_trim(&crate::statusline::events_file());
+    note_local_use(state);
 
     let codex_dir = state.parser.codex_dir().to_path_buf();
     let cached = state.cached_rate_limits.read().await.clone();
@@ -478,6 +490,21 @@ async fn refresh_rate_limits(state: &AppState) {
     crate::plan_budget::record(&merged);
     *state.cached_rate_limits.write().await = Some(merged.clone());
     patch_tray_utilization(state, tray_utilization_from_rate_limits(Some(&merged))).await;
+}
+
+/// End the probes' idle back-off when Claude Code or Codex logged here since
+/// the last rate-limit step: their meters are moving.
+fn note_local_use(state: &AppState) {
+    let versions = (
+        state.parser.data_version("claude"),
+        state.parser.data_version("codex"),
+    );
+    let Ok(mut seen) = state.refresh.probe_log_versions.lock() else {
+        return;
+    };
+    if seen.replace(versions).is_some_and(|seen| seen != versions) {
+        crate::rate_limits::reset_idle_probe_floors();
+    }
 }
 
 fn probe_budget(interval_secs: u64) -> Duration {
@@ -824,13 +851,17 @@ pub(crate) async fn fetch_price_tables_once(state: &AppState, app_data: &Path) -
 }
 
 /// Fetch the price (7 d TTL) and exchange-rate (24 h TTL) tables that are
-/// stale, and hold them for the next sample to apply.
+/// stale, and hold them for a sample to apply. One that arrives asks for a
+/// cycle now: with a long interval, or with it Off, the next tick may be
+/// hours away.
 async fn fetch_stale_price_tables(state: &AppState, app_data: &Path) {
     use crate::usage::{exchange_rates, litellm};
+    let mut fetched = false;
     if litellm::should_refresh(app_data) {
         match litellm::fetch_and_cache(app_data).await {
             Ok(rates) => {
                 put(&state.refresh.pending_pricing, rates);
+                fetched = true;
                 tracing::info!(
                     "Dynamic pricing fetched (LiteLLM + OpenRouter), applied at the next refresh"
                 );
@@ -842,12 +873,19 @@ async fn fetch_stale_price_tables(state: &AppState, app_data: &Path) {
         match exchange_rates::fetch_and_cache(app_data).await {
             Ok(rates) => {
                 put(&state.refresh.pending_fx, rates);
+                fetched = true;
                 tracing::info!(
                     "Exchange rates fetched (frankfurter.dev), applied at the next refresh"
                 );
             }
             Err(e) => tracing::warn!("Exchange rate fetch failed (keeping the current rates): {e}"),
         }
+    }
+    if fetched {
+        // Not `request_refresh`: no user acted, so no Cursor wake or full
+        // sweep. A cycle that has not sampled yet applies the tables itself.
+        state.refresh.requested.store(true, Ordering::SeqCst);
+        state.refresh.wake.notify_one();
     }
 }
 
@@ -1015,8 +1053,15 @@ mod tests {
         for first in [true, false] {
             let steps = cycle_steps(first);
             let at = |step| position(&steps, step);
-            assert!(at(Step::CursorToday) < at(Step::Sample));
-            assert!(at(Step::RateLimits) < at(Step::Sample));
+            if first {
+                assert!(
+                    !steps.contains(&Step::CursorToday) && !steps.contains(&Step::RateLimits),
+                    "the launch publishes the local logs without waiting on any I/O"
+                );
+            } else {
+                assert!(at(Step::CursorToday) < at(Step::Sample));
+                assert!(at(Step::RateLimits) < at(Step::Sample));
+            }
             assert!(at(Step::Sample) < at(Step::Tray));
             assert!(at(Step::Sample) < at(Step::ActiveView));
             assert_eq!(steps.last(), Some(&Step::Publish));
@@ -1024,8 +1069,6 @@ mod tests {
             assert_eq!(steps.contains(&Step::Cleanup), first);
             if first {
                 assert!(at(Step::Cleanup) < at(Step::Sample));
-                // The launch's cold tray compute holds the gate meanwhile.
-                assert!(at(Step::RateLimits) < at(Step::Cleanup));
             }
         }
     }
@@ -1061,7 +1104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_refreshes_only_while_off_and_only_older_data() {
+    async fn focus_refreshes_only_older_data_whatever_the_interval() {
         let st = AppState::new();
         let sampled_ago = |secs: i64| {
             *st.refresh.last_sample.lock().unwrap() =
@@ -1069,23 +1112,33 @@ mod tests {
         };
         let requested = || st.refresh.requested.swap(false, Ordering::SeqCst);
 
-        *st.refresh_interval.write().await = 300;
-        sampled_ago(3600);
-        refresh_if_looked_at(&st).await;
-        assert!(!requested(), "a running interval refreshes on its own");
+        for interval in [300, 0] {
+            *st.refresh_interval.write().await = interval;
+            sampled_ago(10);
+            refresh_if_looked_at(&st);
+            assert!(!requested(), "data this fresh is shown as it is");
 
-        *st.refresh_interval.write().await = 0;
-        sampled_ago(10);
-        refresh_if_looked_at(&st).await;
-        assert!(!requested(), "data this fresh is shown as it is");
-
-        sampled_ago(30);
-        refresh_if_looked_at(&st).await;
-        assert!(requested(), "while Off, a look at older data refreshes it");
+            sampled_ago(30);
+            refresh_if_looked_at(&st);
+            assert!(
+                requested(),
+                "a look at older data refreshes it ({interval} s)"
+            );
+        }
 
         *st.refresh.last_sample.lock().unwrap() = None;
-        refresh_if_looked_at(&st).await;
+        refresh_if_looked_at(&st);
         assert!(requested(), "as does a look before the first sample");
+    }
+
+    #[test]
+    fn showing_the_popover_refreshes_older_data() {
+        let st = AppState::new();
+        *st.refresh.last_sample.lock().unwrap() =
+            Some(Local::now() - chrono::TimeDelta::seconds(60));
+        popover_shown(&st);
+        assert!(st.refresh.requested.load(Ordering::SeqCst));
+        assert!(st.refresh.full_sweep.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1235,7 +1288,7 @@ mod tests {
             while !st.refresh.cycle_running.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
             }
-            refresh_if_looked_at(&st).await;
+            refresh_if_looked_at(&st);
             let requested = st.refresh.requested.load(Ordering::SeqCst);
             drop(gate);
             requested
@@ -1251,7 +1304,7 @@ mod tests {
         );
 
         *st.refresh.last_sample.lock().unwrap() = None;
-        refresh_if_looked_at(&st).await;
+        refresh_if_looked_at(&st);
         assert!(
             st.refresh.requested.load(Ordering::SeqCst),
             "a look after it requests one again"
